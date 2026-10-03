@@ -41,6 +41,7 @@ pub struct ButtonView {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub label: String,
+    pub desktop: Option<String>,
     pub state: ButtonState,
 }
 
@@ -108,6 +109,7 @@ pub fn view(
         id: button.id.clone(),
         kind: button.spec.type_name(),
         label: button.label.clone(),
+        desktop: button.desktop.clone(),
         state: state(config, &button.spec, snapshot, audio),
     }
 }

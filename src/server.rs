@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, broadcast};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
@@ -21,6 +21,7 @@ use crate::{
     audio::Audio,
     buttons::{self, AudioSnapshot, ButtonState, ButtonView, PressError},
     config::Config,
+    desktops::{self, VirtualDesktops},
 };
 
 /// How often state is re-read to catch changes Windows does not notify (e.g. mixer volume).
@@ -31,6 +32,7 @@ pub struct AppState {
     config: Arc<Config>,
     audio: Arc<dyn Audio>,
     hub: Arc<Hub>,
+    desktops: Option<Arc<dyn VirtualDesktops>>,
 }
 
 struct Hub {
@@ -48,7 +50,37 @@ impl AppState {
                 last: Mutex::new(Vec::new()),
                 events,
             }),
+            desktops: None,
         }
+    }
+
+    /// Include virtual desktops in `/events` snapshots and change messages.
+    #[must_use]
+    pub fn with_desktops(mut self, desktops: Arc<dyn VirtualDesktops>) -> Self {
+        self.desktops = Some(desktops);
+        self
+    }
+
+    async fn desktop_listing(&self) -> Value {
+        match &self.desktops {
+            Some(desktops) => desktops::api::listing(desktops.clone()).await,
+            None => json!({ "desktops": [], "error": "virtual desktops are not enabled" }),
+        }
+    }
+
+    /// Push the current desktop list on `/events` after a desktop change.
+    pub async fn publish_desktops(&self, reason: &str) {
+        let listing = self.desktop_listing().await;
+        let _ordering = self.hub.last.lock().await;
+        let _ = self.hub.events.send(
+            json!({
+                "type": "desktops",
+                "reason": reason,
+                "desktops": listing["desktops"],
+                "error": listing["error"],
+            })
+            .to_string(),
+        );
     }
 
     /// Re-read every button, broadcast the ones that changed, and return all of them.
@@ -94,6 +126,7 @@ fn compute(config: &Config, audio: &dyn Audio) -> Vec<ButtonView> {
                 id: button.id.clone(),
                 kind: button.spec.type_name(),
                 label: button.label.clone(),
+                desktop: button.desktop.clone(),
                 state: ButtonState::Error {
                     message: error.to_string(),
                 },
@@ -167,9 +200,19 @@ async fn events(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response
 
 /// Send a full snapshot first, then each changed button; a lagging client gets a
 /// fresh snapshot instead of the missed messages.
+async fn snapshot(state: &AppState, buttons: Vec<ButtonView>) -> String {
+    let listing = state.desktop_listing().await;
+    json!({
+        "type": "snapshot",
+        "buttons": buttons,
+        "desktops": listing["desktops"],
+        "desktops_error": listing["error"],
+    })
+    .to_string()
+}
+
 async fn stream(state: AppState, mut socket: WebSocket) {
     let mut changes = state.hub.events.subscribe();
-    let snapshot = |views: Vec<ButtonView>| json!({ "type": "snapshot", "buttons": views });
     state.refresh().await;
     // Publishers send while holding `last`, so under the same lock every queued
     // change is already reflected in it: drop them and start from `last`.
@@ -179,8 +222,9 @@ async fn stream(state: AppState, mut socket: WebSocket) {
             changes.try_recv(),
             Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed)
         ) {}
-        snapshot(last.clone()).to_string()
+        last.clone()
     };
+    let first = snapshot(&state, first).await;
     if socket.send(Message::Text(first.into())).await.is_err() {
         return;
     }
@@ -194,7 +238,7 @@ async fn stream(state: AppState, mut socket: WebSocket) {
                 let text = match change {
                     Ok(text) => text,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        snapshot(state.refresh().await).to_string()
+                        snapshot(&state, state.refresh().await).await
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 };
@@ -364,5 +408,55 @@ buttons:
         assert_eq!(change["type"], "button");
         assert_eq!(change["button"]["id"], "output");
         assert_eq!(change["button"]["state"]["current"], "jbl");
+    }
+
+    #[tokio::test]
+    async fn events_include_desktops_and_push_desktop_changes() {
+        let (state, _) = state();
+        let fake = Arc::new(crate::desktops::api::fake::FakeDesktops::new(&[
+            "dev",
+            "ゲーム",
+        ]));
+        let state = state.with_desktops(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        tokio::spawn(async move { axum::serve(listener, app(server_state)).await });
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/events"))
+            .await
+            .unwrap();
+        let next = |text: tokio_tungstenite::tungstenite::Message| -> Value {
+            serde_json::from_str(text.to_text().unwrap()).unwrap()
+        };
+        let first = next(socket.next().await.unwrap().unwrap());
+        assert_eq!(first["type"], "snapshot");
+        assert_eq!(first["desktops"][1]["name"], "ゲーム");
+        assert_eq!(first["desktops_error"], Value::Null);
+
+        crate::desktops::VirtualDesktops::switch(fake.as_ref(), "GUID-1").unwrap();
+        state.publish_desktops("changed").await;
+        let change = next(socket.next().await.unwrap().unwrap());
+        assert_eq!(change["type"], "desktops");
+        assert_eq!(change["reason"], "changed");
+        assert_eq!(change["desktops"][1]["current"], true);
+    }
+
+    #[tokio::test]
+    async fn buttons_report_their_desktop_binding() {
+        let text = CONFIG.replace(
+            "  - id: sf6
+",
+            "  - id: sf6
+    desktop: GUID-1
+",
+        );
+        let state = AppState::new(
+            config::parse(&text).unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        );
+        let (_, body) = call(state, "GET", "/buttons").await;
+        assert_eq!(body[0]["desktop"], Value::Null);
+        assert_eq!(body[1]["desktop"], "GUID-1");
     }
 }

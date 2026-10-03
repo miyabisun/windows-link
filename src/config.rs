@@ -22,6 +22,10 @@ pub struct Config {
 pub struct ButtonConfig {
     pub id: String,
     pub label: String,
+    /// Virtual desktop GUID (see `GET /desktops`) whose tab shows this button; none
+    /// means the button is shown on every tab.
+    #[serde(default)]
+    pub desktop: Option<String>,
     #[serde(flatten)]
     pub spec: ButtonSpec,
 }

@@ -60,6 +60,7 @@ buttons:
     type: audio.app_volume_toggle
     process: StreetFighter6.exe   # executable file name, case-insensitive
     levels: [0.2, 1.0]
+    desktop: D65417D3-28D1-4D1A-8671-F07FD9BD3B45  # optional, see below
 ```
 
 - `audio.output_toggle` switches to the second device when the first is the default, and
@@ -70,6 +71,10 @@ buttons:
   session of the process. Windows remembers per-application volume, so the state shows
   the remembered value; nothing is restored automatically. Pressing while the process has
   no audio session fails with `409 not_running`.
+- `desktop` (optional, any button type) ties the button to one virtual desktop by its ID
+  from `GET /desktops`; a panel shows it only on that desktop's tab. Buttons without it
+  belong to every tab. IDs survive renaming. A button whose desktop no longer exists stays
+  in `GET /buttons` and is logged as a warning at startup.
 
 Restart the server after editing the file.
 
@@ -78,16 +83,45 @@ Restart the server after editing the file.
 | method and path | description |
 | --- | --- |
 | `GET /healthz` | `ok` |
-| `GET /buttons` | all buttons in configuration order: `{id, type, label, state}` |
+| `GET /buttons` | all buttons in configuration order: `{id, type, label, desktop, state}` |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
-| `GET /events` | WebSocket: a `{"type":"snapshot","buttons":[…]}` message, then `{"type":"button","button":…}` whenever a button's state changes |
+| `GET /desktops` | virtual desktops: `{"desktops":[{id, name, index, current}], "error": null}` |
+| `POST /desktops/{id}/switch` | switch to a virtual desktop; returns the new `GET /desktops` body |
+| `POST /windows/{hwnd}/pin` | show a window on every virtual desktop (`hwnd` in decimal or `0x` hex) |
+| `GET /touch-monitors`, `PUT /touch-monitors/{id}` | see [Touch and the mouse cursor](#touch-and-the-mouse-cursor) |
+| `GET /events` | WebSocket: one `snapshot` message, then `button` and `desktops` messages as things change (below) |
 
 Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_unavailable`,
-`409 not_running`, or `500 audio`.
+`409 not_running`, `500 audio`, `400 invalid_hwnd`, or `503 desktops`.
+
+`/events` messages:
+
+- `{"type":"snapshot","buttons":[…],"desktops":[…],"desktops_error":null}` on connect
+- `{"type":"button","button":{…}}` when a button's state changes
+- `{"type":"desktops","reason":…,"desktops":[…],"error":null}` when the current desktop
+  changes (`changed`), or a desktop is `created`, `removed`, `renamed` or `moved`, and
+  `reconnected` after Explorer restarts. Switching with `Win + Ctrl + →` or the
+  API both produce `changed`.
 
 State changes made outside the server, such as choosing another output in the Windows
 sound settings or moving a slider in the volume mixer, are picked up through Windows
 device notifications and a one-second refresh and are pushed on `/events`.
+
+## Virtual desktops
+
+Windows switches the virtual desktop on every monitor at once, so a control panel on a
+touch monitor would disappear on desktops it was not opened on. Instead the panel pins its
+own window with `POST /windows/{hwnd}/pin` so it stays on every desktop, and shows the
+desktops as tabs: tapping a tab calls `POST /desktops/{id}/switch`, and switching any other
+way updates the tab through `/events`. Unnamed desktops are listed as `デスクトップ N`, the
+same as Windows.
+
+Windows has no public API for virtual desktops. windows-link uses the undocumented COM
+interfaces through [winvd](https://crates.io/crates/winvd) (Windows 11 24H2 or later). If
+they do not work on this build, only the virtual desktop features are disabled: `GET
+/desktops` returns an empty list with the reason in `error`, the switch and pin endpoints
+return `503`, and buttons, volume and touch keep working. When Explorer restarts, the
+server notices within a few seconds, subscribes again and sends `reconnected`.
 
 ## Touch and the mouse cursor
 

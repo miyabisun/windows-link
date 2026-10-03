@@ -4,10 +4,16 @@
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use tokio::{net::TcpListener, sync::Notify};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use windows_link::{
     audio::{Audio, UnavailableAudio, windows::WindowsAudio},
-    config, logging, port,
+    config,
+    desktops::{
+        VirtualDesktops,
+        api::{self as desktop_api, DesktopState},
+        winvd::{WinvdDesktops, watch as desktop_watch},
+    },
+    logging, port,
     server::{self, AppState},
     touch::{
         KeepCursor,
@@ -104,8 +110,16 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(UnavailableAudio(err.to_string()))
         }
     };
-    let state = AppState::new(config, audio);
+    let desktops: Arc<dyn VirtualDesktops> = Arc::new(WinvdDesktops);
+    warn_unknown_desktops(&config, desktops.as_ref());
+    let state = AppState::new(config, audio).with_desktops(desktops.clone());
     tokio::spawn(state.clone().run_refresher(changes));
+    let runtime = tokio::runtime::Handle::current();
+    let publisher = state.clone();
+    desktop_watch(move |reason| {
+        let publisher = publisher.clone();
+        runtime.spawn(async move { publisher.publish_desktops(reason).await });
+    });
 
     let store = Arc::new(Store::open(&data_dir().join("windows-link.db"))?);
     let keep = KeepCursor::new(store.keep_cursor_overrides()?);
@@ -117,7 +131,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port::from_env()?));
     let listener = bind_with_retry(bind_addr).await?;
     info!(%bind_addr, "server listening");
-    axum::serve(listener, server::app(state).merge(touch_api::router(touch)))
+    let app = server::app(state)
+        .merge(touch_api::router(touch))
+        .merge(desktop_api::router(DesktopState::new(desktops)));
+    axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
             info!("shutdown signal received");
@@ -125,6 +142,21 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     info!("server stopped");
     Ok(())
+}
+
+/// Buttons bound to a desktop that does not exist stay in `GET /buttons` but no tab
+/// shows them; say so at startup.
+fn warn_unknown_desktops(config: &config::Config, desktops: &dyn VirtualDesktops) {
+    let Ok(list) = desktops.list() else {
+        return;
+    };
+    for button in &config.buttons {
+        if let Some(id) = &button.desktop
+            && !list.iter().any(|d| d.id.eq_ignore_ascii_case(id))
+        {
+            warn!(button = %button.id, desktop = %id, "button is bound to an unknown virtual desktop");
+        }
+    }
 }
 
 /// A previous instance (restarted by Task Scheduler or an update) may still hold the
