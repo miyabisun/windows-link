@@ -242,7 +242,12 @@ PC, so do not allow inbound connections:
 
 Accepted risk: a web page open in a browser on the same PC can send requests to
 `http://127.0.0.1:4730` and press buttons. This was a deliberate choice for a personal
-machine; there is no token or origin check.
+machine; there is no token, and requests are not rejected by origin.
+
+Cross-origin reads (CORS) are allowed only for the windows-deck window
+(`http://tauri.localhost`, `https://tauri.localhost`, `tauri://localhost`) and for pages
+served from `http://localhost` or `http://127.0.0.1` on any port, such as the panel's
+development server. Other web sites cannot read the answers.
 
 ## Development
 

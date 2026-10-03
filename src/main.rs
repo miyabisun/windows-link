@@ -7,7 +7,7 @@ use tokio::{net::TcpListener, sync::Notify};
 use tracing::{error, info, warn};
 use windows_link::{
     audio::{Audio, UnavailableAudio, windows::WindowsAudio},
-    config,
+    config, cors,
     desktops::{
         VirtualDesktops,
         api::{self as desktop_api, DesktopState},
@@ -140,7 +140,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let app = server::app(state)
         .merge(touch_api::router(touch))
         .merge(desktop_api::router(DesktopState::new(desktops)))
-        .merge(update_api::router(updater));
+        .merge(update_api::router(updater))
+        .layer(cors::layer());
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
