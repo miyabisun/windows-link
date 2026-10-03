@@ -11,6 +11,9 @@ Each button does one thing:
 | `audio.output_toggle` | switches the Windows default output between two devices | the current default and whether each device is connected |
 | `audio.app_volume_toggle` | toggles one application's volume between two levels | the application's current volume, or not running |
 
+It also keeps the mouse cursor where it was when you touch a touch screen (see
+[Touch and the mouse cursor](#touch-and-the-mouse-cursor)).
+
 ## Requirements
 
 - Windows 10 or 11 (x64)
@@ -86,6 +89,35 @@ State changes made outside the server, such as choosing another output in the Wi
 sound settings or moving a slider in the volume mixer, are picked up through Windows
 device notifications and a one-second refresh and are pushed on `/events`.
 
+## Touch and the mouse cursor
+
+Windows has a single cursor: touching a screen moves it to the touched point, so after
+tapping a touch panel your mouse continues from the panel instead of where you left it.
+windows-link moves the cursor back to the last real mouse position shortly after a touch
+ends. The tap or swipe itself still reaches the application.
+
+- It is on by default for every monitor a touch digitizer is mapped to, and can be
+  switched per monitor. Settings are stored in `%LOCALAPPDATA%\windows-link\windows-link.db`
+  and keyed by the monitor's device path, so they survive restarts and reconnecting the
+  monitor to the same port.
+- With it off, the cursor stays at the touched point, as Windows normally does. Turn it
+  off for old applications that read the cursor position on their own timing after a tap.
+- If touches land on the wrong monitor, map the digitizer to the panel first with
+  `MultiDigiMon.exe -touch` (Tablet PC settings → Setup).
+
+| method and path | description |
+| --- | --- |
+| `GET /touch-monitors` | connected monitors: `{id, name, device_path, gdi_name, primary, touch, keep_cursor}` |
+| `PUT /touch-monitors/{id}` | body `{"keep_cursor": true \| false}`; returns the updated monitor (`404` if it is not connected) |
+
+How it works: applications that handle touch natively (browsers, WebView2) get no mouse
+input at all, so nothing marks the end of a tap except that the cursor moved. A low-level
+mouse hook records where the real mouse is, and every 40 ms the cursor is checked: when it
+sits still somewhere the real mouse did not put it (the mouse quiet for 150 ms) on a touch
+monitor that keeps the cursor, it is moved back. For applications that get touch as
+promoted mouse input, nothing is moved while the finger is down, so their drags are not
+interrupted.
+
 ## Start at logon
 
 Copy the release build to a per-user location and register a Task Scheduler task that
@@ -140,6 +172,19 @@ cargo test --locked
 
 The button logic and the HTTP API are tested against an in-memory audio backend; the
 Windows Core Audio backend (`src/audio/windows.rs`) is exercised on a real machine.
+
+To check the touch cursor keeper without a finger, inject synthetic touch (coordinates
+are physical pixels; `park` moves the mouse like a real mouse would):
+
+```powershell
+cargo run --example touch_tap -- park 1280 720
+cargo run --example touch_tap -- tap 1378 1950
+cargo run --example touch_tap -- swipe 1378 2420 1378 2170
+```
+
+The tool prints the cursor position before and 300 ms after the gesture. Point it at a
+window on the touch monitor that shows whether the tap arrived (for example a page that
+counts clicks in its title).
 
 ## License
 

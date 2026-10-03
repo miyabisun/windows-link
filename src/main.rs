@@ -9,6 +9,12 @@ use windows_link::{
     audio::{Audio, UnavailableAudio, windows::WindowsAudio},
     config, logging, port,
     server::{self, AppState},
+    touch::{
+        KeepCursor,
+        api::{self as touch_api, TouchState},
+        store::Store,
+        windows::{WindowsDisplays, start_hook},
+    },
 };
 
 const USAGE: &str = "usage: windows-link [devices | --version]
@@ -18,6 +24,12 @@ const USAGE: &str = "usage: windows-link [devices | --version]
   --version      print the version";
 
 fn main() -> ExitCode {
+    // Hook, cursor and monitor coordinates must all be physical pixels.
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
     let console = attach_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
@@ -48,9 +60,13 @@ fn attach_console() -> bool {
     }
 }
 
-fn log_file() -> PathBuf {
+fn data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    base.join("windows-link").join("windows-link.log")
+    base.join("windows-link")
+}
+
+fn log_file() -> PathBuf {
+    data_dir().join("windows-link.log")
 }
 
 fn run_server(console: bool) -> ExitCode {
@@ -91,10 +107,17 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(config, audio);
     tokio::spawn(state.clone().run_refresher(changes));
 
+    let store = Arc::new(Store::open(&data_dir().join("windows-link.db"))?);
+    let keep = KeepCursor::new(store.keep_cursor_overrides()?);
+    if let Err(err) = start_hook(keep.clone()) {
+        error!(%err, "touch cursor keeper is unavailable");
+    }
+    let touch = TouchState::new(Arc::new(WindowsDisplays), store, keep);
+
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port::from_env()?));
     let listener = bind_with_retry(bind_addr).await?;
     info!(%bind_addr, "server listening");
-    axum::serve(listener, server::app(state))
+    axum::serve(listener, server::app(state).merge(touch_api::router(touch)))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
             info!("shutdown signal received");
