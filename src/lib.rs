@@ -6,3 +6,4 @@ pub mod logging;
 pub mod port;
 pub mod server;
 pub mod touch;
+pub mod update;

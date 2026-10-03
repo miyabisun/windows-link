@@ -21,11 +21,12 @@ use windows_link::{
         store::Store,
         windows::{WindowsDisplays, start_hook},
     },
+    update::{self, Updater, api as update_api, swap},
 };
 
 const USAGE: &str = "usage: windows-link [devices | --version]
 
-  (no argument)  run the server (PORT, LOG_LEVEL, WINDOWS_LINK_CONFIG)
+  (no argument)  run the server (PORT, LOG_LEVEL, WINDOWS_LINK_CONFIG, WINDOWS_LINK_UPDATE_URL)
   devices        list audio output endpoints and their IDs for config.yaml
   --version      print the version";
 
@@ -130,10 +131,16 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port::from_env()?));
     let listener = bind_with_retry(bind_addr).await?;
-    info!(%bind_addr, "server listening");
+    info!(%bind_addr, version = env!("CARGO_PKG_VERSION"), "server listening");
+    let updater = Arc::new(Updater::from_env());
+    if let Some(exe) = updater.installed_exe() {
+        swap::remove_old_later(exe);
+    }
+    tokio::spawn(update::run_periodically(updater.clone()));
     let app = server::app(state)
         .merge(touch_api::router(touch))
-        .merge(desktop_api::router(DesktopState::new(desktops)));
+        .merge(desktop_api::router(DesktopState::new(desktops)))
+        .merge(update_api::router(updater));
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

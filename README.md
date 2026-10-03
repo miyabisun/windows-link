@@ -12,12 +12,31 @@ Each button does one thing:
 | `audio.app_volume_toggle` | toggles one application's volume between two levels | the application's current volume, or not running |
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
-[Touch and the mouse cursor](#touch-and-the-mouse-cursor)).
+[Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
+Windows virtual desktops, and updates itself from GitHub Releases (see [Updates](#updates)).
 
 ## Requirements
 
 - Windows 10 or 11 (x64)
 - To build: Rust 1.96 (selected by `rust-toolchain.toml`) with the MSVC toolchain
+
+## Install
+
+Download `windows-link-x86_64-pc-windows-msvc.exe` from the
+[latest release](https://github.com/miyabisun/windows-link/releases/latest) and save it as
+`%LOCALAPPDATA%\Programs\windows-link\windows-link.exe`, then register it to
+[start at logon](#start-at-logon). From PowerShell:
+
+```powershell
+$dir = "$env:LOCALAPPDATA\Programs\windows-link"
+New-Item -ItemType Directory -Force $dir | Out-Null
+Invoke-WebRequest -OutFile "$dir\windows-link.exe" `
+  https://github.com/miyabisun/windows-link/releases/latest/download/windows-link-x86_64-pc-windows-msvc.exe
+& "$dir\windows-link.exe" devices   # list output devices and their IDs
+```
+
+Only a copy in that folder [updates itself](#updates). Each release also has a `.sha256`
+file to check the download against.
 
 ## Build and run
 
@@ -27,13 +46,14 @@ cargo build --release
 .\target\release\windows-link.exe           # run the server
 ```
 
-The server reads two environment variables:
+The server reads these environment variables:
 
 | variable | default | meaning |
 | --- | --- | --- |
 | `PORT` | `4730` | TCP port to listen on |
 | `LOG_LEVEL` | `info` | `off`, `error`, `warn`, `info`, `debug` or `trace` |
 | `WINDOWS_LINK_CONFIG` | `%LOCALAPPDATA%\windows-link\config.yaml` | configuration file |
+| `WINDOWS_LINK_UPDATE_URL` | this repository's latest release in the GitHub API | where [updates](#updates) come from |
 
 The release build has no console window. When it is started without a terminal (for
 example at logon), logs go to `%LOCALAPPDATA%\windows-link\windows-link.log`.
@@ -89,10 +109,12 @@ Restart the server after editing the file.
 | `POST /desktops/{id}/switch` | switch to a virtual desktop; returns the new `GET /desktops` body |
 | `POST /windows/{hwnd}/pin` | show a window on every virtual desktop (`hwnd` in decimal or `0x` hex) |
 | `GET /touch-monitors`, `PUT /touch-monitors/{id}` | see [Touch and the mouse cursor](#touch-and-the-mouse-cursor) |
+| `GET /version` | `{"version": "0.1.0"}` |
+| `POST /update/check` | check for an update now (see [Updates](#updates)) |
 | `GET /events` | WebSocket: one `snapshot` message, then `button` and `desktops` messages as things change (below) |
 
 Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_unavailable`,
-`409 not_running`, `500 audio`, `400 invalid_hwnd`, or `503 desktops`.
+`409 not_running`, `500 audio`, `400 invalid_hwnd`, `503 desktops`, or `502 update`.
 
 `/events` messages:
 
@@ -154,15 +176,11 @@ interrupted.
 
 ## Start at logon
 
-Copy the release build to a per-user location and register a Task Scheduler task that
-starts it when you sign in. The trigger is limited to your own logon, so no
-administrator rights are needed:
+Register a Task Scheduler task that starts the [installed](#install) exe when you sign
+in. The trigger is limited to your own logon, so no administrator rights are needed:
 
 ```powershell
 $dir = "$env:LOCALAPPDATA\Programs\windows-link"
-New-Item -ItemType Directory -Force $dir | Out-Null
-Copy-Item .\target\release\windows-link.exe $dir
-
 $action = New-ScheduledTaskAction -Execute "$dir\windows-link.exe"
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
@@ -177,6 +195,36 @@ restarting the task right after stopping it is fine.
 
 It runs as a normal process in your session, not as a Windows service: per-application
 audio sessions are not reachable from the service session.
+
+## Updates
+
+The installed server checks the latest GitHub release when it starts and every hour.
+When the release is newer than itself it updates without asking:
+
+1. downloads the exe and its `.sha256` file over HTTPS and checks the SHA-256,
+2. saves it as `windows-link.exe.new` and checks that it runs and reports the release's
+   version,
+3. renames the running exe to `windows-link.exe.old` (Windows allows renaming a running
+   exe, not replacing it) and moves the new one into its place,
+4. starts the new exe with the same arguments and exits. The new process waits for the
+   port, then deletes `windows-link.exe.old`.
+
+Any failure leaves the running version as it is and is logged; the next check tries
+again. A panel such as windows-deck reconnects by itself, so an update shows as a moment
+of "disconnected". Debug builds and copies run from anywhere other than
+`%LOCALAPPDATA%\Programs\windows-link` never update.
+
+`POST /update/check` checks immediately and answers with one of:
+
+- `{"result": "up_to_date", "current": "0.1.0", "latest": "0.1.0"}`
+- `{"result": "restarting", "current": "0.1.0", "latest": "0.1.1"}`: the server restarts
+  into the new version right after answering
+- `{"result": "skipped", "current": "0.1.0", "reason": "development build"}`
+- `502 {"error": "update", "message": …}` when the release could not be fetched or
+  checked
+
+Releases are built by GitHub Actions when a `vX.Y.Z` tag is pushed
+(`.github/workflows/release.yml`); the tag must match the version in `Cargo.toml`.
 
 ## Network exposure
 
@@ -206,6 +254,10 @@ cargo test --locked
 
 The button logic and the HTTP API are tested against an in-memory audio backend; the
 Windows Core Audio backend (`src/audio/windows.rs`) is exercised on a real machine.
+
+To try an update without publishing a release, serve a GitHub-style release JSON from
+this machine and point `WINDOWS_LINK_UPDATE_URL` at it (plain HTTP is accepted only for
+`127.0.0.1`, `localhost` and `[::1]`; every other URL must be HTTPS).
 
 To check the touch cursor keeper without a finger, inject synthetic touch (coordinates
 are physical pixels; `park` moves the mouse like a real mouse would):

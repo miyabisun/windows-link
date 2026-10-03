@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    env:
+      ASSET: windows-link-x86_64-pc-windows-msvc.exe
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check that the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
+          }
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package the exe and its SHA-256
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target\release\windows-link.exe "dist\$env:ASSET"
+          $hash = (Get-FileHash "dist\$env:ASSET" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$PWD\dist\$env:ASSET.sha256", "$hash  $env:ASSET`n")
+          Get-Content "dist\$env:ASSET.sha256"
+
+      - name: Publish the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME "dist\$env:ASSET" "dist\$env:ASSET.sha256" --title $env:GITHUB_REF_NAME --generate-notes --verify-tag
