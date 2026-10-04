@@ -10,6 +10,7 @@ Each button does one thing:
 | --- | --- | --- |
 | `audio.output_toggle` | switches the Windows default output between two devices | the current default and whether each device is connected |
 | `audio.app_volume_toggle` | toggles one application's volume between two levels | the application's current volume, or not running |
+| `discord.voice` | joins one Discord voice channel, or leaves it when you are in it | whether you are in that channel, or why Discord cannot be reached |
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -54,6 +55,7 @@ The server reads these environment variables:
 | `LOG_LEVEL` | `info` | `off`, `error`, `warn`, `info`, `debug` or `trace` |
 | `WINDOWS_LINK_CONFIG` | `%LOCALAPPDATA%\windows-link\config.yaml` | configuration file |
 | `WINDOWS_LINK_UPDATE_URL` | this repository's latest release in the GitHub API | where [updates](#updates) come from |
+| `WINDOWS_LINK_SECRETS` | `%LOCALAPPDATA%\windows-link\secrets.yaml` | credentials for outside services ([Discord](#discord)) |
 
 The release build has no console window. When it is started without a terminal (for
 example at logon), logs go to `%LOCALAPPDATA%\windows-link\windows-link.log`.
@@ -81,6 +83,10 @@ buttons:
     process: StreetFighter6.exe   # executable file name, case-insensitive
     levels: [0.2, 1.0]
     desktop: D65417D3-28D1-4D1A-8671-F07FD9BD3B45  # optional, see below
+  - id: vc-friends
+    label: Friends VC
+    type: discord.voice
+    channel_id: 1533091153086251103   # from `windows-link discord-channels`
 ```
 
 - `audio.output_toggle` switches to the second device when the first is the default, and
@@ -91,12 +97,53 @@ buttons:
   session of the process. Windows remembers per-application volume, so the state shows
   the remembered value; nothing is restored automatically. Pressing while the process has
   no audio session fails with `409 not_running`.
+- `discord.voice` joins its channel (moving you out of any other voice channel), or
+  leaves it when you are already there. Add one button per channel. See
+  [Discord](#discord) for the one-time setup.
 - `desktop` (optional, any button type) ties the button to one virtual desktop by its ID
   from `GET /desktops`; a panel shows it only on that desktop's tab. Buttons without it
   belong to every tab. IDs survive renaming. A button whose desktop no longer exists stays
   in `GET /buttons` and is logged as a warning at startup.
 
 Restart the server after editing the file.
+
+## Discord
+
+The `discord.voice` buttons drive the Discord desktop app on the same PC through its local
+RPC, signed in as a Discord application of your own:
+
+1. In the [Developer Portal](https://discord.com/developers/applications), signed in
+   with the account you use in the Discord app, create an application. Under OAuth2, add
+   the redirect `http://127.0.0.1`. (Until Discord approves an application, only its
+   owner and its testers can use RPC with it.)
+2. Put its Client ID and Client Secret in `%LOCALAPPDATA%\windows-link\secrets.yaml`
+   (`WINDOWS_LINK_SECRETS` overrides the path), which holds credentials per service:
+
+   ```yaml
+   discord:
+     client_id: 1234567890123456789
+     client_secret: your-client-secret
+   ```
+
+3. With Discord running, run `windows-link discord-channels`. The first time, Discord
+   asks you to approve windows-link; then it lists the voice channels you can join:
+
+   ```text
+   My server
+     1556097803241918564  general-voice
+   ```
+
+4. Add a `discord.voice` button per channel you want, using the IDs from the list, and
+   restart the server.
+
+windows-link keeps the approval in `%LOCALAPPDATA%\windows-link\discord-token.json` and
+renews it before it expires. It connects to Discord while Discord runs and reconnects
+after Discord restarts; until then the buttons report `available: false` with the reason.
+Pressing one while Discord is not running starts Discord minimized and joins once it is
+ready (up to a minute). Joining does not bring Discord's window to the front.
+
+Press errors: `409 discord_unavailable` (Discord did not start or cannot be used, with the
+reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 
 ## API
 
@@ -114,7 +161,8 @@ Restart the server after editing the file.
 | `GET /events` | WebSocket: one `snapshot` message, then `button` and `desktops` messages as things change (below) |
 
 Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_unavailable`,
-`409 not_running`, `500 audio`, `400 invalid_hwnd`, `503 desktops`, or `502 update`.
+`409 not_running`, `500 audio`, `409 discord_unavailable`, `409 discord_rejected`,
+`500 discord`, `400 invalid_hwnd`, `503 desktops`, or `502 update`.
 
 `/events` messages:
 

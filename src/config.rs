@@ -39,6 +39,12 @@ pub enum ButtonSpec {
     /// Toggle one process's session volume between two levels (0.0-1.0).
     #[serde(rename = "audio.app_volume_toggle")]
     AppVolumeToggle { process: String, levels: [f32; 2] },
+    /// Join one Discord voice channel, or leave it when already there.
+    #[serde(rename = "discord.voice")]
+    DiscordVoice {
+        #[serde(deserialize_with = "crate::secrets::id_text")]
+        channel_id: String,
+    },
 }
 
 impl ButtonSpec {
@@ -46,6 +52,7 @@ impl ButtonSpec {
         match self {
             Self::OutputToggle { .. } => "audio.output_toggle",
             Self::AppVolumeToggle { .. } => "audio.app_volume_toggle",
+            Self::DiscordVoice { .. } => "discord.voice",
         }
     }
 }
@@ -136,6 +143,13 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                     )));
                 }
             }
+            ButtonSpec::DiscordVoice { channel_id } => {
+                if !channel_id.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(ConfigError(format!(
+                        "button {id:?}: channel_id must be a Discord channel ID (digits; see `windows-link discord-channels`)"
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -210,6 +224,32 @@ buttons:
     fn rejects_identical_output_devices() {
         let text = SAMPLE.replace("[motu, jbl]", "[motu, motu]");
         assert!(parse(&text).unwrap_err().0.contains("must differ"));
+    }
+
+    #[test]
+    fn discord_voice_buttons_take_one_channel_each_quoted_or_not() {
+        let text = format!(
+            "{SAMPLE}  - id: vc-apex
+    label: APEX
+    type: discord.voice
+    channel_id: 1234567890123456789
+  - id: vc-sf6
+    label: SF6
+    type: discord.voice
+    channel_id: \"987\"
+"
+        );
+        let config = parse(&text).unwrap();
+        assert!(matches!(
+            &config.buttons[2].spec,
+            ButtonSpec::DiscordVoice { channel_id } if channel_id == "1234567890123456789"
+        ));
+        assert!(matches!(
+            &config.buttons[3].spec,
+            ButtonSpec::DiscordVoice { channel_id } if channel_id == "987"
+        ));
+        let bad = text.replace("\"987\"", "general");
+        assert!(parse(&bad).unwrap_err().0.contains("channel_id"));
     }
 
     #[test]

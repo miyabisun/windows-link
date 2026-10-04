@@ -22,6 +22,7 @@ use crate::{
     buttons::{self, AudioSnapshot, ButtonState, ButtonView, PressError},
     config::Config,
     desktops::{self, VirtualDesktops},
+    discord::{NoVoice, Voice},
 };
 
 /// How often state is re-read to catch changes Windows does not notify (e.g. mixer volume).
@@ -33,6 +34,7 @@ pub struct AppState {
     audio: Arc<dyn Audio>,
     hub: Arc<Hub>,
     desktops: Option<Arc<dyn VirtualDesktops>>,
+    voice: Arc<dyn Voice>,
 }
 
 struct Hub {
@@ -51,7 +53,15 @@ impl AppState {
                 events,
             }),
             desktops: None,
+            voice: Arc::new(NoVoice("no Discord connection".into())),
         }
+    }
+
+    /// Back the `discord.voice` buttons with a Discord connection.
+    #[must_use]
+    pub fn with_voice(mut self, voice: Arc<dyn Voice>) -> Self {
+        self.voice = voice;
+        self
     }
 
     /// Include virtual desktops in `/events` snapshots and change messages.
@@ -87,9 +97,11 @@ impl AppState {
     pub async fn refresh(&self) -> Vec<ButtonView> {
         let config = self.config.clone();
         let audio = self.audio.clone();
-        let views = tokio::task::spawn_blocking(move || compute(&config, audio.as_ref()))
-            .await
-            .unwrap_or_default();
+        let voice = self.voice.clone();
+        let views =
+            tokio::task::spawn_blocking(move || compute(&config, audio.as_ref(), voice.as_ref()))
+                .await
+                .unwrap_or_default();
         let mut last = self.hub.last.lock().await;
         for view in &views {
             if !last.contains(view) {
@@ -115,13 +127,14 @@ impl AppState {
     }
 }
 
-fn compute(config: &Config, audio: &dyn Audio) -> Vec<ButtonView> {
+fn compute(config: &Config, audio: &dyn Audio, voice: &dyn Voice) -> Vec<ButtonView> {
     let snapshot = AudioSnapshot::read(audio);
+    let voice = voice.status();
     config
         .buttons
         .iter()
         .map(|button| match &snapshot {
-            Ok(snapshot) => buttons::view(config, button, snapshot, audio),
+            Ok(snapshot) => buttons::view(config, button, snapshot, audio, &voice),
             Err(error) => ButtonView {
                 id: button.id.clone(),
                 kind: button.spec.type_name(),
@@ -160,10 +173,12 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let config = state.config.clone();
     let audio = state.audio.clone();
+    let voice = state.voice.clone();
     let pressed_id = id.clone();
-    let result =
-        tokio::task::spawn_blocking(move || buttons::press(&config, &pressed_id, audio.as_ref()))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        buttons::press(&config, &pressed_id, audio.as_ref(), voice.as_ref())
+    })
+    .await;
     match result {
         Ok(Ok(())) => {
             let views = state.refresh().await;
@@ -177,6 +192,10 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
         }
         Ok(Err(PressError::Conflict { code, message })) => {
             error(StatusCode::CONFLICT, code, &message)
+        }
+        Ok(Err(PressError::Discord(failure))) => {
+            warn!(button = %id, %failure, "press failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "discord", &failure)
         }
         Ok(Err(PressError::Audio(failure))) => {
             warn!(button = %id, %failure, "press failed");

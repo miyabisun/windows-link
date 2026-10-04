@@ -7,13 +7,20 @@ use tokio::{net::TcpListener, sync::Notify};
 use tracing::{error, info, warn};
 use windows_link::{
     audio::{Audio, UnavailableAudio, windows::WindowsAudio},
-    config, cors,
+    config::{self, ButtonSpec},
+    cors,
     desktops::{
         VirtualDesktops,
         api::{self as desktop_api, DesktopState},
         winvd::{WinvdDesktops, watch as desktop_watch},
     },
-    logging, port,
+    discord::{
+        NoVoice, Voice, channel_listing,
+        client::{Client, ConnectError, sign_in},
+        service::DiscordVoice,
+        token,
+    },
+    logging, port, secrets,
     server::{self, AppState},
     touch::{
         KeepCursor,
@@ -24,11 +31,12 @@ use windows_link::{
     update::{self, Updater, api as update_api, swap},
 };
 
-const USAGE: &str = "usage: windows-link [devices | --version]
+const USAGE: &str = "usage: windows-link [devices | discord-channels | --version]
 
-  (no argument)  run the server (PORT, LOG_LEVEL, WINDOWS_LINK_CONFIG, WINDOWS_LINK_UPDATE_URL)
-  devices        list audio output endpoints and their IDs for config.yaml
-  --version      print the version";
+  (no argument)     run the server (PORT, LOG_LEVEL, WINDOWS_LINK_CONFIG, WINDOWS_LINK_UPDATE_URL)
+  devices           list audio output endpoints and their IDs for config.yaml
+  discord-channels  list the Discord voice channels you can join, with their IDs
+  --version         print the version";
 
 fn main() -> ExitCode {
     // Hook, cursor and monitor coordinates must all be physical pixels.
@@ -42,6 +50,7 @@ fn main() -> ExitCode {
     match args.as_slice() {
         [] => run_server(console),
         [command] if command == "devices" => list_devices(),
+        [command] if command == "discord-channels" => list_discord_channels(),
         [command] if command == "--version" => {
             println!("windows-link {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -113,7 +122,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     };
     let desktops: Arc<dyn VirtualDesktops> = Arc::new(WinvdDesktops);
     warn_unknown_desktops(&config, desktops.as_ref());
-    let state = AppState::new(config, audio).with_desktops(desktops.clone());
+    let voice = discord_voice(&config, changes.clone());
+    let state = AppState::new(config, audio)
+        .with_desktops(desktops.clone())
+        .with_voice(voice);
     tokio::spawn(state.clone().run_refresher(changes));
     let runtime = tokio::runtime::Handle::current();
     let publisher = state.clone();
@@ -178,6 +190,103 @@ async fn bind_with_retry(addr: SocketAddr) -> std::io::Result<TcpListener> {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
             result => return result,
+        }
+    }
+}
+
+/// Connect to Discord only when a button needs it.
+fn discord_voice(config: &config::Config, changes: Arc<Notify>) -> Arc<dyn Voice> {
+    let needed = config
+        .buttons
+        .iter()
+        .any(|b| matches!(b.spec, ButtonSpec::DiscordVoice { .. }));
+    if !needed {
+        return Arc::new(NoVoice("no Discord buttons are configured".into()));
+    }
+    let path = secrets::default_path();
+    match secrets::load(&path) {
+        Ok(secrets::Secrets {
+            discord: Some(app), ..
+        }) => DiscordVoice::start(app, token::default_path(), changes),
+        Ok(_) => {
+            let reason = format!("{} has no discord section", path.display());
+            warn!(%reason, "Discord buttons cannot work");
+            Arc::new(NoVoice(reason))
+        }
+        Err(reason) => {
+            error!(%reason, "Discord buttons cannot work");
+            Arc::new(NoVoice(reason))
+        }
+    }
+}
+
+fn list_discord_channels() -> ExitCode {
+    let path = secrets::default_path();
+    let app = match secrets::load(&path) {
+        Ok(secrets::Secrets {
+            discord: Some(app), ..
+        }) => app,
+        Ok(_) => {
+            eprintln!(
+                "{} needs a discord section with client_id and client_secret",
+                path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("cannot start: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let listed = runtime.block_on(async {
+        let client = Client::connect(&app.client_id)
+            .await
+            .map_err(|err| match err {
+                ConnectError::NotRunning => "Discord is not running; start it first".to_owned(),
+                other @ ConnectError::Failed(_) => other.to_string(),
+            })?;
+        let token_path = token::default_path();
+        if token::load(&token_path).is_none() {
+            eprintln!("Approve windows-link in the dialog Discord shows...");
+        }
+        sign_in(&client, &app, &token_path, true)
+            .await
+            .map_err(|err| err.to_string())?;
+        let guilds = client
+            .command("GET_GUILDS", serde_json::json!({}))
+            .await
+            .map_err(|err| err.to_string())?;
+        let mut listing = Vec::new();
+        for guild in guilds["guilds"].as_array().into_iter().flatten() {
+            let channels = client
+                .command(
+                    "GET_CHANNELS",
+                    serde_json::json!({ "guild_id": guild["id"] }),
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+            listing.push((guild.clone(), channels));
+        }
+        Ok::<_, String>(channel_listing(&listing))
+    });
+    match listed {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
         }
     }
 }
