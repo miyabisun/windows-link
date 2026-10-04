@@ -147,9 +147,11 @@ buttons:
   folder. With `process`, the state shows `running` while that exe runs, and a press then
   brings its window to the front (restoring it when minimized) instead of opening another
   one. `admin: true` opens it as administrator, after Windows asks for consent.
-- `steam.game` starts the game through Steam (`steam://rungameid/<app_id>`) and shows
-  `running` while `process` runs; pressing it then asks the game's windows to close, like
-  their close button (`409 no_window` while it has none yet).
+- `steam.game` starts the game through Steam (`steam://rungameid/<app_id>`) and brings its
+  window to the front as soon as it appears (started this way, a game would otherwise open
+  behind the window that had the focus and may not go full screen). It shows `running`
+  while `process` runs; pressing it then asks the game's windows to close, like their close
+  button (`409 no_window` while it has none yet).
 - `icon` (optional, any button type) is a file whose Windows icon the button shows: an exe,
   a shortcut, an image or a `shell:AppsFolder\…` app. `app.launch` buttons show their
   target's icon without it.

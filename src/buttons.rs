@@ -321,7 +321,9 @@ pub fn press(
             } else {
                 launcher
                     .open(&format!("steam://rungameid/{app_id}"), None, false)
-                    .map_err(PressError::Launch)
+                    .map_err(PressError::Launch)?;
+                launcher.focus_when_ready(process);
+                Ok(())
             }
         }
     }
@@ -712,6 +714,7 @@ buttons:
             *launcher.opened.lock().unwrap(),
             ["steam://rungameid/1364780"]
         );
+        assert_eq!(*launcher.awaited.lock().unwrap(), ["StreetFighter6.exe"]);
 
         launcher
             .running

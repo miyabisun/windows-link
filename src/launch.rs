@@ -13,6 +13,11 @@ pub trait Launcher: Send + Sync + 'static {
     /// Bring the process's main window to the front (restoring it when minimized).
     /// `Ok(false)` when it has no window to show.
     fn focus(&self, process: &str) -> Result<bool, String>;
+    /// In the background, wait for the process's main window to appear and bring it to
+    /// the front once. A program started through another one (a game through Steam)
+    /// otherwise starts behind the window that had the focus, and a game then may not
+    /// go full screen.
+    fn focus_when_ready(&self, process: &str);
     /// Ask the process's windows to close, like clicking their close button. Returns
     /// how many windows were asked.
     fn close(&self, process: &str) -> Result<usize, String>;
@@ -134,9 +139,34 @@ pub mod windows {
         search.found
     }
 
+    /// How long a started program may take to show its window.
+    const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
     pub struct WindowsLauncher;
 
     impl Launcher for WindowsLauncher {
+        fn focus_when_ready(&self, process: &str) {
+            let process = process.to_owned();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + READY_TIMEOUT;
+                while std::time::Instant::now() < deadline {
+                    if main_window(&pids_of(&process)).is_some() {
+                        match WindowsLauncher.focus(&process) {
+                            Ok(_) => {
+                                tracing::info!(%process, "brought the started program to the front");
+                            }
+                            Err(message) => {
+                                tracing::warn!(%message, "cannot bring the started program to the front");
+                            }
+                        }
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                tracing::warn!(%process, "the started program showed no window in time");
+            });
+        }
+
         fn focus(&self, process: &str) -> Result<bool, String> {
             let pids = pids_of(process);
             let Some(hwnd) = main_window(&pids) else {
@@ -246,6 +276,7 @@ pub mod fake {
         pub running: Mutex<Processes>,
         pub opened: Mutex<Vec<String>>,
         pub focused: Mutex<Vec<String>>,
+        pub awaited: Mutex<Vec<String>>,
     }
 
     impl Launcher for FakeLauncher {
@@ -256,6 +287,10 @@ pub mod fake {
             }
             self.opened.lock().unwrap().push(line);
             Ok(())
+        }
+
+        fn focus_when_ready(&self, process: &str) {
+            self.awaited.lock().unwrap().push(process.to_owned());
         }
 
         fn focus(&self, process: &str) -> Result<bool, String> {
