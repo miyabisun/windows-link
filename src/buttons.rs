@@ -1,11 +1,14 @@
 //! Button state and press logic, independent of HTTP and of the audio backend.
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 
 use crate::{
     audio::{Audio, AudioError, Device},
     config::{ButtonConfig, ButtonSpec, Config},
     discord::{Voice, VoiceError, VoiceStatus},
+    launch::{Launcher, Processes, is_running},
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -38,6 +41,12 @@ pub enum ButtonState {
         joined: bool,
         reason: Option<String>,
     },
+    /// A program, shortcut or URL to open.
+    Launch {},
+    /// A Steam game: a press starts it, or closes it while `running`.
+    Game {
+        running: bool,
+    },
     Error {
         message: String,
     },
@@ -49,7 +58,12 @@ pub struct ButtonView {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub label: String,
+    /// The desktop (by name) whose tab shows this button; `None` for shared buttons,
+    /// which every tab shows except those named in `except`.
     pub desktop: Option<String>,
+    pub except: Vec<String>,
+    /// Whether `GET /buttons/{id}/icon` has a picture.
+    pub icon: bool,
     pub state: ButtonState,
 }
 
@@ -63,6 +77,7 @@ pub enum PressError {
     },
     Audio(AudioError),
     Discord(String),
+    Launch(String),
 }
 
 /// Default-output target after a press: the second device when the first is the
@@ -108,29 +123,52 @@ impl AudioSnapshot {
     }
 }
 
+/// The file whose Windows icon the button shows: its `icon`, or what an
+/// `app.launch` button opens when that is a file.
+pub fn icon_path(button: &ButtonConfig) -> Option<PathBuf> {
+    if let Some(icon) = &button.icon {
+        return Some(icon.clone());
+    }
+    match &button.spec {
+        ButtonSpec::AppLaunch { target, .. } if !target.contains("://") => {
+            Some(PathBuf::from(target))
+        }
+        _ => None,
+    }
+}
+
+/// Everything read once per refresh that the button states need.
+pub struct Readings<'a> {
+    pub audio: &'a AudioSnapshot,
+    pub voice: &'a VoiceStatus,
+    pub processes: &'a Processes,
+}
+
 pub fn view(
     config: &Config,
     button: &ButtonConfig,
-    snapshot: &AudioSnapshot,
+    readings: &Readings<'_>,
     audio: &dyn Audio,
-    voice: &VoiceStatus,
 ) -> ButtonView {
     ButtonView {
         id: button.id.clone(),
         kind: button.spec.type_name(),
         label: button.label.clone(),
         desktop: button.desktop.clone(),
-        state: state(config, &button.spec, snapshot, audio, voice),
+        except: button.except.clone(),
+        icon: icon_path(button).is_some_and(|path| path.exists()),
+        state: state(config, &button.spec, readings, audio),
     }
 }
 
 fn state(
     config: &Config,
     spec: &ButtonSpec,
-    snapshot: &AudioSnapshot,
+    readings: &Readings<'_>,
     audio: &dyn Audio,
-    voice: &VoiceStatus,
 ) -> ButtonState {
+    let snapshot = readings.audio;
+    let voice = readings.voice;
     match spec {
         ButtonSpec::OutputToggle { devices } => {
             let options = devices
@@ -180,6 +218,10 @@ fn state(
             joined: voice.available && voice.selected.as_deref() == Some(channel_id.as_str()),
             reason: voice.reason.clone(),
         },
+        ButtonSpec::AppLaunch { .. } => ButtonState::Launch {},
+        ButtonSpec::SteamGame { process, .. } => ButtonState::Game {
+            running: is_running(readings.processes, process),
+        },
     }
 }
 
@@ -188,6 +230,7 @@ pub fn press(
     id: &str,
     audio: &dyn Audio,
     voice: &dyn Voice,
+    launcher: &dyn Launcher,
 ) -> Result<(), PressError> {
     let button = config
         .buttons
@@ -241,6 +284,24 @@ pub fn press(
                 VoiceError::Failed(message) => PressError::Discord(message),
             })
         }
+        ButtonSpec::AppLaunch { target, args } => launcher
+            .open(target, args.as_deref())
+            .map_err(PressError::Launch),
+        ButtonSpec::SteamGame { app_id, process } => {
+            if is_running(&launcher.processes(), process) {
+                match launcher.close(process).map_err(PressError::Launch)? {
+                    0 => Err(PressError::Conflict {
+                        code: "no_window",
+                        message: format!("{process} has no window to close yet"),
+                    }),
+                    _ => Ok(()),
+                }
+            } else {
+                launcher
+                    .open(&format!("steam://rungameid/{app_id}"), None)
+                    .map_err(PressError::Launch)
+            }
+        }
     }
 }
 
@@ -252,10 +313,21 @@ mod tests {
         buttons::AudioSnapshot,
         config,
         discord::{Voice, VoiceStatus, fake::FakeVoice},
+        launch::{Launcher, Processes, fake::FakeLauncher},
     };
 
     fn no_voice() -> VoiceStatus {
         VoiceStatus::unavailable("no Discord buttons")
+    }
+
+    static NO_PROCESSES: std::sync::LazyLock<Processes> = std::sync::LazyLock::new(Processes::new);
+
+    fn readings<'a>(audio: &'a AudioSnapshot, voice: &'a VoiceStatus) -> super::Readings<'a> {
+        super::Readings {
+            audio,
+            voice,
+            processes: &NO_PROCESSES,
+        }
     }
 
     const CONFIG: &str = r"
@@ -322,11 +394,23 @@ buttons:
     fn output_press_switches_the_default_and_the_state_follows() {
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), Some("id-motu"));
-        press(&config, "output", &audio, &FakeVoice::new(false, None)).unwrap();
+        press(
+            &config,
+            "output",
+            &audio,
+            &FakeVoice::new(false, None),
+            &FakeLauncher::default(),
+        )
+        .unwrap();
         assert_eq!(audio.default_output().unwrap().as_deref(), Some("id-jbl"));
 
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let view = view(&config, &config.buttons[0], &snapshot, &audio, &no_voice());
+        let view = view(
+            &config,
+            &config.buttons[0],
+            &readings(&snapshot, &no_voice()),
+            &audio,
+        );
         assert!(matches!(
             view.state,
             ButtonState::Output { current: Some(ref a), current_name: Some(ref n), .. }
@@ -339,7 +423,14 @@ buttons:
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), Some("id-motu"));
         audio.set_connected("id-jbl", false);
-        let error = press(&config, "output", &audio, &FakeVoice::new(false, None)).unwrap_err();
+        let error = press(
+            &config,
+            "output",
+            &audio,
+            &FakeVoice::new(false, None),
+            &FakeLauncher::default(),
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             PressError::Conflict { code: "device_unavailable", ref message } if message.contains("JBL")
@@ -352,7 +443,12 @@ buttons:
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), Some("id-hdmi"));
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let view = view(&config, &config.buttons[0], &snapshot, &audio, &no_voice());
+        let view = view(
+            &config,
+            &config.buttons[0],
+            &readings(&snapshot, &no_voice()),
+            &audio,
+        );
         assert!(matches!(
             view.state,
             ButtonState::Output { current: None, current_name: Some(ref n), .. } if n == "HDMI"
@@ -364,9 +460,21 @@ buttons:
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), None);
         audio.set_volume("streetfighter6.exe", 1.0);
-        press(&config, "sf6", &audio, &FakeVoice::new(false, None)).unwrap();
+        press(
+            &config,
+            "sf6",
+            &audio,
+            &FakeVoice::new(false, None),
+            &FakeLauncher::default(),
+        )
+        .unwrap();
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let view = view(&config, &config.buttons[1], &snapshot, &audio, &no_voice());
+        let view = view(
+            &config,
+            &config.buttons[1],
+            &readings(&snapshot, &no_voice()),
+            &audio,
+        );
         assert_eq!(
             view.state,
             ButtonState::Volume {
@@ -382,7 +490,12 @@ buttons:
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), None);
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let view = view(&config, &config.buttons[1], &snapshot, &audio, &no_voice());
+        let view = view(
+            &config,
+            &config.buttons[1],
+            &readings(&snapshot, &no_voice()),
+            &audio,
+        );
         assert!(matches!(
             view.state,
             ButtonState::Volume {
@@ -392,7 +505,13 @@ buttons:
             }
         ));
         assert!(matches!(
-            press(&config, "sf6", &audio, &FakeVoice::new(false, None)),
+            press(
+                &config,
+                "sf6",
+                &audio,
+                &FakeVoice::new(false, None),
+                &FakeLauncher::default()
+            ),
             Err(PressError::Conflict {
                 code: "not_running",
                 ..
@@ -410,12 +529,12 @@ buttons:
             view(
                 &config,
                 &config.buttons[i],
-                &snapshot,
+                &readings(&snapshot, &voice.status()),
                 &audio,
-                &voice.status(),
             )
             .state
         };
+        let launcher = FakeLauncher::default();
         assert_eq!(
             state(2),
             ButtonState::Voice {
@@ -434,7 +553,7 @@ buttons:
         );
 
         // Pressing the other button moves there; pressing it again leaves.
-        press(&config, "vc-sf6", &audio, &voice).unwrap();
+        press(&config, "vc-sf6", &audio, &voice, &launcher).unwrap();
         assert_eq!(
             state(2),
             ButtonState::Voice {
@@ -451,7 +570,7 @@ buttons:
                 reason: None
             }
         );
-        press(&config, "vc-sf6", &audio, &voice).unwrap();
+        press(&config, "vc-sf6", &audio, &voice, &launcher).unwrap();
         assert_eq!(voice.status().selected, None);
         assert_eq!(*voice.presses.lock().unwrap(), ["222", "222"]);
     }
@@ -466,9 +585,8 @@ buttons:
             view(
                 &config,
                 &config.buttons[2],
-                &snapshot,
+                &readings(&snapshot, &voice.status()),
                 &audio,
-                &voice.status()
             )
             .state,
             ButtonState::Voice {
@@ -478,7 +596,7 @@ buttons:
             }
         );
         assert!(matches!(
-            press(&config, "vc-apex", &audio, &voice),
+            press(&config, "vc-apex", &audio, &voice, &FakeLauncher::default()),
             Err(PressError::Conflict {
                 code: "discord_unavailable",
                 ..
@@ -487,11 +605,77 @@ buttons:
     }
 
     #[test]
+    fn launch_buttons_open_their_target_and_show_its_icon() {
+        let config = config::parse(
+            "buttons:\n  - id: ba\n    label: BA\n    type: app.launch\n    target: C:/Games/ba.exe\n    args: --fast\n  - id: site\n    label: Site\n    type: app.launch\n    target: https://example.com/\n",
+        )
+        .unwrap();
+        let launcher = FakeLauncher::default();
+        let audio = FakeAudio::new(devices(), None);
+        let voice = FakeVoice::new(false, None);
+        press(&config, "ba", &audio, &voice, &launcher).unwrap();
+        press(&config, "site", &audio, &voice, &launcher).unwrap();
+        assert_eq!(
+            *launcher.opened.lock().unwrap(),
+            ["C:/Games/ba.exe --fast", "https://example.com/"]
+        );
+        assert_eq!(
+            super::icon_path(&config.buttons[0]),
+            Some(std::path::PathBuf::from("C:/Games/ba.exe"))
+        );
+        assert_eq!(super::icon_path(&config.buttons[1]), None);
+    }
+
+    #[test]
+    fn steam_games_start_through_steam_and_close_while_running() {
+        let config = config::parse(
+            "buttons:\n  - id: sf6\n    label: SF6\n    type: steam.game\n    app_id: 1364780\n    process: StreetFighter6.exe\n    icon: C:/sf6.exe\n",
+        )
+        .unwrap();
+        let launcher = FakeLauncher::default();
+        let audio = FakeAudio::new(devices(), None);
+        let voice = FakeVoice::new(false, None);
+        let snapshot = AudioSnapshot::read(&audio).unwrap();
+        let state = |launcher: &FakeLauncher| {
+            let processes = launcher.processes();
+            let status = no_voice();
+            let readings = super::Readings {
+                audio: &snapshot,
+                voice: &status,
+                processes: &processes,
+            };
+            view(&config, &config.buttons[0], &readings, &audio).state
+        };
+        assert_eq!(state(&launcher), ButtonState::Game { running: false });
+        press(&config, "sf6", &audio, &voice, &launcher).unwrap();
+        assert_eq!(
+            *launcher.opened.lock().unwrap(),
+            ["steam://rungameid/1364780"]
+        );
+
+        launcher
+            .running
+            .lock()
+            .unwrap()
+            .insert("streetfighter6.exe".into());
+        assert_eq!(state(&launcher), ButtonState::Game { running: true });
+        press(&config, "sf6", &audio, &voice, &launcher).unwrap();
+        assert_eq!(state(&launcher), ButtonState::Game { running: false });
+        assert_eq!(launcher.opened.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn unknown_button_is_not_found() {
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), None);
         assert_eq!(
-            press(&config, "nope", &audio, &FakeVoice::new(false, None)),
+            press(
+                &config,
+                "nope",
+                &audio,
+                &FakeVoice::new(false, None),
+                &FakeLauncher::default()
+            ),
             Err(PressError::NotFound)
         );
     }

@@ -63,6 +63,15 @@ impl VirtualDesktops for WinvdDesktops {
         ::winvd::switch_desktop(index).map_err(|e| DesktopError::Failed(failed("switch", &e)))
     }
 
+    fn create(&self, name: &str) -> Result<(), DesktopError> {
+        let desktop =
+            ::winvd::create_desktop().map_err(|e| DesktopError::Failed(failed("create", &e)))?;
+        desktop
+            .set_name(name)
+            .map_err(|e| DesktopError::Failed(failed("name", &e)))?;
+        ::winvd::switch_desktop(desktop).map_err(|e| DesktopError::Failed(failed("switch", &e)))
+    }
+
     fn pin_window(&self, hwnd: isize) -> Result<(), DesktopError> {
         let handle = HWND(hwnd as *mut c_void);
         ::winvd::pin_window(handle).map_err(|e| match e {

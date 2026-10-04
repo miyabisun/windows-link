@@ -62,9 +62,12 @@ example at logon), logs go to `%LOCALAPPDATA%\windows-link\windows-link.log`.
 
 ## Configuration
 
-The configuration is a machine-local YAML file (device IDs differ per PC, so it lives in
-LocalAppData rather than the roaming profile); keep it out of version control. If the
-file does not exist, the server starts with no buttons.
+The configuration is machine-local YAML in `%LOCALAPPDATA%\windows-link\` (device IDs
+differ per PC, so it does not roam); keep it out of version control. Without any file the
+server starts with no buttons.
+
+`config.yaml` holds the device aliases and the **shared** buttons, which every virtual
+desktop's tab shows:
 
 ```yaml
 # Aliases for output devices; IDs come from `windows-link devices`.
@@ -73,20 +76,46 @@ devices:
   earbuds: "{0.0.0.00000000}.{95e7c4af-0a40-46d0-adf3-9d884ff67c4f}"
 
 buttons:
-  - id: output              # letters, digits, '-' and '_'
+  - id: output              # letters, digits, '-' and '_'; unique across all files
     label: Output
     type: audio.output_toggle
     devices: [speakers, earbuds]
+    except: [dev]           # optional: desktops whose tab leaves it out
+```
+
+Each virtual desktop can have its own buttons in `desktops/<desktop name>.yaml`, which
+only that desktop's tab shows. The file is matched to the desktop by name (ignoring case),
+so renaming or removing the desktop in Windows hides its buttons; create a desktop with the
+same name to bring them back (a panel can do this for you, see `POST /desktops`). For
+example `desktops/SF6.yaml`:
+
+```yaml
+buttons:
   - id: game-volume
     label: Game volume
     type: audio.app_volume_toggle
     process: StreetFighter6.exe   # executable file name, case-insensitive
     levels: [0.2, 1.0]
-    desktop: D65417D3-28D1-4D1A-8671-F07FD9BD3B45  # optional, see below
+  - id: sf6
+    label: Street Fighter 6
+    type: steam.game
+    app_id: 1364780                # from the store page URL
+    process: StreetFighter6.exe
+    icon: C:\Program Files (x86)\Steam\steamapps\common\Street Fighter 6\StreetFighter6.exe
   - id: vc-friends
     label: Friends VC
     type: discord.voice
     channel_id: 1533091153086251103   # from `windows-link discord-channels`
+```
+
+and `desktops/Blue Archive.yaml`:
+
+```yaml
+buttons:
+  - id: blue-archive
+    label: Blue Archive
+    type: app.launch
+    target: C:\YostarGames\BlueArchive_JP_Gamelauncher\BlueArchive_JP_Gamelauncher.exe
 ```
 
 - `audio.output_toggle` switches to the second device when the first is the default, and
@@ -100,10 +129,14 @@ buttons:
 - `discord.voice` joins its channel (moving you out of any other voice channel), or
   leaves it when you are already there. Add one button per channel. See
   [Discord](#discord) for the one-time setup.
-- `desktop` (optional, any button type) ties the button to one virtual desktop by its ID
-  from `GET /desktops`; a panel shows it only on that desktop's tab. Buttons without it
-  belong to every tab. IDs survive renaming. A button whose desktop no longer exists stays
-  in `GET /buttons` and is logged as a warning at startup.
+- `app.launch` opens `target` (an exe, a shortcut, a document or a URL) the way
+  double-clicking it in Explorer does, with optional `args`. A program starts in its own
+  folder.
+- `steam.game` starts the game through Steam (`steam://rungameid/<app_id>`) and shows
+  `running` while `process` runs; pressing it then asks the game's windows to close, like
+  their close button (`409 no_window` while it has none yet).
+- `icon` (optional, any button type) is a file whose Windows icon the button shows: an exe,
+  a shortcut or an image. `app.launch` buttons show their target's icon without it.
 
 Restart the server after editing the file.
 
@@ -150,25 +183,29 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 | method and path | description |
 | --- | --- |
 | `GET /healthz` | `ok` |
-| `GET /buttons` | all buttons in configuration order: `{id, type, label, desktop, state}` |
+| `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
-| `GET /desktops` | virtual desktops: `{"desktops":[{id, name, index, current}], "error": null}` |
+| `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, when `icon` is true |
+| `GET /desktops` | virtual desktops, and the desktop files without a desktop: `{"desktops":[{id, name, index, current}], "unmatched":[name], "error": null}` |
+| `POST /desktops` | `{"name": …}`: create a desktop with this name and switch to it (`201`, the new `GET /desktops` body; `409 exists`) |
 | `POST /desktops/{id}/switch` | switch to a virtual desktop; returns the new `GET /desktops` body |
 | `POST /windows/{hwnd}/pin` | show a window on every virtual desktop (`hwnd` in decimal or `0x` hex) |
 | `GET /touch-monitors`, `PUT /touch-monitors/{id}` | see [Touch and the mouse cursor](#touch-and-the-mouse-cursor) |
+| `POST /power/sleep` | put the PC to sleep (answers `202` first) |
 | `GET /version` | `{"version": "0.1.0"}` |
 | `POST /update/check` | check for an update now (see [Updates](#updates)) |
 | `GET /events` | WebSocket: one `snapshot` message, then `button` and `desktops` messages as things change (below) |
 
 Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_unavailable`,
 `409 not_running`, `500 audio`, `409 discord_unavailable`, `409 discord_rejected`,
-`500 discord`, `400 invalid_hwnd`, `503 desktops`, or `502 update`.
+`500 discord`, `409 no_window`, `500 launch`, `400 invalid_hwnd`, `400 invalid_name`,
+`409 exists`, `503 desktops`, or `502 update`.
 
 `/events` messages:
 
-- `{"type":"snapshot","buttons":[…],"desktops":[…],"desktops_error":null}` on connect
+- `{"type":"snapshot","buttons":[…],"desktops":[…],"unmatched":[…],"desktops_error":null}` on connect
 - `{"type":"button","button":{…}}` when a button's state changes
-- `{"type":"desktops","reason":…,"desktops":[…],"error":null}` when the current desktop
+- `{"type":"desktops","reason":…,"desktops":[…],"unmatched":[…],"error":null}` when the current desktop
   changes (`changed`), or a desktop is `created`, `removed`, `renamed` or `moved`, and
   `reconnected` after Explorer restarts. Switching with `Win + Ctrl + →` or the
   API both produce `changed`.

@@ -1,4 +1,4 @@
-//! `/desktops` and `/windows/{hwnd}/pin`.
+//! `/desktops` (list, switch, create) and `/windows/{hwnd}/pin`.
 
 use std::sync::Arc;
 
@@ -11,22 +11,24 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use super::{DesktopError, VirtualDesktops, parse_hwnd};
+use super::{DesktopError, VirtualDesktops, parse_hwnd, unmatched};
 
 #[derive(Clone)]
 pub struct DesktopState {
     desktops: Arc<dyn VirtualDesktops>,
+    /// Names of the desktops that have a configuration file.
+    defined: Arc<Vec<String>>,
 }
 
 impl DesktopState {
-    pub fn new(desktops: Arc<dyn VirtualDesktops>) -> Self {
-        Self { desktops }
+    pub fn new(desktops: Arc<dyn VirtualDesktops>, defined: Arc<Vec<String>>) -> Self {
+        Self { desktops, defined }
     }
 }
 
 pub fn router(state: DesktopState) -> Router {
     Router::new()
-        .route("/desktops", get(list))
+        .route("/desktops", get(list).post(create))
         .route("/desktops/{id}/switch", post(switch))
         .route("/windows/{hwnd}/pin", post(pin))
         .with_state(state)
@@ -36,25 +38,75 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(json!({ "error": code, "message": message }))).into_response()
 }
 
-/// `{"desktops": [...], "error": null}`, or an empty list with the reason when the
-/// virtual desktop service is unavailable (other features keep working).
-pub async fn listing(desktops: Arc<dyn VirtualDesktops>) -> Value {
+/// `{"desktops": [...], "unmatched": [...], "error": null}`: the desktops, and the
+/// desktop files whose desktop does not exist. When the virtual desktop service is
+/// unavailable the lists are empty and `error` says why (other features keep working).
+pub async fn listing(desktops: Arc<dyn VirtualDesktops>, defined: &[String]) -> Value {
     match tokio::task::spawn_blocking(move || desktops.list()).await {
-        Ok(Ok(list)) => json!({ "desktops": list, "error": null }),
-        Ok(Err(message)) => json!({ "desktops": [], "error": message }),
-        Err(join) => json!({ "desktops": [], "error": join.to_string() }),
+        Ok(Ok(list)) => {
+            json!({ "desktops": list, "unmatched": unmatched(defined, &list), "error": null })
+        }
+        Ok(Err(message)) => json!({ "desktops": [], "unmatched": [], "error": message }),
+        Err(join) => json!({ "desktops": [], "unmatched": [], "error": join.to_string() }),
     }
 }
 
 async fn list(State(state): State<DesktopState>) -> Json<Value> {
-    Json(listing(state.desktops.clone()).await)
+    Json(listing(state.desktops.clone(), &state.defined).await)
+}
+
+#[derive(serde::Deserialize)]
+struct NewDesktop {
+    name: String,
+}
+
+/// Create a desktop (for a desktop file without one) and switch to it.
+async fn create(State(state): State<DesktopState>, Json(body): Json<NewDesktop>) -> Response {
+    let name = body.name.trim().to_owned();
+    if name.is_empty() {
+        return error(StatusCode::BAD_REQUEST, "invalid_name", "the name is empty");
+    }
+    let current = listing(state.desktops.clone(), &state.defined).await;
+    let taken = current["desktops"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|d| {
+            d["name"]
+                .as_str()
+                .is_some_and(|n| n.to_lowercase() == name.to_lowercase())
+        });
+    if taken {
+        return error(
+            StatusCode::CONFLICT,
+            "exists",
+            "a desktop with this name already exists",
+        );
+    }
+    let desktops = state.desktops.clone();
+    match tokio::task::spawn_blocking(move || desktops.create(&name)).await {
+        Ok(Ok(())) => (
+            StatusCode::CREATED,
+            Json(listing(state.desktops.clone(), &state.defined).await),
+        )
+            .into_response(),
+        Ok(Err(DesktopError::NotFound)) => error(StatusCode::NOT_FOUND, "not_found", "not found"),
+        Ok(Err(DesktopError::Failed(message))) => {
+            error(StatusCode::SERVICE_UNAVAILABLE, "desktops", &message)
+        }
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
 }
 
 async fn switch(State(state): State<DesktopState>, Path(id): Path<String>) -> Response {
     let desktops = state.desktops.clone();
     let target = id.clone();
     match tokio::task::spawn_blocking(move || desktops.switch(&target)).await {
-        Ok(Ok(())) => Json(listing(state.desktops.clone()).await).into_response(),
+        Ok(Ok(())) => Json(listing(state.desktops.clone(), &state.defined).await).into_response(),
         Ok(Err(DesktopError::NotFound)) => error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -156,6 +208,24 @@ pub mod fake {
             self.pinned.lock().unwrap().push(hwnd);
             Ok(())
         }
+
+        fn create(&self, name: &str) -> Result<(), DesktopError> {
+            let mut guard = self.desktops.lock().unwrap();
+            let list = guard
+                .as_mut()
+                .ok_or_else(|| DesktopError::Failed("service unavailable".into()))?;
+            for desktop in list.iter_mut() {
+                desktop.current = false;
+            }
+            let index = u32::try_from(list.len()).unwrap();
+            list.push(DesktopInfo {
+                id: format!("GUID-{index}"),
+                name: name.to_owned(),
+                index,
+                current: true,
+            });
+            Ok(())
+        }
     }
 }
 
@@ -188,10 +258,55 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 
+    async fn send_json(state: DesktopState, uri: &str, json: &str) -> (StatusCode, Value) {
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn offers_desktop_files_without_a_desktop_and_creates_them() {
+        let fake = Arc::new(FakeDesktops::new(&["dev", "ゲーム"]));
+        let state = DesktopState::new(
+            fake.clone(),
+            Arc::new(vec!["dev".to_owned(), "SF6".to_owned()]),
+        );
+        let (_, body) = post(state.clone(), "GET", "/desktops").await;
+        assert_eq!(body["unmatched"], serde_json::json!(["SF6"]));
+
+        let (status, body) = send_json(state.clone(), "/desktops", r#"{"name":"SF6"}"#).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["unmatched"], serde_json::json!([]));
+        let created = &body["desktops"][2];
+        assert_eq!(
+            (created["name"].as_str(), created["current"].as_bool()),
+            (Some("SF6"), Some(true))
+        );
+
+        let (status, _) = send_json(state.clone(), "/desktops", r#"{"name":"sf6"}"#).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = send_json(state, "/desktops", r#"{"name":"  "}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn lists_and_switches_desktops() {
         let fake = Arc::new(FakeDesktops::new(&["dev", "ゲーム"]));
-        let state = DesktopState::new(fake.clone());
+        let state = DesktopState::new(
+            fake.clone(),
+            Arc::new(vec!["dev".to_owned(), "SF6".to_owned()]),
+        );
         let (status, body) = post(state.clone(), "GET", "/desktops").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["error"], Value::Null);
@@ -207,7 +322,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_desktop_is_404_and_unavailable_service_lists_nothing_with_a_reason() {
         let fake = Arc::new(FakeDesktops::new(&["dev"]));
-        let state = DesktopState::new(fake.clone());
+        let state = DesktopState::new(
+            fake.clone(),
+            Arc::new(vec!["dev".to_owned(), "SF6".to_owned()]),
+        );
         let (status, _) = post(state.clone(), "POST", "/desktops/nope/switch").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
@@ -223,7 +341,10 @@ mod tests {
     #[tokio::test]
     async fn pins_by_decimal_or_hex_handle_and_rejects_bad_ones() {
         let fake = Arc::new(FakeDesktops::new(&["dev"]));
-        let state = DesktopState::new(fake.clone());
+        let state = DesktopState::new(
+            fake.clone(),
+            Arc::new(vec!["dev".to_owned(), "SF6".to_owned()]),
+        );
         assert_eq!(
             post(state.clone(), "POST", "/windows/4723016/pin").await.0,
             StatusCode::OK

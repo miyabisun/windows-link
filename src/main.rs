@@ -121,7 +121,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let desktops: Arc<dyn VirtualDesktops> = Arc::new(WinvdDesktops);
-    warn_unknown_desktops(&config, desktops.as_ref());
+    let defined = Arc::new(config.desktops.clone());
     let voice = discord_voice(&config, changes.clone());
     let state = AppState::new(config, audio)
         .with_desktops(desktops.clone())
@@ -151,7 +151,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(update::run_periodically(updater.clone()));
     let app = server::app(state)
         .merge(touch_api::router(touch))
-        .merge(desktop_api::router(DesktopState::new(desktops)))
+        .merge(desktop_api::router(DesktopState::new(desktops, defined)))
         .merge(update_api::router(updater))
         .layer(cors::layer());
     axum::serve(listener, app)
@@ -162,21 +162,6 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     info!("server stopped");
     Ok(())
-}
-
-/// Buttons bound to a desktop that does not exist stay in `GET /buttons` but no tab
-/// shows them; say so at startup.
-fn warn_unknown_desktops(config: &config::Config, desktops: &dyn VirtualDesktops) {
-    let Ok(list) = desktops.list() else {
-        return;
-    };
-    for button in &config.buttons {
-        if let Some(id) = &button.desktop
-            && !list.iter().any(|d| d.id.eq_ignore_ascii_case(id))
-        {
-            warn!(button = %button.id, desktop = %id, "button is bound to an unknown virtual desktop");
-        }
-    }
 }
 
 /// A previous instance (restarted by Task Scheduler or an update) may still hold the

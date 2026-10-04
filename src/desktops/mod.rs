@@ -25,6 +25,22 @@ pub trait VirtualDesktops: Send + Sync + 'static {
     fn list(&self) -> Result<Vec<DesktopInfo>, String>;
     fn switch(&self, id: &str) -> Result<(), DesktopError>;
     fn pin_window(&self, hwnd: isize) -> Result<(), DesktopError>;
+    /// Create a desktop with this name and switch to it.
+    fn create(&self, name: &str) -> Result<(), DesktopError>;
+}
+
+/// Desktop files whose desktop does not exist (renamed or removed in Windows), so a
+/// panel can offer to create them again. Names match without regard to case.
+pub fn unmatched(defined: &[String], desktops: &[DesktopInfo]) -> Vec<String> {
+    defined
+        .iter()
+        .filter(|name| {
+            !desktops
+                .iter()
+                .any(|d| d.name.to_lowercase() == name.to_lowercase())
+        })
+        .cloned()
+        .collect()
 }
 
 /// Windows shows unnamed desktops as "デスクトップ N"; do the same.
@@ -67,7 +83,23 @@ mod tests {
     use ::winvd::{Desktop, DesktopEvent};
     use windows058::Win32::Foundation::HWND;
 
-    use super::{display_name, parse_hwnd, reason};
+    use super::{DesktopInfo, display_name, parse_hwnd, reason, unmatched};
+
+    #[test]
+    fn lists_desktop_files_without_a_desktop() {
+        let desktop = |name: &str| DesktopInfo {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            index: 0,
+            current: false,
+        };
+        let defined = ["dev", "SF6", "Old"].map(str::to_owned);
+        assert_eq!(
+            unmatched(&defined, &[desktop("DEV"), desktop("sf6")]),
+            ["Old"]
+        );
+        assert!(unmatched(&[], &[desktop("dev")]).is_empty());
+    }
 
     #[test]
     fn desktop_list_events_are_reported_and_window_or_wallpaper_events_are_not() {

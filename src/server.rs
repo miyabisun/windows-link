@@ -23,6 +23,9 @@ use crate::{
     config::Config,
     desktops::{self, VirtualDesktops},
     discord::{NoVoice, Voice},
+    icons,
+    launch::{Launcher, windows::WindowsLauncher},
+    power,
 };
 
 /// How often state is re-read to catch changes Windows does not notify (e.g. mixer volume).
@@ -35,6 +38,8 @@ pub struct AppState {
     hub: Arc<Hub>,
     desktops: Option<Arc<dyn VirtualDesktops>>,
     voice: Arc<dyn Voice>,
+    launcher: Arc<dyn Launcher>,
+    icons: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>>,
 }
 
 struct Hub {
@@ -54,7 +59,16 @@ impl AppState {
             }),
             desktops: None,
             voice: Arc::new(NoVoice("no Discord connection".into())),
+            launcher: Arc::new(WindowsLauncher),
+            icons: Arc::default(),
         }
+    }
+
+    /// Start programs and read running processes through `launcher` (tests use a fake).
+    #[must_use]
+    pub fn with_launcher(mut self, launcher: Arc<dyn Launcher>) -> Self {
+        self.launcher = launcher;
+        self
     }
 
     /// Back the `discord.voice` buttons with a Discord connection.
@@ -73,8 +87,12 @@ impl AppState {
 
     async fn desktop_listing(&self) -> Value {
         match &self.desktops {
-            Some(desktops) => desktops::api::listing(desktops.clone()).await,
-            None => json!({ "desktops": [], "error": "virtual desktops are not enabled" }),
+            Some(desktops) => desktops::api::listing(desktops.clone(), &self.config.desktops).await,
+            None => json!({
+                "desktops": [],
+                "unmatched": [],
+                "error": "virtual desktops are not enabled"
+            }),
         }
     }
 
@@ -87,6 +105,7 @@ impl AppState {
                 "type": "desktops",
                 "reason": reason,
                 "desktops": listing["desktops"],
+                "unmatched": listing["unmatched"],
                 "error": listing["error"],
             })
             .to_string(),
@@ -98,10 +117,12 @@ impl AppState {
         let config = self.config.clone();
         let audio = self.audio.clone();
         let voice = self.voice.clone();
-        let views =
-            tokio::task::spawn_blocking(move || compute(&config, audio.as_ref(), voice.as_ref()))
-                .await
-                .unwrap_or_default();
+        let launcher = self.launcher.clone();
+        let views = tokio::task::spawn_blocking(move || {
+            compute(&config, audio.as_ref(), voice.as_ref(), launcher.as_ref())
+        })
+        .await
+        .unwrap_or_default();
         let mut last = self.hub.last.lock().await;
         for view in &views {
             if !last.contains(view) {
@@ -127,19 +148,34 @@ impl AppState {
     }
 }
 
-fn compute(config: &Config, audio: &dyn Audio, voice: &dyn Voice) -> Vec<ButtonView> {
+fn compute(
+    config: &Config,
+    audio: &dyn Audio,
+    voice: &dyn Voice,
+    launcher: &dyn Launcher,
+) -> Vec<ButtonView> {
     let snapshot = AudioSnapshot::read(audio);
     let voice = voice.status();
+    let processes = launcher.processes();
     config
         .buttons
         .iter()
         .map(|button| match &snapshot {
-            Ok(snapshot) => buttons::view(config, button, snapshot, audio, &voice),
+            Ok(snapshot) => {
+                let readings = buttons::Readings {
+                    audio: snapshot,
+                    voice: &voice,
+                    processes: &processes,
+                };
+                buttons::view(config, button, &readings, audio)
+            }
             Err(error) => ButtonView {
                 id: button.id.clone(),
                 kind: button.spec.type_name(),
                 label: button.label.clone(),
                 desktop: button.desktop.clone(),
+                except: button.except.clone(),
+                icon: false,
                 state: ButtonState::Error {
                     message: error.to_string(),
                 },
@@ -153,6 +189,8 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/buttons", get(list_buttons))
         .route("/buttons/{id}/press", post(press_button))
+        .route("/buttons/{id}/icon", get(button_icon))
+        .route("/power/sleep", post(sleep))
         .route("/events", get(events))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -174,9 +212,16 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
     let config = state.config.clone();
     let audio = state.audio.clone();
     let voice = state.voice.clone();
+    let launcher = state.launcher.clone();
     let pressed_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        buttons::press(&config, &pressed_id, audio.as_ref(), voice.as_ref())
+        buttons::press(
+            &config,
+            &pressed_id,
+            audio.as_ref(),
+            voice.as_ref(),
+            launcher.as_ref(),
+        )
     })
     .await;
     match result {
@@ -192,6 +237,10 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
         }
         Ok(Err(PressError::Conflict { code, message })) => {
             error(StatusCode::CONFLICT, code, &message)
+        }
+        Ok(Err(PressError::Launch(failure))) => {
+            warn!(button = %id, %failure, "press failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "launch", &failure)
         }
         Ok(Err(PressError::Discord(failure))) => {
             warn!(button = %id, %failure, "press failed");
@@ -213,6 +262,76 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
     }
 }
 
+/// The button's Windows icon as PNG, read once and then kept.
+async fn button_icon(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let cached = state
+        .icons
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&id)
+        .cloned();
+    let png = if let Some(png) = cached {
+        png
+    } else {
+        let Some(path) = state
+            .config
+            .buttons
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(buttons::icon_path)
+        else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "no icon for this button",
+            );
+        };
+        match tokio::task::spawn_blocking(move || icons::icon_png(&path)).await {
+            Ok(Ok(png)) => {
+                let png = Arc::new(png);
+                state
+                    .icons
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id, png.clone());
+                png
+            }
+            Ok(Err(message)) => {
+                warn!(button = %id, %message, "cannot read the icon");
+                return error(StatusCode::NOT_FOUND, "not_found", &message);
+            }
+            Err(join) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &join.to_string(),
+                );
+            }
+        }
+    };
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            (axum::http::header::CACHE_CONTROL, "max-age=3600"),
+        ],
+        png.as_ref().clone(),
+    )
+        .into_response()
+}
+
+/// Answer first, then put the PC to sleep.
+async fn sleep() -> Response {
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        match tokio::task::spawn_blocking(power::sleep).await {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => warn!(%message, "cannot sleep"),
+            Err(join) => warn!(%join, "cannot sleep"),
+        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({ "sleeping": true }))).into_response()
+}
+
 async fn events(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| stream(state, socket))
 }
@@ -225,6 +344,7 @@ async fn snapshot(state: &AppState, buttons: Vec<ButtonView>) -> String {
         "type": "snapshot",
         "buttons": buttons,
         "desktops": listing["desktops"],
+        "unmatched": listing["unmatched"],
         "desktops_error": listing["error"],
     })
     .to_string()
@@ -462,20 +582,23 @@ buttons:
     }
 
     #[tokio::test]
-    async fn buttons_report_their_desktop_binding() {
-        let text = CONFIG.replace(
-            "  - id: sf6
-",
-            "  - id: sf6
-    desktop: GUID-1
-",
+    async fn buttons_report_their_desktop_and_exceptions() {
+        let shared = CONFIG.replace(
+            "    devices: [motu, jbl]\n  - id: sf6\n    label: SF6\n    type: audio.app_volume_toggle\n    process: StreetFighter6.exe\n    levels: [0.2, 1.0]\n",
+            "    devices: [motu, jbl]\n    except: [dev]\n",
         );
+        let files = vec![(
+            "SF6".to_owned(),
+            "buttons:\n  - id: sf6\n    label: SF6\n    type: audio.app_volume_toggle\n    process: StreetFighter6.exe\n    levels: [0.2, 1.0]\n".to_owned(),
+        )];
         let state = AppState::new(
-            config::parse(&text).unwrap(),
+            config::parse_all(&shared, &files).unwrap(),
             Arc::new(FakeAudio::new(Vec::new(), None)),
         );
         let (_, body) = call(state, "GET", "/buttons").await;
         assert_eq!(body[0]["desktop"], Value::Null);
-        assert_eq!(body[1]["desktop"], "GUID-1");
+        assert_eq!(body[0]["except"], serde_json::json!(["dev"]));
+        assert_eq!(body[1]["desktop"], "SF6");
+        assert_eq!(body[1]["icon"], false);
     }
 }

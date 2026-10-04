@@ -1,4 +1,5 @@
-//! Machine-local YAML configuration: device aliases and the button list.
+//! Machine-local YAML configuration: device aliases and shared buttons in `config.yaml`,
+//! and each virtual desktop's own buttons in `desktops/<desktop name>.yaml` next to it.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -14,20 +15,36 @@ pub struct Config {
     /// Alias -> audio endpoint ID (see `windows-link devices`).
     #[serde(default)]
     pub devices: BTreeMap<String, String>,
+    /// Shared buttons from `config.yaml`, then each desktop file's buttons.
     #[serde(default)]
     pub buttons: Vec<ButtonConfig>,
+    /// Names of the desktops that have a file in `desktops/`, sorted.
+    #[serde(skip)]
+    pub desktops: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ButtonConfig {
     pub id: String,
     pub label: String,
-    /// Virtual desktop GUID (see `GET /desktops`) whose tab shows this button; none
-    /// means the button is shown on every tab.
+    /// Shared buttons only: desktop names whose tab leaves this button out.
     #[serde(default)]
+    pub except: Vec<String>,
+    /// File (exe, shortcut, image) whose Windows icon the button shows.
+    #[serde(default)]
+    pub icon: Option<PathBuf>,
+    /// The desktop whose file defines the button; `None` for shared buttons.
+    #[serde(skip)]
     pub desktop: Option<String>,
     #[serde(flatten)]
     pub spec: ButtonSpec,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesktopFile {
+    #[serde(default)]
+    buttons: Vec<ButtonConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +62,21 @@ pub enum ButtonSpec {
         #[serde(deserialize_with = "crate::secrets::id_text")]
         channel_id: String,
     },
+    /// Open a program, shortcut or URL the way double-clicking it in Explorer does.
+    #[serde(rename = "app.launch")]
+    AppLaunch {
+        target: String,
+        #[serde(default)]
+        args: Option<String>,
+    },
+    /// Start a Steam game, or close it while it runs.
+    #[serde(rename = "steam.game")]
+    SteamGame {
+        #[serde(deserialize_with = "crate::secrets::id_text")]
+        app_id: String,
+        /// Executable file name of the running game, case-insensitive.
+        process: String,
+    },
 }
 
 impl ButtonSpec {
@@ -53,6 +85,8 @@ impl ButtonSpec {
             Self::OutputToggle { .. } => "audio.output_toggle",
             Self::AppVolumeToggle { .. } => "audio.app_volume_toggle",
             Self::DiscordVoice { .. } => "discord.voice",
+            Self::AppLaunch { .. } => "app.launch",
+            Self::SteamGame { .. } => "steam.game",
         }
     }
 }
@@ -79,20 +113,73 @@ pub fn default_path() -> PathBuf {
 }
 
 /// A missing file is an empty configuration so the server can start before setup.
+/// Desktop files are read from `desktops/` next to `path`.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => parse(&text),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(err) => Err(ConfigError(format!(
-            "cannot read {}: {err}",
-            path.display()
-        ))),
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(ConfigError(format!(
+                "cannot read {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let dir = path.parent().unwrap_or(Path::new(".")).join("desktops");
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let file = entry.path();
+            let is_yaml = file
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml"));
+            let Some(name) = file.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if is_yaml {
+                let text = std::fs::read_to_string(&file)
+                    .map_err(|err| ConfigError(format!("cannot read {}: {err}", file.display())))?;
+                files.push((name.to_owned(), text));
+            }
+        }
     }
+    parse_all(&text, &files)
 }
 
 pub fn parse(text: &str) -> Result<Config, ConfigError> {
-    let config: Config =
-        serde_norway::from_str(text).map_err(|err| ConfigError(format!("invalid YAML: {err}")))?;
+    parse_all(text, &[])
+}
+
+/// `config.yaml` and the desktop files as `(desktop name, text)`.
+pub fn parse_all(text: &str, desktops: &[(String, String)]) -> Result<Config, ConfigError> {
+    let mut config: Config = if text.trim().is_empty() {
+        Config::default()
+    } else {
+        serde_norway::from_str(text).map_err(|err| ConfigError(format!("invalid YAML: {err}")))?
+    };
+    let mut desktops: Vec<&(String, String)> = desktops.iter().collect();
+    desktops.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, text) in desktops {
+        let file: DesktopFile = if text.trim().is_empty() {
+            DesktopFile {
+                buttons: Vec::new(),
+            }
+        } else {
+            serde_norway::from_str(text)
+                .map_err(|err| ConfigError(format!("desktops/{name}.yaml: invalid YAML: {err}")))?
+        };
+        for mut button in file.buttons {
+            if !button.except.is_empty() {
+                return Err(ConfigError(format!(
+                    "desktops/{name}.yaml: button {:?}: except is only for shared buttons in config.yaml",
+                    button.id
+                )));
+            }
+            button.desktop = Some(name.clone());
+            config.buttons.push(button);
+        }
+        config.desktops.push(name.clone());
+    }
     validate(&config)?;
     Ok(config)
 }
@@ -140,6 +227,18 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                 if (levels[0] - levels[1]).abs() < f32::EPSILON {
                     return Err(ConfigError(format!(
                         "button {id:?}: the two levels must differ"
+                    )));
+                }
+            }
+            ButtonSpec::AppLaunch { target, .. } => {
+                if target.trim().is_empty() {
+                    return Err(ConfigError(format!("button {id:?}: target is empty")));
+                }
+            }
+            ButtonSpec::SteamGame { app_id, process } => {
+                if !app_id.bytes().all(|b| b.is_ascii_digit()) || process.trim().is_empty() {
+                    return Err(ConfigError(format!(
+                        "button {id:?}: app_id must be a Steam app ID and process an exe name"
                     )));
                 }
             }
@@ -250,6 +349,72 @@ buttons:
         ));
         let bad = text.replace("\"987\"", "general");
         assert!(parse(&bad).unwrap_err().0.contains("channel_id"));
+    }
+
+    #[test]
+    fn desktop_files_add_their_buttons_after_the_shared_ones() {
+        let shared = "devices:\n  a: id-a\n  b: id-b\nbuttons:\n  - id: output\n    label: Output\n    type: audio.output_toggle\n    devices: [a, b]\n    except: [dev]\n";
+        let files = vec![
+            (
+                "SF6".to_owned(),
+                "buttons:\n  - id: sf6\n    label: SF6\n    type: steam.game\n    app_id: 1364780\n    process: StreetFighter6.exe\n    icon: C:/Games/SF6/StreetFighter6.exe\n".to_owned(),
+            ),
+            (
+                "ブルアカ".to_owned(),
+                "buttons:\n  - id: ba\n    label: BA\n    type: app.launch\n    target: C:/YostarGames/launcher.exe\n".to_owned(),
+            ),
+            ("dev".to_owned(), String::new()),
+        ];
+        let config = super::parse_all(shared, &files).unwrap();
+        let ids: Vec<_> = config
+            .buttons
+            .iter()
+            .map(|b| (b.id.as_str(), b.desktop.as_deref()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("output", None),
+                ("sf6", Some("SF6")),
+                ("ba", Some("ブルアカ"))
+            ]
+        );
+        assert_eq!(config.buttons[0].except, ["dev"]);
+        assert_eq!(config.desktops, ["SF6", "dev", "ブルアカ"]);
+        assert!(config.buttons[1].icon.is_some());
+    }
+
+    #[test]
+    fn desktop_files_cannot_use_except_or_reuse_ids() {
+        let shared = "buttons:\n  - id: x\n    label: X\n    type: app.launch\n    target: a.exe\n";
+        let except = vec![(
+            "SF6".to_owned(),
+            "buttons:\n  - id: y\n    label: Y\n    type: app.launch\n    target: b.exe\n    except: [dev]\n".to_owned(),
+        )];
+        assert!(
+            super::parse_all(shared, &except)
+                .unwrap_err()
+                .0
+                .contains("except")
+        );
+        let dup = vec![(
+            "SF6".to_owned(),
+            "buttons:\n  - id: x\n    label: X2\n    type: app.launch\n    target: b.exe\n"
+                .to_owned(),
+        )];
+        assert!(
+            super::parse_all(shared, &dup)
+                .unwrap_err()
+                .0
+                .contains("duplicate")
+        );
+        let typo = vec![("SF6".to_owned(), "button: []\n".to_owned())];
+        assert!(
+            super::parse_all(shared, &typo)
+                .unwrap_err()
+                .0
+                .contains("desktops/SF6.yaml")
+        );
     }
 
     #[test]
