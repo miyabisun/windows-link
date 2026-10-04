@@ -68,6 +68,13 @@ pub enum ButtonSpec {
         target: String,
         #[serde(default)]
         args: Option<String>,
+        /// Executable file name; while it runs, a press brings its window to the front
+        /// instead of opening `target` again.
+        #[serde(default)]
+        process: Option<String>,
+        /// Open as administrator (Windows asks for consent).
+        #[serde(default)]
+        admin: bool,
     },
     /// Start a Steam game, or close it while it runs.
     #[serde(rename = "steam.game")]

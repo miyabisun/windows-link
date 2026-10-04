@@ -58,7 +58,8 @@ pub fn icon_png(path: &Path) -> Result<Vec<u8>, String> {
         core::PCWSTR,
     };
 
-    if !path.exists() {
+    let shell = path.to_string_lossy().to_lowercase().starts_with("shell:");
+    if !shell && !path.exists() {
         return Err(format!("{} does not exist", path.display()));
     }
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();

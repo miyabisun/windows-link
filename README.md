@@ -108,14 +108,26 @@ buttons:
     channel_id: 1533091153086251103   # from `windows-link discord-channels`
 ```
 
-and `desktops/Blue Archive.yaml`:
+and `desktops/dev.yaml`:
 
 ```yaml
 buttons:
+  - id: terminal
+    label: Terminal
+    type: app.launch
+    target: shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App   # a Store app
+    process: WindowsTerminal.exe   # while it runs, a press brings it to the front
+  - id: terminal-admin
+    label: Terminal (admin)
+    type: app.launch
+    target: wt.exe
+    admin: true
+    icon: shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App
   - id: blue-archive
     label: Blue Archive
     type: app.launch
     target: C:\YostarGames\BlueArchive_JP_Gamelauncher\BlueArchive_JP_Gamelauncher.exe
+    process: BlueArchive.exe       # the game the launcher starts
 ```
 
 - `audio.output_toggle` switches to the second device when the first is the default, and
@@ -129,14 +141,18 @@ buttons:
 - `discord.voice` joins its channel (moving you out of any other voice channel), or
   leaves it when you are already there. Add one button per channel. See
   [Discord](#discord) for the one-time setup.
-- `app.launch` opens `target` (an exe, a shortcut, a document or a URL) the way
+- `app.launch` opens `target` (an exe, a shortcut, a document, a URL, or a Store app as
+  `shell:AppsFolder\<app ID>`; PowerShell's `Get-StartApps` lists the IDs) the way
   double-clicking it in Explorer does, with optional `args`. A program starts in its own
-  folder.
+  folder. With `process`, the state shows `running` while that exe runs, and a press then
+  brings its window to the front (restoring it when minimized) instead of opening another
+  one. `admin: true` opens it as administrator, after Windows asks for consent.
 - `steam.game` starts the game through Steam (`steam://rungameid/<app_id>`) and shows
   `running` while `process` runs; pressing it then asks the game's windows to close, like
   their close button (`409 no_window` while it has none yet).
 - `icon` (optional, any button type) is a file whose Windows icon the button shows: an exe,
-  a shortcut or an image. `app.launch` buttons show their target's icon without it.
+  a shortcut, an image or a `shell:AppsFolder\…` app. `app.launch` buttons show their
+  target's icon without it.
 
 Restart the server after editing the file.
 

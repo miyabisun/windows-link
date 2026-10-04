@@ -41,8 +41,11 @@ pub enum ButtonState {
         joined: bool,
         reason: Option<String>,
     },
-    /// A program, shortcut or URL to open.
-    Launch {},
+    /// A program, shortcut or URL to open; `running` while its `process` runs, when
+    /// the button names one (a press then brings it to the front).
+    Launch {
+        running: bool,
+    },
     /// A Steam game: a press starts it, or closes it while `running`.
     Game {
         running: bool,
@@ -156,7 +159,9 @@ pub fn view(
         label: button.label.clone(),
         desktop: button.desktop.clone(),
         except: button.except.clone(),
-        icon: icon_path(button).is_some_and(|path| path.exists()),
+        icon: icon_path(button).is_some_and(|path| {
+            path.to_string_lossy().to_lowercase().starts_with("shell:") || path.exists()
+        }),
         state: state(config, &button.spec, readings, audio),
     }
 }
@@ -218,7 +223,11 @@ fn state(
             joined: voice.available && voice.selected.as_deref() == Some(channel_id.as_str()),
             reason: voice.reason.clone(),
         },
-        ButtonSpec::AppLaunch { .. } => ButtonState::Launch {},
+        ButtonSpec::AppLaunch { process, .. } => ButtonState::Launch {
+            running: process
+                .as_deref()
+                .is_some_and(|p| is_running(readings.processes, p)),
+        },
         ButtonSpec::SteamGame { process, .. } => ButtonState::Game {
             running: is_running(readings.processes, process),
         },
@@ -284,9 +293,22 @@ pub fn press(
                 VoiceError::Failed(message) => PressError::Discord(message),
             })
         }
-        ButtonSpec::AppLaunch { target, args } => launcher
-            .open(target, args.as_deref())
-            .map_err(PressError::Launch),
+        ButtonSpec::AppLaunch {
+            target,
+            args,
+            process,
+            admin,
+        } => {
+            if let Some(process) = process
+                && is_running(&launcher.processes(), process)
+                && launcher.focus(process).map_err(PressError::Launch)?
+            {
+                return Ok(());
+            }
+            launcher
+                .open(target, args.as_deref(), *admin)
+                .map_err(PressError::Launch)
+        }
         ButtonSpec::SteamGame { app_id, process } => {
             if is_running(&launcher.processes(), process) {
                 match launcher.close(process).map_err(PressError::Launch)? {
@@ -298,7 +320,7 @@ pub fn press(
                 }
             } else {
                 launcher
-                    .open(&format!("steam://rungameid/{app_id}"), None)
+                    .open(&format!("steam://rungameid/{app_id}"), None, false)
                     .map_err(PressError::Launch)
             }
         }
@@ -624,6 +646,44 @@ buttons:
             Some(std::path::PathBuf::from("C:/Games/ba.exe"))
         );
         assert_eq!(super::icon_path(&config.buttons[1]), None);
+    }
+
+    #[test]
+    fn launch_buttons_bring_a_running_app_forward_instead_of_starting_it_again() {
+        let config = config::parse(
+            "buttons:\n  - id: ba\n    label: BA\n    type: app.launch\n    target: C:/Games/launcher.exe\n    process: BlueArchive.exe\n  - id: admin\n    label: Admin\n    type: app.launch\n    target: wt.exe\n    admin: true\n    icon: shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App\n",
+        )
+        .unwrap();
+        let launcher = FakeLauncher::default();
+        let audio = FakeAudio::new(devices(), None);
+        let voice = FakeVoice::new(false, None);
+        press(&config, "ba", &audio, &voice, &launcher).unwrap();
+        assert_eq!(*launcher.opened.lock().unwrap(), ["C:/Games/launcher.exe"]);
+
+        launcher
+            .running
+            .lock()
+            .unwrap()
+            .insert("bluearchive.exe".into());
+        let snapshot = AudioSnapshot::read(&audio).unwrap();
+        let processes = launcher.processes();
+        let status = no_voice();
+        let readings = super::Readings {
+            audio: &snapshot,
+            voice: &status,
+            processes: &processes,
+        };
+        assert_eq!(
+            view(&config, &config.buttons[0], &readings, &audio).state,
+            ButtonState::Launch { running: true }
+        );
+        press(&config, "ba", &audio, &voice, &launcher).unwrap();
+        assert_eq!(*launcher.focused.lock().unwrap(), ["BlueArchive.exe"]);
+        assert_eq!(launcher.opened.lock().unwrap().len(), 1);
+
+        press(&config, "admin", &audio, &voice, &launcher).unwrap();
+        assert_eq!(launcher.opened.lock().unwrap()[1], "wt.exe (admin)");
+        assert!(view(&config, &config.buttons[1], &readings, &audio).icon);
     }
 
     #[test]
