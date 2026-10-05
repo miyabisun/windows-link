@@ -265,6 +265,9 @@ pub fn app(state: AppState) -> Router {
         .route("/buttons/{id}/library/{item}/folder", post(open_folder))
         .route("/buttons/{id}/library/{item}/programs", get(item_programs))
         .route("/buttons/{id}/library/{item}/keys", get(license_keys))
+        .route("/audio/mixer", get(mixer))
+        .route("/audio/master", axum::routing::put(set_master))
+        .route("/audio/apps/{process}", axum::routing::put(set_app_volume))
         .route(
             "/buttons/{id}/library/{item}/program",
             axum::routing::put(choose_program),
@@ -457,6 +460,126 @@ async fn item_programs(
             StatusCode::NOT_FOUND,
             "not_found",
             "the game has no programs to choose from",
+        ),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// The default output's volume and mute, and the apps with sound on it:
+/// `{"master": {volume, muted}, "apps": [{process, name, volume}]}`.
+async fn mixer(State(state): State<AppState>) -> Response {
+    mixer_response(&state).await
+}
+
+async fn mixer_response(state: &AppState) -> Response {
+    let audio = state.audio.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        Ok::<_, crate::audio::AudioError>((audio.master()?, audio.apps()?))
+    })
+    .await;
+    match read {
+        Ok(Ok((master, apps))) => {
+            // Volumes to two places, as the buttons give them.
+            let apps: Vec<Value> = apps
+                .iter()
+                .map(|app| json!({ "process": app.process, "name": app.name, "volume": buttons::round2(app.volume) }))
+                .collect();
+            let master = json!({ "volume": buttons::round2(master.volume), "muted": master.muted });
+            Json(json!({ "master": master, "apps": apps })).into_response()
+        }
+        Ok(Err(failure)) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audio",
+            &failure.to_string(),
+        ),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MasterChange {
+    volume: Option<f32>,
+    muted: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct VolumeChange {
+    volume: f32,
+}
+
+fn valid_volume(volume: f32) -> bool {
+    (0.0..=1.0).contains(&volume)
+}
+
+/// `{"volume"}` and/or `{"muted"}`; a volume alone also unmutes, as Windows' own
+/// slider does. Answers the mixer.
+async fn set_master(State(state): State<AppState>, Json(change): Json<MasterChange>) -> Response {
+    if change.volume.is_some_and(|v| !valid_volume(v)) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_volume",
+            "volume must be between 0 and 1",
+        );
+    }
+    let muted = change.muted.or(change.volume.map(|_| false));
+    let audio = state.audio.clone();
+    let set = tokio::task::spawn_blocking(move || audio.set_master(change.volume, muted)).await;
+    match set {
+        Ok(Ok(())) => {
+            state.refresh().await;
+            mixer_response(&state).await
+        }
+        Ok(Err(failure)) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audio",
+            &failure.to_string(),
+        ),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// `{"volume"}` for every session of a program. Answers the mixer.
+async fn set_app_volume(
+    State(state): State<AppState>,
+    Path(process): Path<String>,
+    Json(change): Json<VolumeChange>,
+) -> Response {
+    if !valid_volume(change.volume) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_volume",
+            "volume must be between 0 and 1",
+        );
+    }
+    let audio = state.audio.clone();
+    let set =
+        tokio::task::spawn_blocking(move || audio.set_app_volume(&process, change.volume)).await;
+    match set {
+        Ok(Ok(0)) => error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "the program has no sound now",
+        ),
+        Ok(Ok(_)) => {
+            state.refresh().await;
+            mixer_response(&state).await
+        }
+        Ok(Err(failure)) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audio",
+            &failure.to_string(),
         ),
         Err(join) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1314,6 +1437,68 @@ buttons:
         assert_eq!(body["error"], "not_found");
         let (status, _) = call(state, "GET", "/buttons/nope/library/1/keys").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_mixer_reads_and_sets_the_output_and_each_apps_volume() {
+        use serde_json::json;
+
+        let (state, audio) = state();
+        audio.set_volume("discord.exe", 0.8);
+        let (status, body) = call(state.clone(), "GET", "/audio/mixer").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "master": {"volume": 0.5, "muted": false},
+                "apps": [
+                    {"process": "discord.exe", "name": "discord", "volume": 0.8},
+                    {"process": "streetfighter6.exe", "name": "streetfighter6", "volume": 1.0}
+                ]
+            })
+        );
+
+        // Muting, then moving the volume, which unmutes as Windows' own slider does.
+        let (status, body) = send(
+            state.clone(),
+            "PUT",
+            "/audio/master",
+            json!({"muted": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["master"], json!({"volume": 0.5, "muted": true}));
+        let (_, body) = send(
+            state.clone(),
+            "PUT",
+            "/audio/master",
+            json!({"volume": 0.25}),
+        )
+        .await;
+        assert_eq!(body["master"], json!({"volume": 0.25, "muted": false}));
+        let (status, body) = send(
+            state.clone(),
+            "PUT",
+            "/audio/master",
+            json!({"volume": 1.5}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_volume");
+
+        let (status, body) = send(
+            state.clone(),
+            "PUT",
+            "/audio/apps/Discord.exe",
+            json!({"volume": 0.4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["apps"][0]["volume"], json!(0.4));
+        let (status, body) =
+            send(state, "PUT", "/audio/apps/gone.exe", json!({"volume": 0.4})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
     }
 
     #[tokio::test]

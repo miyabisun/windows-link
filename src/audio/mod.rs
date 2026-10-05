@@ -18,6 +18,22 @@ pub struct Device {
     pub connected: bool,
 }
 
+/// The default output's volume (0.0-1.0) and whether it is muted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct Master {
+    pub volume: f32,
+    pub muted: bool,
+}
+
+/// An app with sound on the default output: its program's file name, a name to show,
+/// and its volume (0.0-1.0).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AppSound {
+    pub process: String,
+    pub name: String,
+    pub volume: f32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioError(pub String);
 
@@ -55,6 +71,18 @@ impl Audio for UnavailableAudio {
     fn set_app_volume(&self, _: &str, _: f32) -> AudioResult<usize> {
         Err(AudioError(self.0.clone()))
     }
+
+    fn master(&self) -> AudioResult<Master> {
+        Err(AudioError(self.0.clone()))
+    }
+
+    fn set_master(&self, _: Option<f32>, _: Option<bool>) -> AudioResult<()> {
+        Err(AudioError(self.0.clone()))
+    }
+
+    fn apps(&self) -> AudioResult<Vec<AppSound>> {
+        Err(AudioError(self.0.clone()))
+    }
 }
 
 /// Blocking calls; the server runs them on the blocking pool.
@@ -69,4 +97,10 @@ pub trait Audio: Send + Sync + 'static {
     fn app_volume(&self, process: &str) -> AudioResult<Option<f32>>;
     /// Set the volume of every live session owned by `process`; returns the count.
     fn set_app_volume(&self, process: &str, level: f32) -> AudioResult<usize>;
+    /// The default output's volume and mute.
+    fn master(&self) -> AudioResult<Master>;
+    /// Change the default output's volume, its mute, or both.
+    fn set_master(&self, volume: Option<f32>, muted: Option<bool>) -> AudioResult<()>;
+    /// The apps with sound on the default output, one per program, by name.
+    fn apps(&self) -> AudioResult<Vec<AppSound>>;
 }

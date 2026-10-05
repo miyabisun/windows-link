@@ -58,6 +58,13 @@ pub enum ButtonSpec {
     /// Toggle one process's session volume between two levels (0.0-1.0).
     #[serde(rename = "audio.app_volume_toggle")]
     AppVolumeToggle { process: String, levels: [f32; 2] },
+    /// Mute the default output, or unmute it.
+    #[serde(rename = "audio.mute_toggle")]
+    MuteToggle {},
+    /// The mixer: the panel opens the default output's volume and each app's
+    /// (`GET /audio/mixer`) instead of pressing.
+    #[serde(rename = "audio.mixer")]
+    Mixer {},
     /// Join one Discord voice channel, or leave it when already there.
     #[serde(rename = "discord.voice")]
     DiscordVoice {
@@ -121,6 +128,8 @@ impl ButtonSpec {
         match self {
             Self::OutputToggle { .. } => "audio.output_toggle",
             Self::AppVolumeToggle { .. } => "audio.app_volume_toggle",
+            Self::MuteToggle {} => "audio.mute_toggle",
+            Self::Mixer {} => "audio.mixer",
             Self::DiscordVoice { .. } => "discord.voice",
             Self::AppLaunch { .. } => "app.launch",
             Self::SteamGame { .. } => "steam.game",
@@ -281,7 +290,10 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                     )));
                 }
             }
-            ButtonSpec::SteamLibrary { .. } | ButtonSpec::DlsiteLibrary { .. } => {}
+            ButtonSpec::SteamLibrary { .. }
+            | ButtonSpec::DlsiteLibrary { .. }
+            | ButtonSpec::MuteToggle {}
+            | ButtonSpec::Mixer {} => {}
             ButtonSpec::DiscordVoice { channel_id } => {
                 if !channel_id.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(ConfigError(format!(

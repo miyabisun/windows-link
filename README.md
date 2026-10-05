@@ -10,6 +10,8 @@ Each button does one thing:
 | --- | --- | --- |
 | `audio.output_toggle` | switches the Windows default output between two devices | the current default and whether each device is connected |
 | `audio.app_volume_toggle` | toggles one application's volume between two levels | the application's current volume, or not running |
+| `audio.mute_toggle` | mutes the default output, or unmutes it | whether it is muted, and its volume |
+| `audio.mixer` | nothing: a panel opens the mixer (`GET /audio/mixer`) | the default output's volume and whether it is muted |
 | `discord.voice` | joins one Discord voice channel, or leaves it when you are in it | whether you are in that channel, or why Discord cannot be reached |
 | `app.launch` | opens a program, shortcut, URL or Store app, or brings it to the front while it runs | whether it runs |
 | `steam.game` | starts a Steam game, or closes it while it runs | whether it runs |
@@ -85,6 +87,12 @@ buttons:
     type: audio.output_toggle
     devices: [speakers, earbuds]
     except: [dev]           # optional: desktops whose tab leaves it out
+  - id: mute
+    label: Mute
+    type: audio.mute_toggle
+  - id: mixer
+    label: Mixer
+    type: audio.mixer
 ```
 
 Each virtual desktop can have its own buttons in `desktops/<desktop name>.yaml`, which
@@ -142,6 +150,10 @@ buttons:
   session of the process. Windows remembers per-application volume, so the state shows
   the remembered value; nothing is restored automatically. Pressing while the process has
   no audio session fails with `409 not_running`.
+- `audio.mixer` is opened by the panel, not pressed: `GET /audio/mixer` gives the default
+  output's volume and mute and the applications with sound on it (one per program, named
+  by its file name without `.exe`), and `PUT /audio/master` and `PUT /audio/apps/{process}`
+  change them. Moving the volume of a muted output unmutes it, as Windows' own slider does.
 - `discord.voice` joins its channel (moving you out of any other voice channel), or
   leaves it when you are already there. Add one button per channel. See
   [Discord](#discord) for the one-time setup.
@@ -370,6 +382,9 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 | `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now) |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
+| `GET /audio/mixer` | the default output's volume and mute and the applications with sound on it: `{"master": {volume, muted}, "apps": [{process, name, volume}]}` (volumes 0–1) |
+| `PUT /audio/master` | `{"volume": …}` and/or `{"muted": …}` (a volume alone also unmutes); returns the mixer (`400 invalid_volume` outside 0–1) |
+| `PUT /audio/apps/{process}` | `{"volume": …}` for every session of the program; returns the mixer (`404` when it has no sound now) |
 | `PUT /buttons/{id}/pins/{item}`, `DELETE …` | pin a game to the button, or take it off; returns `{"button": …}` |
 | `POST /buttons/{id}/library/{item}/folder` | show an installed game's folder in Explorer (`204`; `404` when not installed) |
 | `GET /buttons/{id}/library/{item}/programs` | a game's programs to choose from: `{"candidates": ["Game.exe", …], "chosen": null}` (`404` when it has no choice) |

@@ -23,10 +23,10 @@ use windows::{
         Foundation::{CloseHandle, PROPERTYKEY},
         Media::Audio::{
             AudioSessionStateExpired, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATEMASK_ALL,
-            EDataFlow, ERole, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
-            IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
-            ISimpleAudioVolume, MMDeviceEnumerator, eCommunications, eConsole, eMultimedia,
-            eRender,
+            EDataFlow, ERole, Endpoints::IAudioEndpointVolume, IAudioSessionControl2,
+            IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
+            IMMNotificationClient_Impl, ISimpleAudioVolume, MMDeviceEnumerator, eCommunications,
+            eConsole, eMultimedia, eRender,
         },
         System::{
             Com::{
@@ -44,7 +44,7 @@ use windows::{
     },
 };
 
-use super::{Audio, AudioError, AudioResult, Device};
+use super::{AppSound, Audio, AudioError, AudioResult, Device, Master};
 
 /// Undocumented but long-stable interface used to change the default endpoint
 /// (the same one `SoundSwitch` and `AudioDeviceCmdlets` use). Only `SetDefaultEndpoint`
@@ -93,6 +93,9 @@ enum Command {
     SetDefaultOutput(String, Reply<()>),
     AppVolume(String, Reply<Option<f32>>),
     SetAppVolume(String, f32, Reply<usize>),
+    Master(Reply<Master>),
+    SetMaster(Option<f32>, Option<bool>, Reply<()>),
+    Apps(Reply<Vec<AppSound>>),
 }
 
 pub struct WindowsAudio {
@@ -144,6 +147,18 @@ impl Audio for WindowsAudio {
 
     fn set_app_volume(&self, process: &str, level: f32) -> AudioResult<usize> {
         self.call(|reply| Command::SetAppVolume(process.to_owned(), level, reply))
+    }
+
+    fn master(&self) -> AudioResult<Master> {
+        self.call(Command::Master)
+    }
+
+    fn set_master(&self, volume: Option<f32>, muted: Option<bool>) -> AudioResult<()> {
+        self.call(|reply| Command::SetMaster(volume, muted, reply))
+    }
+
+    fn apps(&self) -> AudioResult<Vec<AppSound>> {
+        self.call(Command::Apps)
     }
 }
 
@@ -235,6 +250,11 @@ fn worker(
             Command::SetAppVolume(process, level, reply) => {
                 drop(reply.send(state.set_app_volume(&process, level)));
             }
+            Command::Master(reply) => drop(reply.send(state.master())),
+            Command::SetMaster(volume, muted, reply) => {
+                drop(reply.send(state.set_master(volume, muted)));
+            }
+            Command::Apps(reply) => drop(reply.send(state.apps())),
         }
     }
 }
@@ -308,6 +328,109 @@ impl ComState {
             }
         }
         Ok(())
+    }
+
+    /// The default output's volume control.
+    fn endpoint_volume(&self) -> AudioResult<IAudioEndpointVolume> {
+        unsafe {
+            self.enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .map_err(|e| err("GetDefaultAudioEndpoint", &e))?
+                .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+                .map_err(|e| err("IAudioEndpointVolume", &e))
+        }
+    }
+
+    fn master(&self) -> AudioResult<Master> {
+        let endpoint = self.endpoint_volume()?;
+        unsafe {
+            Ok(Master {
+                volume: endpoint
+                    .GetMasterVolumeLevelScalar()
+                    .map_err(|e| err("GetMasterVolumeLevelScalar", &e))?,
+                muted: endpoint
+                    .GetMute()
+                    .map_err(|e| err("GetMute", &e))?
+                    .as_bool(),
+            })
+        }
+    }
+
+    fn set_master(&self, volume: Option<f32>, muted: Option<bool>) -> AudioResult<()> {
+        let endpoint = self.endpoint_volume()?;
+        unsafe {
+            if let Some(volume) = volume {
+                endpoint
+                    .SetMasterVolumeLevelScalar(volume, std::ptr::null())
+                    .map_err(|e| err("SetMasterVolumeLevelScalar", &e))?;
+            }
+            if let Some(muted) = muted {
+                endpoint
+                    .SetMute(muted, std::ptr::null())
+                    .map_err(|e| err("SetMute", &e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The apps with a live session on the default output, one per program (the first
+    /// session's volume), by name. A program's name is its file name without `.exe`.
+    fn apps(&self) -> AudioResult<Vec<AppSound>> {
+        let mut apps: Vec<AppSound> = Vec::new();
+        unsafe {
+            let device = self
+                .enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .map_err(|e| err("GetDefaultAudioEndpoint", &e))?;
+            let manager = device
+                .Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)
+                .map_err(|e| err("IAudioSessionManager2", &e))?;
+            let sessions = manager
+                .GetSessionEnumerator()
+                .map_err(|e| err("GetSessionEnumerator", &e))?;
+            for i in 0..sessions.GetCount().unwrap_or(0) {
+                let Ok(control) = sessions.GetSession(i) else {
+                    continue;
+                };
+                if control
+                    .GetState()
+                    .is_ok_and(|state| state == AudioSessionStateExpired)
+                {
+                    continue;
+                }
+                let Ok(pid) = control
+                    .cast::<IAudioSessionControl2>()
+                    .and_then(|c| c.GetProcessId())
+                else {
+                    continue;
+                };
+                let Some(process) = (pid != 0).then(|| process_file_name(pid)).flatten() else {
+                    continue;
+                };
+                if apps
+                    .iter()
+                    .any(|a| a.process.eq_ignore_ascii_case(&process))
+                {
+                    continue;
+                }
+                let Ok(volume) = control
+                    .cast::<ISimpleAudioVolume>()
+                    .and_then(|v| v.GetMasterVolume())
+                else {
+                    continue;
+                };
+                let name = Path::new(&process)
+                    .file_stem()
+                    .map_or_else(|| process.clone(), |s| s.to_string_lossy().into_owned());
+                apps.push(AppSound {
+                    process,
+                    name,
+                    volume,
+                });
+            }
+        }
+        apps.sort_by_key(|a| a.name.to_lowercase());
+        Ok(apps)
     }
 
     /// Live sessions of `process` across all active render endpoints.

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Mutex};
 
-use super::{Audio, AudioError, AudioResult, Device};
+use super::{AppSound, Audio, AudioError, AudioResult, Device, Master};
 
 /// In-memory audio state for tests.
 #[derive(Default)]
@@ -14,6 +14,7 @@ pub struct FakeState {
     pub default_output: Option<String>,
     /// process file name (lowercase) -> volume
     pub volumes: HashMap<String, f32>,
+    pub master: Master,
 }
 
 impl FakeAudio {
@@ -23,6 +24,10 @@ impl FakeAudio {
                 devices,
                 default_output: default_output.map(str::to_owned),
                 volumes: HashMap::new(),
+                master: Master {
+                    volume: 0.5,
+                    muted: false,
+                },
             }),
         }
     }
@@ -71,6 +76,37 @@ impl Audio for FakeAudio {
             .volumes
             .get(&process.to_lowercase())
             .copied())
+    }
+
+    fn master(&self) -> AudioResult<Master> {
+        Ok(self.state.lock().unwrap().master)
+    }
+
+    fn set_master(&self, volume: Option<f32>, muted: Option<bool>) -> AudioResult<()> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(volume) = volume {
+            state.master.volume = volume;
+        }
+        if let Some(muted) = muted {
+            state.master.muted = muted;
+        }
+        Ok(())
+    }
+
+    /// One app per volume, named by its file name without `.exe`.
+    fn apps(&self) -> AudioResult<Vec<AppSound>> {
+        let state = self.state.lock().unwrap();
+        let mut apps: Vec<AppSound> = state
+            .volumes
+            .iter()
+            .map(|(process, volume)| AppSound {
+                process: process.clone(),
+                name: process.trim_end_matches(".exe").to_owned(),
+                volume: *volume,
+            })
+            .collect();
+        apps.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(apps)
     }
 
     fn set_app_volume(&self, process: &str, level: f32) -> AudioResult<usize> {

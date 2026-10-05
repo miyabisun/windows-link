@@ -35,6 +35,17 @@ pub enum ButtonState {
         volume: Option<f64>,
         levels: [f64; 2],
     },
+    /// The default output's mute; `volume` is its volume (0-1).
+    Mute {
+        muted: bool,
+        volume: f64,
+    },
+    /// The mixer the panel opens (`GET /audio/mixer`) instead of pressing, with the
+    /// default output's volume and mute.
+    Mixer {
+        muted: bool,
+        volume: f64,
+    },
     /// A Discord voice channel: `available` is false while Discord cannot be reached
     /// (`reason` says why); a press still tries, starting Discord if needed.
     Voice {
@@ -117,7 +128,7 @@ pub fn next_volume(current: f32, levels: [f32; 2]) -> f32 {
     }
 }
 
-fn round2(value: f32) -> f64 {
+pub fn round2(value: f32) -> f64 {
     (f64::from(value) * 100.0).round() / 100.0
 }
 
@@ -230,6 +241,19 @@ fn state(
                 message: error.to_string(),
             },
         },
+        ButtonSpec::MuteToggle {} | ButtonSpec::Mixer {} => match audio.master() {
+            Ok(master) => {
+                let (muted, volume) = (master.muted, round2(master.volume));
+                if matches!(spec, ButtonSpec::Mixer {}) {
+                    ButtonState::Mixer { muted, volume }
+                } else {
+                    ButtonState::Mute { muted, volume }
+                }
+            }
+            Err(error) => ButtonState::Error {
+                message: error.to_string(),
+            },
+        },
         ButtonSpec::DiscordVoice { channel_id } => ButtonState::Voice {
             available: voice.available,
             joined: voice.available && voice.selected.as_deref() == Some(channel_id.as_str()),
@@ -253,6 +277,33 @@ fn state(
     }
 }
 
+/// Make the other of the two devices the default output, when it is connected.
+fn press_output(
+    config: &Config,
+    devices: &[String; 2],
+    audio: &dyn Audio,
+) -> Result<(), PressError> {
+    let first = &config.devices[&devices[0]];
+    let second = &config.devices[&devices[1]];
+    let current = audio.default_output().map_err(PressError::Audio)?;
+    let target = next_output(current.as_deref(), first, second);
+    let known = audio.devices().map_err(PressError::Audio)?;
+    let device = known.iter().find(|d| d.id == target);
+    if !device.is_some_and(|d| d.connected) {
+        let alias = if target == first {
+            &devices[0]
+        } else {
+            &devices[1]
+        };
+        let name = device.map_or(alias.as_str(), |d| d.name.as_str());
+        return Err(PressError::Conflict {
+            code: "device_unavailable",
+            message: format!("{name} is not connected"),
+        });
+    }
+    audio.set_default_output(target).map_err(PressError::Audio)
+}
+
 pub fn press(
     config: &Config,
     id: &str,
@@ -266,27 +317,7 @@ pub fn press(
         .find(|b| b.id == id)
         .ok_or(PressError::NotFound)?;
     match &button.spec {
-        ButtonSpec::OutputToggle { devices } => {
-            let first = &config.devices[&devices[0]];
-            let second = &config.devices[&devices[1]];
-            let current = audio.default_output().map_err(PressError::Audio)?;
-            let target = next_output(current.as_deref(), first, second);
-            let known = audio.devices().map_err(PressError::Audio)?;
-            let device = known.iter().find(|d| d.id == target);
-            if !device.is_some_and(|d| d.connected) {
-                let alias = if target == first {
-                    &devices[0]
-                } else {
-                    &devices[1]
-                };
-                let name = device.map_or(alias.as_str(), |d| d.name.as_str());
-                return Err(PressError::Conflict {
-                    code: "device_unavailable",
-                    message: format!("{name} is not connected"),
-                });
-            }
-            audio.set_default_output(target).map_err(PressError::Audio)
-        }
+        ButtonSpec::OutputToggle { devices } => press_output(config, devices, audio),
         ButtonSpec::AppVolumeToggle { process, levels } => {
             let Some(current) = audio.app_volume(process).map_err(PressError::Audio)? else {
                 return Err(PressError::Conflict {
@@ -299,6 +330,16 @@ pub fn press(
                 .map_err(PressError::Audio)?;
             Ok(())
         }
+        ButtonSpec::MuteToggle {} => {
+            let master = audio.master().map_err(PressError::Audio)?;
+            audio
+                .set_master(None, Some(!master.muted))
+                .map_err(PressError::Audio)
+        }
+        ButtonSpec::Mixer {} => Err(PressError::Conflict {
+            code: "not_pressable",
+            message: "the mixer opens on the panel; use GET /audio/mixer".into(),
+        }),
         ButtonSpec::DiscordVoice { channel_id } => {
             voice.toggle(channel_id).map_err(|error| match error {
                 VoiceError::Unavailable(message) => PressError::Conflict {
@@ -382,6 +423,52 @@ mod tests {
             processes: &NO_PROCESSES,
             pins: &NO_PINS,
         }
+    }
+
+    #[test]
+    fn mute_toggles_the_output_and_the_mixer_opens_on_the_panel() {
+        let config = config::parse(
+            "buttons:\n  - id: mute\n    label: Mute\n    type: audio.mute_toggle\n  - id: mixer\n    label: Mixer\n    type: audio.mixer\n",
+        )
+        .unwrap();
+        let audio = FakeAudio::new(devices(), Some("id-motu"));
+        let state = |index: usize| {
+            let snapshot = AudioSnapshot::read(&audio).unwrap();
+            view(
+                &config,
+                &config.buttons[index],
+                &readings(&snapshot, &no_voice()),
+                &audio,
+            )
+            .state
+        };
+        assert_eq!(
+            state(0),
+            ButtonState::Mute {
+                muted: false,
+                volume: 0.5
+            }
+        );
+        let voice = FakeVoice::new(false, None);
+        let launcher = FakeLauncher::default();
+        press(&config, "mute", &audio, &voice, &launcher).unwrap();
+        assert!(audio.master().unwrap().muted);
+        assert_eq!(
+            state(1),
+            ButtonState::Mixer {
+                muted: true,
+                volume: 0.5
+            }
+        );
+        press(&config, "mute", &audio, &voice, &launcher).unwrap();
+        assert!(!audio.master().unwrap().muted);
+        assert!(matches!(
+            press(&config, "mixer", &audio, &voice, &launcher),
+            Err(PressError::Conflict {
+                code: "not_pressable",
+                ..
+            })
+        ));
     }
 
     const CONFIG: &str = r"
