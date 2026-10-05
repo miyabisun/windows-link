@@ -8,7 +8,8 @@ use crate::{
     audio::{Audio, AudioError, Device},
     config::{ButtonConfig, ButtonSpec, Config},
     discord::{Voice, VoiceError, VoiceStatus},
-    launch::{Launcher, Processes, is_running},
+    launch::{Launcher, Processes, Program, is_running},
+    library::{Pin, Pinned},
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -49,6 +50,11 @@ pub enum ButtonState {
     /// A Steam game: a press starts it, or closes it while `running`.
     Game {
         running: bool,
+    },
+    /// A game library the panel opens (`GET /buttons/{id}/library`) instead of
+    /// pressing; `pins` are the games pinned to the button's tab, in order.
+    Library {
+        pins: Vec<Pin>,
     },
     Error {
         message: String,
@@ -145,6 +151,7 @@ pub struct Readings<'a> {
     pub audio: &'a AudioSnapshot,
     pub voice: &'a VoiceStatus,
     pub processes: &'a Processes,
+    pub pins: &'a Pinned,
 }
 
 pub fn view(
@@ -162,16 +169,17 @@ pub fn view(
         icon: icon_path(button).is_some_and(|path| {
             path.to_string_lossy().to_lowercase().starts_with("shell:") || path.exists()
         }),
-        state: state(config, &button.spec, readings, audio),
+        state: state(config, button, readings, audio),
     }
 }
 
 fn state(
     config: &Config,
-    spec: &ButtonSpec,
+    button: &ButtonConfig,
     readings: &Readings<'_>,
     audio: &dyn Audio,
 ) -> ButtonState {
+    let spec = &button.spec;
     let snapshot = readings.audio;
     let voice = readings.voice;
     match spec {
@@ -230,6 +238,9 @@ fn state(
         },
         ButtonSpec::SteamGame { process, .. } => ButtonState::Game {
             running: is_running(readings.processes, process),
+        },
+        ButtonSpec::SteamLibrary { .. } => ButtonState::Library {
+            pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
         },
     }
 }
@@ -301,7 +312,9 @@ pub fn press(
         } => {
             if let Some(process) = process
                 && is_running(&launcher.processes(), process)
-                && launcher.focus(process).map_err(PressError::Launch)?
+                && launcher
+                    .focus(&Program::Exe(process.clone()))
+                    .map_err(PressError::Launch)?
             {
                 return Ok(());
             }
@@ -309,6 +322,10 @@ pub fn press(
                 .open(target, args.as_deref(), *admin)
                 .map_err(PressError::Launch)
         }
+        ButtonSpec::SteamLibrary { .. } => Err(PressError::Conflict {
+            code: "not_pressable",
+            message: "a library opens on the panel; use GET /buttons/{id}/library".into(),
+        }),
         ButtonSpec::SteamGame { app_id, process } => {
             if is_running(&launcher.processes(), process) {
                 match launcher.close(process).map_err(PressError::Launch)? {
@@ -322,7 +339,7 @@ pub fn press(
                 launcher
                     .open(&format!("steam://rungameid/{app_id}"), None, false)
                     .map_err(PressError::Launch)?;
-                launcher.focus_when_ready(process);
+                launcher.focus_when_ready(Program::Exe(process.clone()));
                 Ok(())
             }
         }
@@ -337,7 +354,8 @@ mod tests {
         buttons::AudioSnapshot,
         config,
         discord::{Voice, VoiceStatus, fake::FakeVoice},
-        launch::{Launcher, Processes, fake::FakeLauncher},
+        launch::{Launcher, Processes, Program, fake::FakeLauncher},
+        library::{Pin, Pinned},
     };
 
     fn no_voice() -> VoiceStatus {
@@ -345,12 +363,14 @@ mod tests {
     }
 
     static NO_PROCESSES: std::sync::LazyLock<Processes> = std::sync::LazyLock::new(Processes::new);
+    static NO_PINS: std::sync::LazyLock<Pinned> = std::sync::LazyLock::new(Pinned::new);
 
     fn readings<'a>(audio: &'a AudioSnapshot, voice: &'a VoiceStatus) -> super::Readings<'a> {
         super::Readings {
             audio,
             voice,
             processes: &NO_PROCESSES,
+            pins: &NO_PINS,
         }
     }
 
@@ -674,13 +694,17 @@ buttons:
             audio: &snapshot,
             voice: &status,
             processes: &processes,
+            pins: &NO_PINS,
         };
         assert_eq!(
             view(&config, &config.buttons[0], &readings, &audio).state,
             ButtonState::Launch { running: true }
         );
         press(&config, "ba", &audio, &voice, &launcher).unwrap();
-        assert_eq!(*launcher.focused.lock().unwrap(), ["BlueArchive.exe"]);
+        assert_eq!(
+            *launcher.focused.lock().unwrap(),
+            [Program::Exe("BlueArchive.exe".into())]
+        );
         assert_eq!(launcher.opened.lock().unwrap().len(), 1);
 
         press(&config, "admin", &audio, &voice, &launcher).unwrap();
@@ -705,6 +729,7 @@ buttons:
                 audio: &snapshot,
                 voice: &status,
                 processes: &processes,
+                pins: &NO_PINS,
             };
             view(&config, &config.buttons[0], &readings, &audio).state
         };
@@ -714,7 +739,10 @@ buttons:
             *launcher.opened.lock().unwrap(),
             ["steam://rungameid/1364780"]
         );
-        assert_eq!(*launcher.awaited.lock().unwrap(), ["StreetFighter6.exe"]);
+        assert_eq!(
+            *launcher.awaited.lock().unwrap(),
+            [Program::Exe("StreetFighter6.exe".into())]
+        );
 
         launcher
             .running
@@ -725,6 +753,49 @@ buttons:
         press(&config, "sf6", &audio, &voice, &launcher).unwrap();
         assert_eq!(state(&launcher), ButtonState::Game { running: false });
         assert_eq!(launcher.opened.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn library_buttons_show_their_pins_and_open_on_the_panel_instead_of_pressing() {
+        let config = config::parse(
+            "buttons:\n  - id: library\n    label: Library\n    type: steam.library\n  - id: other\n    label: Other\n    type: steam.library\n",
+        )
+        .unwrap();
+        let audio = FakeAudio::new(devices(), None);
+        let snapshot = AudioSnapshot::read(&audio).unwrap();
+        let status = no_voice();
+        let pinned = Pin {
+            id: "1364780".into(),
+            name: "Street Fighter 6".into(),
+        };
+        let pins: Pinned = [("library".to_owned(), vec![pinned.clone()])].into();
+        let readings = super::Readings {
+            audio: &snapshot,
+            voice: &status,
+            processes: &NO_PROCESSES,
+            pins: &pins,
+        };
+        assert_eq!(
+            view(&config, &config.buttons[0], &readings, &audio).state,
+            ButtonState::Library { pins: vec![pinned] }
+        );
+        assert_eq!(
+            view(&config, &config.buttons[1], &readings, &audio).state,
+            ButtonState::Library { pins: vec![] }
+        );
+        assert!(matches!(
+            press(
+                &config,
+                "library",
+                &audio,
+                &FakeVoice::new(false, None),
+                &FakeLauncher::default()
+            ),
+            Err(PressError::Conflict {
+                code: "not_pressable",
+                ..
+            })
+        ));
     }
 
     #[test]

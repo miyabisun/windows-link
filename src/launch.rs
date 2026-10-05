@@ -1,23 +1,46 @@
 //! Starting programs the way Explorer does, and finding, focusing or closing running ones.
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 /// Which executables are running, by lower-case file name.
 pub type Processes = HashSet<String>;
+
+/// Which processes belong to a program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Program {
+    /// Processes of this executable file name, case-insensitive.
+    Exe(String),
+    /// Processes whose executable is in this folder or below it, such as a game started
+    /// through Steam, whose executable name the library does not know.
+    Folder(PathBuf),
+}
+
+impl fmt::Display for Program {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exe(name) => f.write_str(name),
+            Self::Folder(folder) => write!(f, "{}", folder.display()),
+        }
+    }
+}
 
 pub trait Launcher: Send + Sync + 'static {
     /// Open an exe, shortcut, document, URL (`steam://rungameid/…`) or Store app
     /// (`shell:AppsFolder\…`), as administrator when `admin`.
     fn open(&self, target: &str, args: Option<&str>, admin: bool) -> Result<(), String>;
     fn processes(&self) -> Processes;
-    /// Bring the process's main window to the front (restoring it when minimized).
+    /// Bring the program's main window to the front (restoring it when minimized).
     /// `Ok(false)` when it has no window to show.
-    fn focus(&self, process: &str) -> Result<bool, String>;
-    /// In the background, wait for the process's main window to appear and bring it to
+    fn focus(&self, program: &Program) -> Result<bool, String>;
+    /// In the background, wait for the program's main window to appear and bring it to
     /// the front once. A program started through another one (a game through Steam)
     /// otherwise starts behind the window that had the focus, and a game then may not
     /// go full screen.
-    fn focus_when_ready(&self, process: &str);
+    fn focus_when_ready(&self, program: Program);
     /// Ask the process's windows to close, like clicking their close button. Returns
     /// how many windows were asked.
     fn close(&self, process: &str) -> Result<usize, String>;
@@ -25,6 +48,18 @@ pub trait Launcher: Send + Sync + 'static {
 
 pub fn is_running(processes: &Processes, process: &str) -> bool {
     processes.contains(&process.to_lowercase())
+}
+
+/// Whether `exe` is in `folder` or below it, ignoring case as Windows does.
+pub fn is_under(exe: &Path, folder: &Path) -> bool {
+    let mut parts = exe.components();
+    folder.components().all(|want| {
+        parts.next().is_some_and(|part| {
+            part.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&want.as_os_str().to_string_lossy())
+        })
+    }) && parts.next().is_some()
 }
 
 /// Where the target's own folder is, for programs that expect to start there. URLs,
@@ -40,14 +75,25 @@ pub fn working_dir(target: &str) -> Option<std::path::PathBuf> {
 }
 
 pub mod windows {
-    use std::{collections::HashSet, ffi::OsStr, os::windows::ffi::OsStrExt};
+    use std::{
+        collections::HashSet,
+        ffi::OsStr,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+        path::PathBuf,
+    };
 
     use windows::{
         Win32::{
             Foundation::{CloseHandle, HWND, LPARAM, WPARAM},
-            System::Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-                TH32CS_SNAPPROCESS,
+            System::{
+                Diagnostics::ToolHelp::{
+                    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                    TH32CS_SNAPPROCESS,
+                },
+                Threading::{
+                    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+                    QueryFullProcessImageNameW,
+                },
             },
             UI::{
                 Input::KeyboardAndMouse::{
@@ -63,10 +109,10 @@ pub mod windows {
                 },
             },
         },
-        core::{BOOL, PCWSTR, w},
+        core::{BOOL, PCWSTR, PWSTR, w},
     };
 
-    use super::{Launcher, Processes, working_dir};
+    use super::{Launcher, Processes, Program, is_under, working_dir};
 
     fn wide(text: &OsStr) -> Vec<u16> {
         text.encode_wide().chain(Some(0)).collect()
@@ -109,6 +155,36 @@ pub mod windows {
             .collect()
     }
 
+    /// The executable's full path, when Windows lets this user read it.
+    fn exe_path(pid: u32) -> Option<PathBuf> {
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buffer = [0u16; 1024];
+            let mut len = u32::try_from(buffer.len()).unwrap_or(0);
+            let read = QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                PWSTR(buffer.as_mut_ptr()),
+                &raw mut len,
+            );
+            let _ = CloseHandle(process);
+            read.ok()?;
+            let len = usize::try_from(len).unwrap_or(0).min(buffer.len());
+            Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])))
+        }
+    }
+
+    fn pids(program: &Program) -> HashSet<u32> {
+        match program {
+            Program::Exe(name) => pids_of(name),
+            Program::Folder(folder) => snapshot()
+                .into_iter()
+                .filter(|(pid, _)| exe_path(*pid).is_some_and(|exe| is_under(&exe, folder)))
+                .map(|(pid, _)| pid)
+                .collect(),
+        }
+    }
+
     /// The first visible, titled, unowned window of one of `pids` (the main window).
     fn main_window(pids: &HashSet<u32>) -> Option<HWND> {
         struct Search<'a> {
@@ -145,15 +221,14 @@ pub mod windows {
     pub struct WindowsLauncher;
 
     impl Launcher for WindowsLauncher {
-        fn focus_when_ready(&self, process: &str) {
-            let process = process.to_owned();
+        fn focus_when_ready(&self, program: Program) {
             std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + READY_TIMEOUT;
                 while std::time::Instant::now() < deadline {
-                    if main_window(&pids_of(&process)).is_some() {
-                        match WindowsLauncher.focus(&process) {
+                    if main_window(&pids(&program)).is_some() {
+                        match WindowsLauncher.focus(&program) {
                             Ok(_) => {
-                                tracing::info!(%process, "brought the started program to the front");
+                                tracing::info!(%program, "brought the started program to the front");
                             }
                             Err(message) => {
                                 tracing::warn!(%message, "cannot bring the started program to the front");
@@ -163,13 +238,12 @@ pub mod windows {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
-                tracing::warn!(%process, "the started program showed no window in time");
+                tracing::warn!(%program, "the started program showed no window in time");
             });
         }
 
-        fn focus(&self, process: &str) -> Result<bool, String> {
-            let pids = pids_of(process);
-            let Some(hwnd) = main_window(&pids) else {
+        fn focus(&self, program: &Program) -> Result<bool, String> {
+            let Some(hwnd) = main_window(&pids(program)) else {
                 return Ok(false);
             };
             let key = |flags| INPUT {
@@ -196,7 +270,7 @@ pub mod windows {
                 if SetForegroundWindow(hwnd).as_bool() {
                     Ok(true)
                 } else {
-                    Err(format!("Windows did not bring {process} to the front"))
+                    Err(format!("Windows did not bring {program} to the front"))
                 }
             }
         }
@@ -267,16 +341,18 @@ pub mod windows {
 
 #[cfg(test)]
 pub mod fake {
-    use std::sync::Mutex;
+    use std::{path::PathBuf, sync::Mutex};
 
-    use super::{Launcher, Processes};
+    use super::{Launcher, Processes, Program};
 
     #[derive(Default)]
     pub struct FakeLauncher {
         pub running: Mutex<Processes>,
+        /// Folders a running program was started from.
+        pub running_folders: Mutex<Vec<PathBuf>>,
         pub opened: Mutex<Vec<String>>,
-        pub focused: Mutex<Vec<String>>,
-        pub awaited: Mutex<Vec<String>>,
+        pub focused: Mutex<Vec<Program>>,
+        pub awaited: Mutex<Vec<Program>>,
     }
 
     impl Launcher for FakeLauncher {
@@ -289,18 +365,17 @@ pub mod fake {
             Ok(())
         }
 
-        fn focus_when_ready(&self, process: &str) {
-            self.awaited.lock().unwrap().push(process.to_owned());
+        fn focus_when_ready(&self, program: Program) {
+            self.awaited.lock().unwrap().push(program);
         }
 
-        fn focus(&self, process: &str) -> Result<bool, String> {
-            let running = self
-                .running
-                .lock()
-                .unwrap()
-                .contains(&process.to_lowercase());
+        fn focus(&self, program: &Program) -> Result<bool, String> {
+            let running = match program {
+                Program::Exe(name) => self.running.lock().unwrap().contains(&name.to_lowercase()),
+                Program::Folder(folder) => self.running_folders.lock().unwrap().contains(folder),
+            };
             if running {
-                self.focused.lock().unwrap().push(process.to_owned());
+                self.focused.lock().unwrap().push(program.clone());
             }
             Ok(running)
         }
@@ -321,7 +396,37 @@ pub mod fake {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Processes, is_running, working_dir};
+    use std::path::Path;
+
+    use super::{Processes, is_running, is_under, working_dir};
+
+    #[test]
+    fn a_program_is_under_its_folder_at_any_depth_ignoring_case() {
+        let folder = Path::new(r"C:\Program Files (x86)\Steam\steamapps\common\Street Fighter 6");
+        assert!(is_under(
+            Path::new(
+                r"c:\program files (x86)\steam\steamapps\common\street fighter 6\StreetFighter6.exe"
+            ),
+            folder
+        ));
+        assert!(is_under(
+            Path::new(
+                r"C:\Program Files (x86)\Steam\steamapps\common\Street Fighter 6\bin\x64\game.exe"
+            ),
+            folder
+        ));
+        assert!(!is_under(
+            Path::new(
+                r"C:\Program Files (x86)\Steam\steamapps\common\Street Fighter 6 Demo\game.exe"
+            ),
+            folder
+        ));
+        assert!(!is_under(folder, folder));
+        assert!(!is_under(
+            Path::new(r"C:\Program Files (x86)\Steam\steam.exe"),
+            folder
+        ));
+    }
 
     #[test]
     fn programs_start_in_their_own_folder_but_urls_do_not() {

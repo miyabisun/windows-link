@@ -76,6 +76,13 @@ pub enum ButtonSpec {
         #[serde(default)]
         admin: bool,
     },
+    /// Search the owned Steam games on the panel, start them, and pin them to the tab.
+    #[serde(rename = "steam.library")]
+    SteamLibrary {
+        /// Collections whose games are listed only while their label is selected.
+        #[serde(default)]
+        hide: Vec<String>,
+    },
     /// Start a Steam game, or close it while it runs.
     #[serde(rename = "steam.game")]
     SteamGame {
@@ -94,6 +101,7 @@ impl ButtonSpec {
             Self::DiscordVoice { .. } => "discord.voice",
             Self::AppLaunch { .. } => "app.launch",
             Self::SteamGame { .. } => "steam.game",
+            Self::SteamLibrary { .. } => "steam.library",
         }
     }
 }
@@ -249,6 +257,7 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                     )));
                 }
             }
+            ButtonSpec::SteamLibrary { .. } => {}
             ButtonSpec::DiscordVoice { channel_id } => {
                 if !channel_id.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(ConfigError(format!(
@@ -422,6 +431,24 @@ buttons:
                 .0
                 .contains("desktops/SF6.yaml")
         );
+    }
+
+    #[test]
+    fn steam_library_buttons_name_the_labels_they_hide() {
+        let files = vec![(
+            "ゲーム".to_owned(),
+            "buttons:\n  - id: library\n    label: ゲーム検索\n    type: steam.library\n    hide: [outdate]\n  - id: all\n    label: All\n    type: steam.library\n".to_owned(),
+        )];
+        let config = super::parse_all("", &files).unwrap();
+        assert!(matches!(
+            &config.buttons[0].spec,
+            ButtonSpec::SteamLibrary { hide } if hide == &["outdate"]
+        ));
+        assert!(matches!(
+            &config.buttons[1].spec,
+            ButtonSpec::SteamLibrary { hide } if hide.is_empty()
+        ));
+        assert_eq!(config.buttons[0].spec.type_name(), "steam.library");
     }
 
     #[test]

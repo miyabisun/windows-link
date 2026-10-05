@@ -20,11 +20,12 @@ use tracing::warn;
 use crate::{
     audio::Audio,
     buttons::{self, AudioSnapshot, ButtonState, ButtonView, PressError},
-    config::Config,
+    config::{ButtonSpec, Config},
     desktops::{self, VirtualDesktops},
     discord::{NoVoice, Voice},
     icons,
     launch::{Launcher, windows::WindowsLauncher},
+    library::{self, GameLibrary, NoLibrary, Picture, Pin, Pins},
     power,
 };
 
@@ -40,6 +41,8 @@ pub struct AppState {
     voice: Arc<dyn Voice>,
     launcher: Arc<dyn Launcher>,
     icons: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>>,
+    library: Arc<dyn GameLibrary>,
+    pins: Arc<Pins>,
 }
 
 struct Hub {
@@ -61,7 +64,35 @@ impl AppState {
             voice: Arc::new(NoVoice("no Discord connection".into())),
             launcher: Arc::new(WindowsLauncher),
             icons: Arc::default(),
+            library: Arc::new(NoLibrary("no game library is set up".into())),
+            pins: Arc::new(Pins::in_memory().expect("an in-memory database opens")),
         }
+    }
+
+    /// The library `steam.library` buttons open.
+    #[must_use]
+    pub fn with_library(mut self, library: Arc<dyn GameLibrary>) -> Self {
+        self.library = library;
+        self
+    }
+
+    /// Keep library pins in `pins` (by default they last until the server stops).
+    #[must_use]
+    pub fn with_pins(mut self, pins: Arc<Pins>) -> Self {
+        self.pins = pins;
+        self
+    }
+
+    /// The labels a library button hides, or `None` when `id` is not a library button.
+    fn library_button(&self, id: &str) -> Option<Vec<String>> {
+        self.config
+            .buttons
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(|b| match &b.spec {
+                ButtonSpec::SteamLibrary { hide } => Some(hide.clone()),
+                _ => None,
+            })
     }
 
     /// Start programs and read running processes through `launcher` (tests use a fake).
@@ -118,8 +149,15 @@ impl AppState {
         let audio = self.audio.clone();
         let voice = self.voice.clone();
         let launcher = self.launcher.clone();
+        let pins = self.pins.clone();
         let views = tokio::task::spawn_blocking(move || {
-            compute(&config, audio.as_ref(), voice.as_ref(), launcher.as_ref())
+            compute(
+                &config,
+                audio.as_ref(),
+                voice.as_ref(),
+                launcher.as_ref(),
+                &pins,
+            )
         })
         .await
         .unwrap_or_default();
@@ -153,10 +191,15 @@ fn compute(
     audio: &dyn Audio,
     voice: &dyn Voice,
     launcher: &dyn Launcher,
+    pins: &Pins,
 ) -> Vec<ButtonView> {
     let snapshot = AudioSnapshot::read(audio);
     let voice = voice.status();
     let processes = launcher.processes();
+    let pins = pins.all().unwrap_or_else(|err| {
+        warn!(%err, "cannot read the library pins");
+        library::Pinned::new()
+    });
     config
         .buttons
         .iter()
@@ -166,6 +209,7 @@ fn compute(
                     audio: snapshot,
                     voice: &voice,
                     processes: &processes,
+                    pins: &pins,
                 };
                 buttons::view(config, button, &readings, audio)
             }
@@ -190,6 +234,13 @@ pub fn app(state: AppState) -> Router {
         .route("/buttons", get(list_buttons))
         .route("/buttons/{id}/press", post(press_button))
         .route("/buttons/{id}/icon", get(button_icon))
+        .route("/buttons/{id}/library", get(library_listing))
+        .route("/buttons/{id}/library/{item}/start", post(start_item))
+        .route("/buttons/{id}/library/{item}/image", get(item_picture))
+        .route(
+            "/buttons/{id}/pins/{item}",
+            axum::routing::put(pin_item).delete(unpin_item),
+        )
         .route("/power/sleep", post(sleep))
         .route("/events", get(events))
         .layer(TraceLayer::new_for_http())
@@ -225,28 +276,38 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
     })
     .await;
     match result {
-        Ok(Ok(())) => {
-            let views = state.refresh().await;
-            match views.into_iter().find(|view| view.id == id) {
-                Some(view) => Json(json!({ "button": view })).into_response(),
-                None => error(StatusCode::NOT_FOUND, "not_found", "unknown button"),
-            }
-        }
-        Ok(Err(PressError::NotFound)) => {
-            error(StatusCode::NOT_FOUND, "not_found", "unknown button")
-        }
-        Ok(Err(PressError::Conflict { code, message })) => {
-            error(StatusCode::CONFLICT, code, &message)
-        }
-        Ok(Err(PressError::Launch(failure))) => {
+        Ok(Ok(())) => button_response(&state, &id).await,
+        Ok(Err(failure)) => press_error(&id, failure, "unknown button"),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// `{"button": …}` with the button's state after a change.
+async fn button_response(state: &AppState, id: &str) -> Response {
+    let views = state.refresh().await;
+    match views.into_iter().find(|view| view.id == id) {
+        Some(view) => Json(json!({ "button": view })).into_response(),
+        None => error(StatusCode::NOT_FOUND, "not_found", "unknown button"),
+    }
+}
+
+fn press_error(id: &str, failure: PressError, not_found: &str) -> Response {
+    match failure {
+        PressError::NotFound => error(StatusCode::NOT_FOUND, "not_found", not_found),
+        PressError::Conflict { code, message } => error(StatusCode::CONFLICT, code, &message),
+        PressError::Launch(failure) => {
             warn!(button = %id, %failure, "press failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, "launch", &failure)
         }
-        Ok(Err(PressError::Discord(failure))) => {
+        PressError::Discord(failure) => {
             warn!(button = %id, %failure, "press failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, "discord", &failure)
         }
-        Ok(Err(PressError::Audio(failure))) => {
+        PressError::Audio(failure) => {
             warn!(button = %id, %failure, "press failed");
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -254,12 +315,176 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
                 &failure.to_string(),
             )
         }
+    }
+}
+
+const NOT_A_LIBRARY: &str = "no library button has this id";
+
+/// The games a library button opens, each with whether it is pinned to the button.
+async fn library_listing(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(hide) = state.library_button(&id) else {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    };
+    let library = state.library.clone();
+    let pins = state.pins.clone();
+    let read = tokio::task::spawn_blocking(move || (library.listing(), pins.all())).await;
+    let (listing, pins) = match read {
+        Ok((listing, Ok(pins))) => (listing, pins),
+        Ok((_, Err(err))) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage",
+                &err.to_string(),
+            );
+        }
+        Err(join) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &join.to_string(),
+            );
+        }
+    };
+    let pinned = pins.get(&id).cloned().unwrap_or_default();
+    let items: Vec<Value> = listing
+        .items
+        .iter()
+        .map(|item| {
+            let mut value = json!(item);
+            value["pinned"] = json!(pinned.iter().any(|pin| pin.id == item.id));
+            value
+        })
+        .collect();
+    Json(json!({
+        "items": items,
+        "labels": listing.labels,
+        "hide": hide,
+        "partial": listing.partial,
+    }))
+    .into_response()
+}
+
+/// Start a library game, or bring it to the front when it runs (`204`).
+async fn start_item(
+    State(state): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    if state.library_button(&id).is_none() {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    }
+    let library = state.library.clone();
+    let launcher = state.launcher.clone();
+    let started = tokio::task::spawn_blocking(move || {
+        library::start(library.as_ref(), launcher.as_ref(), &item)
+    })
+    .await;
+    match started {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(failure)) => press_error(&id, failure, "the library has no such game"),
         Err(join) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             &join.to_string(),
         ),
     }
+}
+
+/// A library game's picture: its file, or a redirect to it on the web.
+async fn item_picture(
+    State(state): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    if state.library_button(&id).is_none() {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    }
+    let library = state.library.clone();
+    let read = tokio::task::spawn_blocking(move || match library.picture(&item) {
+        Some(Picture::File(path)) => std::fs::read(&path)
+            .map(Ok)
+            .map_err(|err| format!("cannot read {}: {err}", path.display())),
+        Some(Picture::Url(url)) => Ok(Err(url)),
+        None => Err("the library has no such game".to_owned()),
+    })
+    .await;
+    match read {
+        Ok(Ok(Ok(bytes))) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "image/jpeg"),
+                (axum::http::header::CACHE_CONTROL, "max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Ok(Err(url))) => {
+            (StatusCode::FOUND, [(axum::http::header::LOCATION, url)]).into_response()
+        }
+        Ok(Err(message)) => error(StatusCode::NOT_FOUND, "not_found", &message),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// Pin a library game to the button's tab; returns `{"button": …}`.
+async fn pin_item(
+    State(state): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    if state.library_button(&id).is_none() {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    }
+    let library = state.library.clone();
+    let pins = state.pins.clone();
+    let button = id.clone();
+    let pinned = tokio::task::spawn_blocking(move || {
+        let found = library.listing().items.into_iter().find(|i| i.id == item)?;
+        Some(pins.add(
+            &button,
+            &Pin {
+                id: found.id,
+                name: found.name,
+            },
+        ))
+    })
+    .await;
+    match pinned {
+        Ok(Some(Ok(()))) => button_response(&state, &id).await,
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "the library has no such game",
+        ),
+        Ok(Some(Err(err))) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage",
+            &err.to_string(),
+        ),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// Take a game off the button's tab; returns `{"button": …}`.
+async fn unpin_item(
+    State(state): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    if state.library_button(&id).is_none() {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    }
+    if let Err(err) = state.pins.remove(&id, &item) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage",
+            &err.to_string(),
+        );
+    }
+    button_response(&state, &id).await
 }
 
 /// The button's Windows icon as PNG, read once and then kept.
@@ -579,6 +804,89 @@ buttons:
         assert_eq!(change["type"], "desktops");
         assert_eq!(change["reason"], "changed");
         assert_eq!(change["desktops"][1]["current"], true);
+    }
+
+    const LIBRARY: &str = "buttons:\n  - id: games\n    label: Games\n    type: steam.library\n    hide: [outdate]\n  - id: other\n    label: Other\n    type: app.launch\n    target: a.exe\n";
+
+    fn library_state() -> (AppState, Arc<crate::launch::fake::FakeLauncher>) {
+        let launcher = Arc::new(crate::launch::fake::FakeLauncher::default());
+        let state = AppState::new(
+            config::parse(LIBRARY).unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        )
+        .with_launcher(launcher.clone())
+        .with_library(Arc::new(crate::library::fake::FakeLibrary));
+        (state, launcher)
+    }
+
+    #[tokio::test]
+    async fn a_library_button_lists_its_games_with_the_labels_it_hides() {
+        let (state, _) = library_state();
+        let (status, body) = call(state.clone(), "GET", "/buttons/games/library").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["items"][0]["id"], "1");
+        assert_eq!(body["items"][0]["pinned"], false);
+        assert_eq!(body["items"][1]["labels"], serde_json::json!(["outdate"]));
+        assert_eq!(body["labels"], serde_json::json!(["outdate"]));
+        assert_eq!(body["hide"], serde_json::json!(["outdate"]));
+        assert_eq!(body["partial"], Value::Null);
+
+        let (status, _) = call(state, "GET", "/buttons/other/library").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pinning_shows_the_game_on_the_button_until_it_is_unpinned() {
+        let (state, _) = library_state();
+        let (status, body) = call(state.clone(), "PUT", "/buttons/games/pins/2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["button"]["state"]["kind"], "library");
+        assert_eq!(body["button"]["state"]["pins"][0]["name"], "Two");
+        let (_, body) = call(state.clone(), "GET", "/buttons/games/library").await;
+        assert_eq!(body["items"][1]["pinned"], true);
+
+        let (status, _) = call(state.clone(), "PUT", "/buttons/games/pins/9").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = call(state, "DELETE", "/buttons/games/pins/2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["button"]["state"]["pins"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_library_picture_is_served_from_its_file_or_redirected_to_the_web() {
+        let (state, _) = library_state();
+        let get = |uri: &str| {
+            app(state.clone()).oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        };
+        let response = get("/buttons/games/library/1/image").await.unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers()["location"], "https://img/1.jpg");
+
+        let response = get("/buttons/games/library/2/image").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/jpeg");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.starts_with(b"[package]"));
+
+        let (status, _) = call(state.clone(), "GET", "/buttons/games/library/9/image").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(state, "GET", "/buttons/other/library/1/image").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn starting_a_library_game_opens_it() {
+        let (state, launcher) = library_state();
+        let (status, _) = call(state.clone(), "POST", "/buttons/games/library/1/start").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(*launcher.opened.lock().unwrap(), ["game://run/1"]);
+        let (status, body) = call(state.clone(), "POST", "/buttons/games/library/9/start").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+        let (status, body) = call(state, "POST", "/buttons/games/press").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_pressable");
     }
 
     #[tokio::test]

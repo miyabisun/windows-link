@@ -11,6 +11,9 @@ Each button does one thing:
 | `audio.output_toggle` | switches the Windows default output between two devices | the current default and whether each device is connected |
 | `audio.app_volume_toggle` | toggles one application's volume between two levels | the application's current volume, or not running |
 | `discord.voice` | joins one Discord voice channel, or leaves it when you are in it | whether you are in that channel, or why Discord cannot be reached |
+| `app.launch` | opens a program, shortcut, URL or Store app, or brings it to the front while it runs | whether it runs |
+| `steam.game` | starts a Steam game, or closes it while it runs | whether it runs |
+| `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button |
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -55,7 +58,7 @@ The server reads these environment variables:
 | `LOG_LEVEL` | `info` | `off`, `error`, `warn`, `info`, `debug` or `trace` |
 | `WINDOWS_LINK_CONFIG` | `%LOCALAPPDATA%\windows-link\config.yaml` | configuration file |
 | `WINDOWS_LINK_UPDATE_URL` | this repository's latest release in the GitHub API | where [updates](#updates) come from |
-| `WINDOWS_LINK_SECRETS` | `%LOCALAPPDATA%\windows-link\secrets.yaml` | credentials for outside services ([Discord](#discord)) |
+| `WINDOWS_LINK_SECRETS` | `%LOCALAPPDATA%\windows-link\secrets.yaml` | credentials for outside services ([Discord](#discord), [Steam](#steam-library)) |
 
 The release build has no console window. When it is started without a terminal (for
 example at logon), logs go to `%LOCALAPPDATA%\windows-link\windows-link.log`.
@@ -158,6 +161,44 @@ buttons:
 
 Restart the server after editing the file.
 
+## Steam library
+
+A `steam.library` button gives a panel your Steam library: every game you own, whether it
+is installed, and the collections you made in Steam (dynamic collections are left out).
+For example in `desktops/ゲーム.yaml`:
+
+```yaml
+buttons:
+  - id: steam-library
+    label: Game search
+    type: steam.library
+    hide: [outdate]       # collections whose games are listed only while selected
+    icon: C:\Program Files (x86)\Steam\steam.exe
+```
+
+The games you own come from the Steam Web API, for the account that signed in to Steam on
+this PC last. Get a key at <https://steamcommunity.com/dev/apikey> (any domain name will
+do) and put it in `secrets.yaml`:
+
+```yaml
+steam:
+  api_key: 0123456789ABCDEF0123456789ABCDEF
+```
+
+windows-link fetches the list at start and every 30 minutes, so a new purchase shows up
+within half an hour (or after a restart). Without a key, or while the API cannot be
+reached, the library lists the installed games and says why in `partial`. Install state
+and collections are read from the Steam folder (found through the registry) on every
+listing, so they are always current.
+
+Starting a game opens `steam://rungameid/<app ID>` and brings the game's window to the front
+once a program from its install folder shows one; while such a window exists, starting
+brings it to the front instead. A game that is not installed opens Steam's install dialog
+(`steam://install/<app ID>`). Pictures are Steam's own 460×215 headers: the newest one in
+Steam's library cache, which follows the Steam client's language, or the store's.
+
+Pinned games are kept per button in `windows-link.db`, in the order they were pinned.
+
 ## Discord
 
 The `discord.voice` buttons drive the Discord desktop app on the same PC through its local
@@ -204,6 +245,10 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, when `icon` is true |
+| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, installed, labels, pinned}], "labels":[…], "hide":[…], "partial": null}` (`partial` says why only the installed games are listed) |
+| `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
+| `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
+| `PUT /buttons/{id}/pins/{item}`, `DELETE …` | pin a game to the button, or take it off; returns `{"button": …}` |
 | `GET /desktops` | virtual desktops, and the desktop files without a desktop: `{"desktops":[{id, name, index, current}], "unmatched":[name], "error": null}` |
 | `POST /desktops` | `{"name": …}`: create a desktop with this name and switch to it (`201`, the new `GET /desktops` body; `409 exists`) |
 | `POST /desktops/{id}/switch` | switch to a virtual desktop; returns the new `GET /desktops` body |
@@ -216,8 +261,9 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 
 Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_unavailable`,
 `409 not_running`, `500 audio`, `409 discord_unavailable`, `409 discord_rejected`,
-`500 discord`, `409 no_window`, `500 launch`, `400 invalid_hwnd`, `400 invalid_name`,
-`409 exists`, `503 desktops`, or `502 update`.
+`500 discord`, `409 no_window`, `500 launch`, `409 not_pressable` (a library button),
+`500 storage`, `400 invalid_hwnd`, `400 invalid_name`, `409 exists`, `503 desktops`, or
+`502 update`.
 
 `/events` messages:
 

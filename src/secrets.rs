@@ -5,6 +5,8 @@
 //! discord:
 //!   client_id: 1234567890123456789
 //!   client_secret: abcdef
+//! steam:
+//!   api_key: 0123456789ABCDEF0123456789ABCDEF
 //! ```
 
 use std::{
@@ -18,6 +20,22 @@ use serde::{Deserialize, Deserializer, de};
 pub struct Secrets {
     #[serde(default)]
     pub discord: Option<DiscordApp>,
+    #[serde(default)]
+    pub steam: Option<SteamKey>,
+}
+
+/// A Steam Web API key (<https://steamcommunity.com/dev/apikey>), to list owned games.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SteamKey {
+    #[serde(deserialize_with = "id_text")]
+    pub api_key: String,
+}
+
+impl fmt::Debug for SteamKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SteamKey").finish_non_exhaustive()
+    }
 }
 
 /// The Discord application windows-link signs in as (Developer Portal → `OAuth2`).
@@ -38,7 +56,7 @@ impl fmt::Debug for DiscordApp {
     }
 }
 
-/// Discord IDs are often pasted without quotes, which YAML reads as a number.
+/// IDs and keys are often pasted without quotes, which YAML may read as a number.
 pub fn id_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -100,7 +118,7 @@ mod tests {
     fn an_empty_file_or_missing_section_has_no_discord_app() {
         assert!(parse("").unwrap().discord.is_none());
         assert!(parse("# nothing yet\n").unwrap().discord.is_none());
-        assert!(parse("steam:\n  key: x\n").unwrap().discord.is_none());
+        assert!(parse("steam:\n  api_key: x\n").unwrap().discord.is_none());
     }
 
     #[test]
@@ -108,6 +126,17 @@ mod tests {
         assert!(parse("discord:\n  client_id: \"\"\n  client_secret: x\n").is_err());
         assert!(parse("discord:\n  client_id: 1\n").is_err());
         assert!(parse("discord:\n  clientid: 1\n  client_secret: x\n").is_err());
+    }
+
+    #[test]
+    fn reads_the_steam_api_key_and_hides_it_from_debug_output() {
+        let secrets = parse("steam:\n  api_key: 0123ABCD\n").unwrap();
+        let steam = secrets.steam.unwrap();
+        assert_eq!(steam.api_key, "0123ABCD");
+        assert!(!format!("{steam:?}").contains("0123ABCD"));
+        assert!(parse("").unwrap().steam.is_none());
+        assert!(parse("steam:\n  apikey: x\n").is_err());
+        assert!(parse("steam:\n  api_key: \"\"\n").is_err());
     }
 
     #[test]

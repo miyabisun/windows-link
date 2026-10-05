@@ -11,7 +11,7 @@ pub fn layer() -> CorsLayer {
         .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _: &Parts| {
             origin.to_str().is_ok_and(allowed)
         }))
-        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([CONTENT_TYPE])
 }
 

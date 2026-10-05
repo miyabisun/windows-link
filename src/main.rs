@@ -20,8 +20,10 @@ use windows_link::{
         service::DiscordVoice,
         token,
     },
+    library::{GameLibrary, NoLibrary, Pins},
     logging, port, secrets,
     server::{self, AppState},
+    steam::{self, SteamLibrary},
     touch::{
         KeepCursor,
         api::{self as touch_api, TouchState},
@@ -123,9 +125,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let desktops: Arc<dyn VirtualDesktops> = Arc::new(WinvdDesktops);
     let defined = Arc::new(config.desktops.clone());
     let voice = discord_voice(&config, changes.clone());
+    let library = steam_library(&config);
+    let pins = Arc::new(Pins::open(&data_dir().join("windows-link.db"))?);
     let state = AppState::new(config, audio)
         .with_desktops(desktops.clone())
-        .with_voice(voice);
+        .with_voice(voice)
+        .with_library(library)
+        .with_pins(pins);
     tokio::spawn(state.clone().run_refresher(changes));
     let runtime = tokio::runtime::Handle::current();
     let publisher = state.clone();
@@ -203,6 +209,27 @@ fn discord_voice(config: &config::Config, changes: Arc<Notify>) -> Arc<dyn Voice
             Arc::new(NoVoice(reason))
         }
     }
+}
+
+/// Read the Steam library only when a button needs it.
+fn steam_library(config: &config::Config) -> Arc<dyn GameLibrary> {
+    let needed = config
+        .buttons
+        .iter()
+        .any(|b| matches!(b.spec, ButtonSpec::SteamLibrary { .. }));
+    if !needed {
+        return Arc::new(NoLibrary("no steam.library buttons are configured".into()));
+    }
+    let key = match secrets::load(&secrets::default_path()) {
+        Ok(secrets) => secrets.steam,
+        Err(reason) => {
+            error!(%reason, "the Steam library lists installed games only");
+            None
+        }
+    };
+    let library = Arc::new(SteamLibrary::new(steam::steam_dir(), key));
+    tokio::spawn(steam::run_refresher(library.clone()));
+    library
 }
 
 fn list_discord_channels() -> ExitCode {
