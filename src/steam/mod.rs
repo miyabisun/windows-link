@@ -15,7 +15,7 @@ use std::{
 use tracing::{info, warn};
 
 use crate::{
-    library::{GameLibrary, Item, Label, LabelError, Listing, Picture, Start},
+    library::{GameLibrary, Item, Label, LabelError, Listing, Picture, Start, StartError},
     secrets::SteamKey,
 };
 
@@ -218,24 +218,25 @@ impl GameLibrary for SteamLibrary {
     }
 
     /// An installed game runs through Steam; an owned one opens Steam's install dialog.
-    fn start(&self, id: &str) -> Option<Start> {
-        let app_id: u32 = id.parse().ok()?;
+    fn start(&self, id: &str) -> Result<Start, StartError> {
+        let app_id: u32 = id.parse().map_err(|_| StartError::NotFound)?;
         if let Some(game) = self.installed().into_iter().find(|g| g.app_id == app_id) {
-            return Some(Start {
+            return Ok(Start {
                 open: format!("steam://rungameid/{app_id}"),
                 folder: Some(game.folder),
             });
         }
         let owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
-        owned
+        let known = owned
             .as_ref()
-            .ok()?
-            .iter()
-            .any(|g| g.app_id == app_id)
-            .then(|| Start {
-                open: format!("steam://install/{app_id}"),
-                folder: None,
-            })
+            .is_ok_and(|games| games.iter().any(|g| g.app_id == app_id));
+        if !known {
+            return Err(StartError::NotFound);
+        }
+        Ok(Start {
+            open: format!("steam://install/{app_id}"),
+            folder: None,
+        })
     }
 
     fn folder(&self, id: &str) -> Option<PathBuf> {
@@ -554,6 +555,8 @@ pub fn listing(
         .map(|(id, name, _)| Item {
             id: id.to_string(),
             name: name.to_owned(),
+            detail: None,
+            choosable: false,
             installed: local(id).is_some(),
             labels: collections
                 .iter()
@@ -859,12 +862,15 @@ mod tests {
         );
         assert_eq!(
             library.start("105600"),
-            Some(Start {
+            Ok(Start {
                 open: "steam://rungameid/105600".into(),
                 folder: Some(apps.join(r"common\Terraria")),
             })
         );
-        assert_eq!(library.start("1364780"), None);
+        assert_eq!(
+            library.start("1364780"),
+            Err(crate::library::StartError::NotFound)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

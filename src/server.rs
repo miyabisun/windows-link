@@ -32,6 +32,9 @@ use crate::{
 /// How often state is re-read to catch changes Windows does not notify (e.g. mixer volume).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Library pictures read from this PC, by `<button>/<item>`, with their media type.
+type Pictures = std::collections::HashMap<String, (Arc<Vec<u8>>, &'static str)>;
+
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<Config>,
@@ -41,7 +44,9 @@ pub struct AppState {
     voice: Arc<dyn Voice>,
     launcher: Arc<dyn Launcher>,
     icons: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>>,
-    library: Arc<dyn GameLibrary>,
+    pictures: Arc<std::sync::Mutex<Pictures>>,
+    /// Each library button's library, by button ID.
+    libraries: Arc<std::collections::HashMap<String, Arc<dyn GameLibrary>>>,
     pins: Arc<Pins>,
 }
 
@@ -64,15 +69,16 @@ impl AppState {
             voice: Arc::new(NoVoice("no Discord connection".into())),
             launcher: Arc::new(WindowsLauncher),
             icons: Arc::default(),
-            library: Arc::new(NoLibrary("no game library is set up".into())),
+            pictures: Arc::default(),
+            libraries: Arc::default(),
             pins: Arc::new(Pins::in_memory().expect("an in-memory database opens")),
         }
     }
 
-    /// The library `steam.library` buttons open.
+    /// The library a library button opens.
     #[must_use]
-    pub fn with_library(mut self, library: Arc<dyn GameLibrary>) -> Self {
-        self.library = library;
+    pub fn with_library(mut self, button: &str, library: Arc<dyn GameLibrary>) -> Self {
+        Arc::make_mut(&mut self.libraries).insert(button.to_owned(), library);
         self
     }
 
@@ -83,16 +89,26 @@ impl AppState {
         self
     }
 
-    /// The labels a library button hides, or `None` when `id` is not a library button.
-    fn library_button(&self, id: &str) -> Option<Vec<String>> {
-        self.config
+    /// The labels a library button hides and its library, or `None` when `id` is not a
+    /// library button.
+    fn library_button(&self, id: &str) -> Option<(Vec<String>, Arc<dyn GameLibrary>)> {
+        let hide = self
+            .config
             .buttons
             .iter()
             .find(|b| b.id == id)
             .and_then(|b| match &b.spec {
-                ButtonSpec::SteamLibrary { hide } => Some(hide.clone()),
+                ButtonSpec::SteamLibrary { hide } | ButtonSpec::DlsiteLibrary { hide, .. } => {
+                    Some(hide.clone())
+                }
                 _ => None,
-            })
+            })?;
+        let library = self.libraries.get(id).cloned().unwrap_or_else(|| {
+            Arc::new(NoLibrary(
+                "no game library is set up for this button".into(),
+            ))
+        });
+        Some((hide, library))
     }
 
     /// Start programs and read running processes through `launcher` (tests use a fake).
@@ -238,6 +254,11 @@ pub fn app(state: AppState) -> Router {
         .route("/buttons/{id}/library/{item}/start", post(start_item))
         .route("/buttons/{id}/library/{item}/image", get(item_picture))
         .route("/buttons/{id}/library/{item}/folder", post(open_folder))
+        .route("/buttons/{id}/library/{item}/programs", get(item_programs))
+        .route(
+            "/buttons/{id}/library/{item}/program",
+            axum::routing::put(choose_program),
+        )
         .route("/buttons/{id}/labels", post(create_label))
         .route(
             "/buttons/{id}/labels/{label}",
@@ -332,10 +353,9 @@ const NOT_A_LIBRARY: &str = "no library button has this id";
 
 /// The games a library button opens, each with whether it is pinned to the button.
 async fn library_listing(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let Some(hide) = state.library_button(&id) else {
+    let Some((hide, library)) = state.library_button(&id) else {
         return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
     };
-    let library = state.library.clone();
     let pins = state.pins.clone();
     let read = tokio::task::spawn_blocking(move || (library.listing(), pins.all())).await;
     let (listing, pins) = match read {
@@ -386,10 +406,9 @@ async fn open_folder(
     State(state): State<AppState>,
     Path((id, item)): Path<(String, String)>,
 ) -> Response {
-    if state.library_button(&id).is_none() {
+    let Some((_, library)) = state.library_button(&id) else {
         return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
-    }
-    let library = state.library.clone();
+    };
     let launcher = state.launcher.clone();
     let opened = tokio::task::spawn_blocking(move || {
         let folder = library.folder(&item).ok_or(PressError::NotFound)?;
@@ -414,6 +433,54 @@ struct LabelName {
     name: String,
 }
 
+/// The programs a game can be started with, and the one in use.
+async fn item_programs(
+    State(state): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    let Some((_, library)) = state.library_button(&id) else {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    };
+    match tokio::task::spawn_blocking(move || library.programs(&item)).await {
+        Ok(Some(programs)) => Json(programs).into_response(),
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "the game has no programs to choose from",
+        ),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ProgramChoice {
+    program: String,
+}
+
+/// `{"program": …}`: remember which program starts the game (`204`).
+async fn choose_program(
+    State(state): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+    Json(body): Json<ProgramChoice>,
+) -> Response {
+    // The picture is the chosen program's icon.
+    state
+        .pictures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&format!("{id}/{item}"));
+    no_content(
+        change_labels(&state, &id, move |library, _| {
+            library.choose_program(&item, &body.program)
+        })
+        .await,
+    )
+}
+
 fn label_error(failure: LabelError) -> Response {
     match failure {
         LabelError::NotFound => error(StatusCode::NOT_FOUND, "not_found", "no such label or game"),
@@ -434,10 +501,9 @@ async fn change_labels<T: Send + 'static>(
     id: &str,
     change: impl FnOnce(&dyn GameLibrary, &library::Listing) -> Result<T, LabelError> + Send + 'static,
 ) -> Result<T, Response> {
-    if state.library_button(id).is_none() {
+    let Some((_, library)) = state.library_button(id) else {
         return Err(error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY));
-    }
-    let library = state.library.clone();
+    };
     let changed = tokio::task::spawn_blocking(move || {
         let listing = library.listing();
         change(library.as_ref(), &listing)
@@ -554,10 +620,9 @@ async fn start_item(
     State(state): State<AppState>,
     Path((id, item)): Path<(String, String)>,
 ) -> Response {
-    if state.library_button(&id).is_none() {
+    let Some((_, library)) = state.library_button(&id) else {
         return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
-    }
-    let library = state.library.clone();
+    };
     let launcher = state.launcher.clone();
     let started = tokio::task::spawn_blocking(move || {
         library::start(library.as_ref(), launcher.as_ref(), &item)
@@ -579,27 +644,48 @@ async fn item_picture(
     State(state): State<AppState>,
     Path((id, item)): Path<(String, String)>,
 ) -> Response {
-    if state.library_button(&id).is_none() {
+    let Some((_, library)) = state.library_button(&id) else {
         return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
-    }
-    let library = state.library.clone();
-    let read = tokio::task::spawn_blocking(move || match library.picture(&item) {
-        Some(Picture::File(path)) => std::fs::read(&path)
-            .map(Ok)
-            .map_err(|err| format!("cannot read {}: {err}", path.display())),
-        Some(Picture::Url(url)) => Ok(Err(url)),
-        None => Err("the library has no such game".to_owned()),
-    })
-    .await;
+    };
+    let key = format!("{id}/{item}");
+    let cached = state
+        .pictures
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned();
+    let read = match cached {
+        Some(found) => Ok(Ok(Ok(found))),
+        None => {
+            tokio::task::spawn_blocking(move || match library.picture(&item) {
+                Some(Picture::File(path)) => std::fs::read(&path)
+                    .map(|bytes| Ok((Arc::new(bytes), "image/jpeg")))
+                    .map_err(|err| format!("cannot read {}: {err}", path.display())),
+                Some(Picture::Icon(program)) => {
+                    icons::icon_png(&program).map(|png| Ok((Arc::new(png), "image/png")))
+                }
+                Some(Picture::Url(url)) => Ok(Err(url)),
+                None => Err("the library has no such game".to_owned()),
+            })
+            .await
+        }
+    };
     match read {
-        Ok(Ok(Ok(bytes))) => (
-            [
-                (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                (axum::http::header::CACHE_CONTROL, "max-age=86400"),
-            ],
-            bytes,
-        )
-            .into_response(),
+        Ok(Ok(Ok((bytes, kind)))) => {
+            state
+                .pictures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, (Arc::clone(&bytes), kind));
+            (
+                [
+                    (axum::http::header::CONTENT_TYPE, kind),
+                    (axum::http::header::CACHE_CONTROL, "max-age=86400"),
+                ],
+                bytes.as_ref().clone(),
+            )
+                .into_response()
+        }
         Ok(Ok(Err(url))) => {
             (StatusCode::FOUND, [(axum::http::header::LOCATION, url)]).into_response()
         }
@@ -617,10 +703,9 @@ async fn pin_item(
     State(state): State<AppState>,
     Path((id, item)): Path<(String, String)>,
 ) -> Response {
-    if state.library_button(&id).is_none() {
+    let Some((_, library)) = state.library_button(&id) else {
         return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
-    }
-    let library = state.library.clone();
+    };
     let pins = state.pins.clone();
     let button = id.clone();
     let pinned = tokio::task::spawn_blocking(move || {
@@ -1000,7 +1085,7 @@ buttons:
             Arc::new(FakeAudio::new(Vec::new(), None)),
         )
         .with_launcher(launcher.clone())
-        .with_library(Arc::new(crate::library::fake::FakeLibrary::new()));
+        .with_library("games", Arc::new(crate::library::fake::FakeLibrary::new()));
         (state, launcher)
     }
 
@@ -1174,12 +1259,71 @@ buttons:
     }
 
     #[tokio::test]
+    async fn a_game_with_several_programs_asks_once_which_one() {
+        use serde_json::json;
+
+        let (state, _) = library_state();
+        let (status, body) = call(state.clone(), "POST", "/buttons/games/library/9/start").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "choose_program");
+        let (status, body) = call(state.clone(), "GET", "/buttons/games/library/9/programs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"candidates": ["a.exe", "b.exe"], "chosen": null})
+        );
+
+        let (status, _) = send(
+            state.clone(),
+            "PUT",
+            "/buttons/games/library/9/program",
+            json!({"program": "b.exe"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = call(state.clone(), "GET", "/buttons/games/library/9/programs").await;
+        assert_eq!(body["chosen"], "b.exe");
+        let (status, body) = send(
+            state.clone(),
+            "PUT",
+            "/buttons/games/library/9/program",
+            json!({"program": "c.exe"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_label");
+        let (status, _) = call(state, "GET", "/buttons/games/library/1/programs").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn each_library_button_has_its_own_library() {
+        let config = config::parse(
+            "buttons:\n  - id: steam\n    label: Steam\n    type: steam.library\n  - id: dlsite\n    label: DLsite\n    type: dlsite.library\n",
+        )
+        .unwrap();
+        let state = AppState::new(config, Arc::new(FakeAudio::new(Vec::new(), None)))
+            .with_library("dlsite", Arc::new(crate::library::fake::FakeLibrary::new()));
+        let (_, body) = call(state.clone(), "GET", "/buttons/dlsite/library").await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 2);
+        // A library button without a library says so instead of failing.
+        let (status, body) = call(state, "GET", "/buttons/steam/library").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["partial"]
+                .as_str()
+                .unwrap()
+                .contains("no game library")
+        );
+    }
+
+    #[tokio::test]
     async fn starting_a_library_game_opens_it() {
         let (state, launcher) = library_state();
         let (status, _) = call(state.clone(), "POST", "/buttons/games/library/1/start").await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(*launcher.opened.lock().unwrap(), ["game://run/1"]);
-        let (status, body) = call(state.clone(), "POST", "/buttons/games/library/9/start").await;
+        let (status, body) = call(state.clone(), "POST", "/buttons/games/library/7/start").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_found");
         let (status, body) = call(state, "POST", "/buttons/games/press").await;

@@ -4,6 +4,7 @@ pub mod config;
 pub mod cors;
 pub mod desktops;
 pub mod discord;
+pub mod dlsite;
 pub mod icons;
 pub mod launch;
 pub mod library;

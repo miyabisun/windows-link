@@ -9,6 +9,8 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::library::Pictures;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -83,6 +85,17 @@ pub enum ButtonSpec {
         #[serde(default)]
         hide: Vec<String>,
     },
+    /// Search the DLsite games in a folder on the panel, start them, and pin them to the
+    /// tab.
+    #[serde(rename = "dlsite.library")]
+    DlsiteLibrary {
+        /// `<maker>\<title>` folders; DLsiteNest's `D:\DLsiteNest\Game` by default.
+        #[serde(default)]
+        root: Option<PathBuf>,
+        /// Labels whose games are listed only while the label is selected.
+        #[serde(default)]
+        hide: Vec<String>,
+    },
     /// Start a Steam game, or close it while it runs.
     #[serde(rename = "steam.game")]
     SteamGame {
@@ -94,6 +107,15 @@ pub enum ButtonSpec {
 }
 
 impl ButtonSpec {
+    /// What a library button's pictures are: Steam's store art, or DLsite games' icons.
+    pub fn pictures(&self) -> Option<Pictures> {
+        match self {
+            Self::SteamLibrary { .. } => Some(Pictures::Cover),
+            Self::DlsiteLibrary { .. } => Some(Pictures::Icon),
+            _ => None,
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::OutputToggle { .. } => "audio.output_toggle",
@@ -102,6 +124,7 @@ impl ButtonSpec {
             Self::AppLaunch { .. } => "app.launch",
             Self::SteamGame { .. } => "steam.game",
             Self::SteamLibrary { .. } => "steam.library",
+            Self::DlsiteLibrary { .. } => "dlsite.library",
         }
     }
 }
@@ -257,7 +280,7 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                     )));
                 }
             }
-            ButtonSpec::SteamLibrary { .. } => {}
+            ButtonSpec::SteamLibrary { .. } | ButtonSpec::DlsiteLibrary { .. } => {}
             ButtonSpec::DiscordVoice { channel_id } => {
                 if !channel_id.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(ConfigError(format!(
@@ -449,6 +472,24 @@ buttons:
             ButtonSpec::SteamLibrary { hide } if hide.is_empty()
         ));
         assert_eq!(config.buttons[0].spec.type_name(), "steam.library");
+    }
+
+    #[test]
+    fn dlsite_library_buttons_take_an_optional_folder() {
+        let files = vec![(
+            "アダルト".to_owned(),
+            "buttons:\n  - id: dlsite\n    label: DLsite\n    type: dlsite.library\n    hide: [非表示]\n  - id: other\n    label: Other\n    type: dlsite.library\n    root: E:/Games\n".to_owned(),
+        )];
+        let config = super::parse_all("", &files).unwrap();
+        assert!(matches!(
+            &config.buttons[0].spec,
+            ButtonSpec::DlsiteLibrary { root: None, hide } if hide == &["非表示"]
+        ));
+        assert!(matches!(
+            &config.buttons[1].spec,
+            ButtonSpec::DlsiteLibrary { root: Some(root), .. } if root == std::path::Path::new("E:/Games")
+        ));
+        assert_eq!(config.buttons[0].spec.type_name(), "dlsite.library");
     }
 
     #[test]

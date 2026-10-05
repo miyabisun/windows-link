@@ -20,7 +20,8 @@ use windows_link::{
         service::DiscordVoice,
         token,
     },
-    library::{GameLibrary, NoLibrary, Pins},
+    dlsite::{self, DlsiteLibrary, DlsiteStore},
+    library::{GameLibrary, Pins},
     logging, port, secrets,
     server::{self, AppState},
     steam::{self, SteamLibrary},
@@ -133,13 +134,16 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let desktops: Arc<dyn VirtualDesktops> = Arc::new(WinvdDesktops);
     let defined = Arc::new(config.desktops.clone());
     let voice = discord_voice(&config, changes.clone());
-    let library = steam_library(&config);
-    let pins = Arc::new(Pins::open(&data_dir().join("windows-link.db"))?);
-    let state = AppState::new(config, audio)
+    let database = data_dir().join("windows-link.db");
+    let libraries = libraries(&config, &database)?;
+    let pins = Arc::new(Pins::open(&database)?);
+    let mut state = AppState::new(config, audio)
         .with_desktops(desktops.clone())
         .with_voice(voice)
-        .with_library(library)
         .with_pins(pins);
+    for (button, library) in libraries {
+        state = state.with_library(&button, library);
+    }
     tokio::spawn(state.clone().run_refresher(changes));
     let runtime = tokio::runtime::Handle::current();
     let publisher = state.clone();
@@ -216,15 +220,42 @@ fn discord_voice(config: &config::Config, changes: Arc<Notify>) -> Arc<dyn Voice
     }
 }
 
-/// Read the Steam library only when a button needs it.
-fn steam_library(config: &config::Config) -> Arc<dyn GameLibrary> {
-    let needed = config
-        .buttons
-        .iter()
-        .any(|b| matches!(b.spec, ButtonSpec::SteamLibrary { .. }));
-    if !needed {
-        return Arc::new(NoLibrary("no steam.library buttons are configured".into()));
+/// Library buttons by ID, with their libraries.
+type Libraries = Vec<(String, Arc<dyn GameLibrary>)>;
+
+/// The library behind each library button. The Steam library is read only when a
+/// button needs it, and shared by all such buttons.
+fn libraries(
+    config: &config::Config,
+    database: &std::path::Path,
+) -> Result<Libraries, Box<dyn std::error::Error>> {
+    let mut steam: Option<Arc<dyn GameLibrary>> = None;
+    let mut dlsite_store = None;
+    let mut out = Vec::new();
+    for button in &config.buttons {
+        let library: Arc<dyn GameLibrary> = match &button.spec {
+            ButtonSpec::SteamLibrary { .. } => steam.get_or_insert_with(steam_library).clone(),
+            ButtonSpec::DlsiteLibrary { root, .. } => {
+                let store = if let Some(store) = &dlsite_store {
+                    Arc::clone(store)
+                } else {
+                    let store = Arc::new(DlsiteStore::open(database)?);
+                    dlsite_store = Some(Arc::clone(&store));
+                    store
+                };
+                let root = root
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from(dlsite::DEFAULT_ROOT));
+                Arc::new(DlsiteLibrary::new(root, store))
+            }
+            _ => continue,
+        };
+        out.push((button.id.clone(), library));
     }
+    Ok(out)
+}
+
+fn steam_library() -> Arc<dyn GameLibrary> {
     let key = match secrets::load(&secrets::default_path()) {
         Ok(secrets) => secrets.steam,
         Err(reason) => {

@@ -9,7 +9,7 @@ use crate::{
     config::{ButtonConfig, ButtonSpec, Config},
     discord::{Voice, VoiceError, VoiceStatus},
     launch::{Launcher, Processes, Program, is_running},
-    library::{Pin, Pinned},
+    library::{Pictures, Pin, Pinned},
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -52,9 +52,11 @@ pub enum ButtonState {
         running: bool,
     },
     /// A game library the panel opens (`GET /buttons/{id}/library`) instead of
-    /// pressing; `pins` are the games pinned to the button's tab, in order.
+    /// pressing; `pins` are the games pinned to the button's tab, in order, and
+    /// `pictures` says whether the games' pictures are store art or program icons.
     Library {
         pins: Vec<Pin>,
+        pictures: Pictures,
     },
     Error {
         message: String,
@@ -239,9 +241,12 @@ fn state(
         ButtonSpec::SteamGame { process, .. } => ButtonState::Game {
             running: is_running(readings.processes, process),
         },
-        ButtonSpec::SteamLibrary { .. } => ButtonState::Library {
-            pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
-        },
+        ButtonSpec::SteamLibrary { .. } | ButtonSpec::DlsiteLibrary { .. } => {
+            ButtonState::Library {
+                pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
+                pictures: spec.pictures().unwrap_or_default(),
+            }
+        }
     }
 }
 
@@ -322,10 +327,12 @@ pub fn press(
                 .open(target, args.as_deref(), *admin)
                 .map_err(PressError::Launch)
         }
-        ButtonSpec::SteamLibrary { .. } => Err(PressError::Conflict {
-            code: "not_pressable",
-            message: "a library opens on the panel; use GET /buttons/{id}/library".into(),
-        }),
+        ButtonSpec::SteamLibrary { .. } | ButtonSpec::DlsiteLibrary { .. } => {
+            Err(PressError::Conflict {
+                code: "not_pressable",
+                message: "a library opens on the panel; use GET /buttons/{id}/library".into(),
+            })
+        }
         ButtonSpec::SteamGame { app_id, process } => {
             if is_running(&launcher.processes(), process) {
                 match launcher.close(process).map_err(PressError::Launch)? {
@@ -355,7 +362,7 @@ mod tests {
         config,
         discord::{Voice, VoiceStatus, fake::FakeVoice},
         launch::{Launcher, Processes, Program, fake::FakeLauncher},
-        library::{Pin, Pinned},
+        library::{Pictures, Pin, Pinned},
     };
 
     fn no_voice() -> VoiceStatus {
@@ -758,7 +765,7 @@ buttons:
     #[test]
     fn library_buttons_show_their_pins_and_open_on_the_panel_instead_of_pressing() {
         let config = config::parse(
-            "buttons:\n  - id: library\n    label: Library\n    type: steam.library\n  - id: other\n    label: Other\n    type: steam.library\n",
+            "buttons:\n  - id: library\n    label: Library\n    type: steam.library\n  - id: other\n    label: Other\n    type: dlsite.library\n",
         )
         .unwrap();
         let audio = FakeAudio::new(devices(), None);
@@ -777,11 +784,17 @@ buttons:
         };
         assert_eq!(
             view(&config, &config.buttons[0], &readings, &audio).state,
-            ButtonState::Library { pins: vec![pinned] }
+            ButtonState::Library {
+                pins: vec![pinned],
+                pictures: Pictures::Cover
+            }
         );
         assert_eq!(
             view(&config, &config.buttons[1], &readings, &audio).state,
-            ButtonState::Library { pins: vec![] }
+            ButtonState::Library {
+                pins: vec![],
+                pictures: Pictures::Icon
+            }
         );
         assert!(matches!(
             press(

@@ -15,8 +15,22 @@ use crate::{
 pub struct Item {
     pub id: String,
     pub name: String,
+    /// A second line, such as the maker; searched along with the name.
+    pub detail: Option<String>,
+    /// Whether the item has more than one program to start, of which the user picks one.
+    pub choosable: bool,
     pub installed: bool,
     pub labels: Vec<String>,
+}
+
+/// What the items' pictures are: wide store art to fill a tile, or program icons to
+/// show whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pictures {
+    #[default]
+    Cover,
+    Icon,
 }
 
 /// A group of items, such as a Steam collection. Items name their labels by `id`.
@@ -38,6 +52,24 @@ pub struct Listing {
     pub partial: Option<String>,
     /// Why labels cannot be changed right now, when they cannot.
     pub labels_locked: Option<String>,
+}
+
+/// Why an item cannot be started.
+#[derive(Debug, PartialEq)]
+pub enum StartError {
+    NotFound,
+    /// It has several programs and none is chosen yet (see `GameLibrary::programs`).
+    Choose,
+    /// It has no program to start.
+    NoProgram,
+}
+
+/// The programs an item can be started with (paths relative to its folder), and the
+/// one in use.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Programs {
+    pub candidates: Vec<String>,
+    pub chosen: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -80,17 +112,18 @@ pub struct Start {
     pub folder: Option<PathBuf>,
 }
 
-/// An item's picture: a file on this PC, or where to get it on the web.
+/// An item's picture: a file on this PC, where to get it on the web, or a program whose
+/// Windows icon it is.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Picture {
     File(PathBuf),
     Url(String),
+    Icon(PathBuf),
 }
 
 pub trait GameLibrary: Send + Sync + 'static {
     fn listing(&self) -> Listing;
-    /// `None` for an item the library does not have.
-    fn start(&self, id: &str) -> Option<Start>;
+    fn start(&self, id: &str) -> Result<Start, StartError>;
     fn picture(&self, id: &str) -> Option<Picture>;
     /// The folder an installed item lives in, to show in Explorer.
     fn folder(&self, id: &str) -> Option<PathBuf>;
@@ -99,6 +132,14 @@ pub trait GameLibrary: Send + Sync + 'static {
     fn delete_label(&self, label: &str) -> Result<(), LabelError>;
     /// Put an item in a label, or take it out.
     fn set_label(&self, label: &str, item: &str, on: bool) -> Result<(), LabelError>;
+    /// `None` when the item has no choice of programs.
+    fn programs(&self, _id: &str) -> Option<Programs> {
+        None
+    }
+    /// Remember which program starts the item.
+    fn choose_program(&self, _id: &str, _program: &str) -> Result<(), LabelError> {
+        Err(LabelError::NotFound)
+    }
 }
 
 /// The library before one is set up: empty, saying why.
@@ -112,8 +153,8 @@ impl GameLibrary for NoLibrary {
         }
     }
 
-    fn start(&self, _id: &str) -> Option<Start> {
-        None
+    fn start(&self, _id: &str) -> Result<Start, StartError> {
+        Err(StartError::NotFound)
     }
 
     fn picture(&self, _id: &str) -> Option<Picture> {
@@ -148,7 +189,17 @@ pub fn start(
     launcher: &dyn Launcher,
     id: &str,
 ) -> Result<(), PressError> {
-    let start = library.start(id).ok_or(PressError::NotFound)?;
+    let start = library.start(id).map_err(|err| match err {
+        StartError::NotFound => PressError::NotFound,
+        StartError::Choose => PressError::Conflict {
+            code: "choose_program",
+            message: "choose which program starts it".into(),
+        },
+        StartError::NoProgram => PressError::Conflict {
+            code: "no_program",
+            message: "it has no program to start".into(),
+        },
+    })?;
     let program = start.folder.map(Program::Folder);
     if let Some(program) = &program
         && launcher.focus(program).map_err(PressError::Launch)?
@@ -258,13 +309,17 @@ impl Pins {
 pub mod fake {
     use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
 
-    use super::{GameLibrary, Item, Label, LabelError, Listing, Picture, Start};
+    use super::{
+        GameLibrary, Item, Label, LabelError, Listing, Picture, Programs, Start, StartError,
+    };
 
     /// Items `"1"` (installed in `C:\Games\One`, a picture on the web) and `"2"` (not
     /// installed, a picture file); labels `hidden` (fixed, named 非表示, holding "2") and
     /// `uc-1` (outdate, empty), kept in memory.
     pub struct FakeLibrary {
         labels: Mutex<Vec<(Label, BTreeSet<String>)>>,
+        /// The program chosen for item "9", which has `a.exe` and `b.exe`.
+        chosen: Mutex<Option<String>>,
     }
 
     impl Default for FakeLibrary {
@@ -285,6 +340,7 @@ pub mod fake {
                     (label("hidden", "非表示", false), ["2".to_owned()].into()),
                     (label("uc-1", "outdate", true), BTreeSet::new()),
                 ]),
+                chosen: Mutex::new(None),
             }
         }
     }
@@ -295,6 +351,8 @@ pub mod fake {
             let item = |id: &str, name: &str, installed| Item {
                 id: id.into(),
                 name: name.into(),
+                detail: None,
+                choosable: false,
                 installed,
                 labels: labels
                     .iter()
@@ -359,18 +417,39 @@ pub mod fake {
             Ok(())
         }
 
-        fn start(&self, id: &str) -> Option<Start> {
+        /// Also `"9"`, whose program must be chosen, and `"8"`, which has none.
+        fn start(&self, id: &str) -> Result<Start, StartError> {
             match id {
-                "1" => Some(Start {
+                "1" => Ok(Start {
                     open: "game://run/1".into(),
                     folder: Some(PathBuf::from(r"C:\Games\One")),
                 }),
-                "2" => Some(Start {
+                "2" => Ok(Start {
                     open: "game://install/2".into(),
                     folder: None,
                 }),
-                _ => None,
+                "9" => Err(StartError::Choose),
+                "8" => Err(StartError::NoProgram),
+                _ => Err(StartError::NotFound),
             }
+        }
+
+        fn programs(&self, id: &str) -> Option<Programs> {
+            (id == "9").then(|| Programs {
+                candidates: vec!["a.exe".into(), "b.exe".into()],
+                chosen: self.chosen.lock().unwrap().clone(),
+            })
+        }
+
+        fn choose_program(&self, id: &str, program: &str) -> Result<(), LabelError> {
+            if id != "9" {
+                return Err(LabelError::NotFound);
+            }
+            if !["a.exe", "b.exe"].contains(&program) {
+                return Err(LabelError::Invalid("not a program of the game".into()));
+            }
+            *self.chosen.lock().unwrap() = Some(program.to_owned());
+            Ok(())
         }
 
         fn picture(&self, id: &str) -> Option<Picture> {
@@ -483,6 +562,26 @@ mod tests {
             *launcher.focused.lock().unwrap(),
             [Program::Folder(PathBuf::from(r"C:\Games\One"))]
         );
+    }
+
+    #[test]
+    fn a_game_with_several_programs_asks_which_and_one_without_any_says_so() {
+        let launcher = FakeLauncher::default();
+        assert!(matches!(
+            start(&FakeLibrary::new(), &launcher, "9"),
+            Err(PressError::Conflict {
+                code: "choose_program",
+                ..
+            })
+        ));
+        assert!(matches!(
+            start(&FakeLibrary::new(), &launcher, "8"),
+            Err(PressError::Conflict {
+                code: "no_program",
+                ..
+            })
+        ));
+        assert!(launcher.opened.lock().unwrap().is_empty());
     }
 
     #[test]
