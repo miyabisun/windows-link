@@ -100,7 +100,10 @@ fn run_server(console: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(serve()) {
+    let served = runtime.block_on(serve());
+    // Blocking work still running (refreshes, update checks) must not keep the process alive.
+    runtime.shutdown_background();
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             error!(%err, "server stopped with an error");
@@ -113,6 +116,11 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::default_path();
     let config = config::load(&config_path)?;
     info!(path = %config_path.display(), buttons = config.buttons.len(), "config loaded");
+
+    // Bind first: an instance that cannot get the port exits before starting anything.
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], port::from_env()?));
+    let listener = bind_with_retry(bind_addr).await?;
+    info!(%bind_addr, version = env!("CARGO_PKG_VERSION"), "server listening");
 
     let changes = Arc::new(Notify::new());
     let audio: Arc<dyn Audio> = match WindowsAudio::start(Some(changes.clone())) {
@@ -147,9 +155,6 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     }
     let touch = TouchState::new(Arc::new(WindowsDisplays), store, keep);
 
-    let bind_addr = SocketAddr::from(([0, 0, 0, 0], port::from_env()?));
-    let listener = bind_with_retry(bind_addr).await?;
-    info!(%bind_addr, version = env!("CARGO_PKG_VERSION"), "server listening");
     let updater = Arc::new(Updater::from_env());
     if let Some(exe) = updater.installed_exe() {
         swap::remove_old_later(exe);
