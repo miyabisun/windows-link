@@ -300,7 +300,8 @@ up; the panel's list and the log show how it goes.
   after the work; that folder is left out. The download waits in `<root>\.windows-link\<ID>`
   (not listed) until it is unpacked and in place, so a stopped download goes on next time.
   ZIPs are unpacked with Windows' own `tar.exe` (names without the UTF-8 mark read as
-  CP932); RARs, which DLsite uses for works split into parts, with UnRAR.
+  UTF-8, as DLsite writes them, else as CP932); RARs, which DLsite uses for works split
+  into parts, with UnRAR.
 - **Updates**: a game's version is DLsite's `upgrade_date` (else its release date), kept in
   `dlsite_games.version`. A folder windows-link filled is updated when DLsite has a newer
   version; a folder DLsiteNest filled is taken as current when it changed after the latest

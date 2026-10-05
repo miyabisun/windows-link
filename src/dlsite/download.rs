@@ -172,9 +172,9 @@ fn merge(from: &Path, to: &Path, at: &Path) -> std::io::Result<()> {
 /// Unpack the archive whose first file is `first` into `out`. A RAR (DLsite splits big
 /// works into `.part1.exe`, a self-extracting first part, and `.part<N>.rar`) goes
 /// through `UnRAR`. Anything else goes through Windows' own `tar.exe` (libarchive),
-/// without a console window; names in a ZIP without the UTF-8 mark are read as CP932, as
-/// Japanese archives are. (`tar.exe` reads only the first part of a split RAR and says
-/// nothing.)
+/// without a console window. Names in a ZIP without the UTF-8 mark are read as UTF-8
+/// (DLsite's own archives write them so), else as CP932 (older Japanese archives).
+/// (`tar.exe` reads only the first part of a split RAR and says nothing.)
 pub fn unpack(first: &Path, out: &Path) -> Result<(), String> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::fs::create_dir_all(out).map_err(|err| format!("{}: {err}", out.display()))?;
@@ -186,25 +186,29 @@ pub fn unpack(first: &Path, out: &Path) -> Result<(), String> {
     }
     let windows =
         std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    let output = Command::new(windows.join(r"System32\tar.exe"))
-        .args(["--options", "hdrcharset=CP932", "-xf"])
-        .arg(first)
-        .arg("-C")
-        .arg(out)
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|err| format!("tar: {err}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let said = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "cannot unpack {}: {}",
-            first.display(),
-            said.trim()
-        ))
+    let mut said = String::new();
+    for charset in ["UTF-8", "CP932"] {
+        // Start over in an empty folder: a failed try skips the names it cannot read.
+        let _ = std::fs::remove_dir_all(out);
+        std::fs::create_dir_all(out).map_err(|err| format!("{}: {err}", out.display()))?;
+        let output = Command::new(windows.join(r"System32\tar.exe"))
+            .args(["--options", &format!("hdrcharset={charset}"), "-xf"])
+            .arg(first)
+            .arg("-C")
+            .arg(out)
+            .stdin(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|err| format!("tar: {err}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if !said.contains("cannot be converted") {
+            break;
+        }
     }
+    Err(format!("cannot unpack {}: {said}", first.display()))
 }
 
 /// Unpack a RAR, going through all its parts. `UnRAR` finds the next parts from the
