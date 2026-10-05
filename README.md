@@ -192,6 +192,12 @@ reached, the library lists the installed games and says why in `partial`. Instal
 is read from the Steam folder (found through the registry) on every listing, so it is
 always current.
 
+Games are named as the Steam client shows them, in the language Steam is set to (for
+example `45番電車` rather than `Train45`), asked of Steam on every listing while it runs and
+kept from the last answer while it does not. When that name differs from the one in the
+game's files by more than marks such as ™, the latter is the game's `detail`, so either
+name finds it.
+
 Starting a game opens `steam://rungameid/<app ID>` and brings the game's window to the front
 once a program from its install folder shows one; while such a window exists, starting
 brings it to the front instead. A game that is not installed opens Steam's install dialog

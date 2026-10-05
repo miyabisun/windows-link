@@ -83,6 +83,17 @@ pub mod scripts {
         )
     }
 
+    /// The name Steam shows for each app (in the language Steam is set to), by app ID.
+    pub fn names(apps: &[u32]) -> String {
+        format!(
+            "(() => {{ const s = globalThis.appStore; \
+             if (!s) throw new Error(\"STORE_NOT_READY\"); \
+             return Object.fromEntries({}.map((id) => [id, s.GetAppOverviewByAppID(id)?.display_name]) \
+               .filter(([, name]) => name)); }})()",
+            json!(apps)
+        )
+    }
+
     pub fn create(name: &str) -> String {
         format!(
             "(async () => {{ {STORE} \
@@ -149,6 +160,20 @@ pub fn parse_collections(value: &Value) -> Result<Vec<Collection>, String> {
             id: c.id,
             name: c.name,
             apps: c.apps.into_iter().collect::<HashSet<u32>>(),
+        })
+        .collect())
+}
+
+/// The names a `scripts::names` run returned, by app ID.
+pub fn parse_names(value: &Value) -> Result<std::collections::HashMap<u32, String>, String> {
+    let names = value
+        .as_object()
+        .ok_or_else(|| format!("unexpected names from Steam: {value}"))?;
+    Ok(names
+        .iter()
+        .filter_map(|(id, name)| {
+            let name = name.as_str().filter(|name| !name.is_empty())?;
+            Some((id.parse().ok()?, name.to_owned()))
         })
         .collect())
 }
@@ -261,7 +286,7 @@ pub mod fake {
 mod tests {
     use serde_json::json;
 
-    use super::{evaluation, parse_collections, scripts, shared_context};
+    use super::{evaluation, parse_collections, parse_names, scripts, shared_context};
 
     #[test]
     fn finds_the_library_page_among_steam_pages() {
@@ -309,6 +334,24 @@ mod tests {
             scripts::set("hidden", 105_600, true)
                 .contains("AddOrRemoveApp([105600], true, \"hidden\")")
         );
+    }
+
+    #[test]
+    fn reads_the_names_steam_shows() {
+        let names = parse_names(
+            &json!({"1869270": "多砲塔神教", "105600": "Terraria", "x": "bad", "7": ""}),
+        )
+        .unwrap();
+        assert_eq!(
+            names,
+            [
+                (1_869_270, "多砲塔神教".to_owned()),
+                (105_600, "Terraria".to_owned())
+            ]
+            .into()
+        );
+        assert!(parse_names(&json!([1, 2])).is_err());
+        assert!(scripts::names(&[1_869_270, 105_600]).contains("[1869270,105600]"));
     }
 
     #[test]

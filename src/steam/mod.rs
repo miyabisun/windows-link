@@ -19,6 +19,28 @@ use crate::{
     secrets::SteamKey,
 };
 
+/// Show each game by the name Steam shows (`names`, in the language Steam is set to),
+/// keeping the name in its manifest as `detail` when it differs by more than marks such
+/// as ™, so either can be searched.
+#[allow(clippy::implicit_hasher, reason = "built from Steam's answer")]
+pub fn localize(items: &mut [Item], names: &std::collections::HashMap<u32, String>) {
+    let letters = |name: &str| -> String {
+        name.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    for item in items {
+        let Some(name) = item.id.parse().ok().and_then(|id: u32| names.get(&id)) else {
+            continue;
+        };
+        let own = std::mem::replace(&mut item.name, name.clone());
+        if letters(&own) != letters(name) {
+            item.detail = Some(own);
+        }
+    }
+}
+
 /// `SteamID64` of account ID 0; userdata folders are named by account ID.
 const STEAM_ID64_BASE: u64 = 76_561_197_960_265_728;
 /// How often the owned games are fetched again (purchases show up after this).
@@ -63,6 +85,8 @@ pub struct SteamLibrary {
     client: Arc<dyn client::Client>,
     /// The last fetched owned games, or why there are none.
     owned: Mutex<Result<Vec<Owned>, String>>,
+    /// The names Steam last showed, by app ID, kept for while Steam does not answer.
+    names: Mutex<std::collections::HashMap<u32, String>>,
 }
 
 impl SteamLibrary {
@@ -77,6 +101,7 @@ impl SteamLibrary {
             key: key.map(|k| k.api_key),
             client: Arc::new(client::CefClient::new()),
             owned: Mutex::new(Err(reason.to_owned())),
+            names: Mutex::default(),
         }
     }
 
@@ -207,14 +232,34 @@ impl GameLibrary for SteamLibrary {
         let installed = self.installed();
         let (collections, locked) = self.live_collections();
         let owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
-        Listing {
+        let mut listing = Listing {
             labels_locked: locked,
             ..listing(
                 owned.as_deref().map_err(String::as_str),
                 &installed,
                 &collections,
             )
+        };
+        drop(owned);
+        let mut names = self.names.lock().unwrap_or_else(PoisonError::into_inner);
+        // Only ask while Steam answers; otherwise keep what it said last.
+        if listing.labels_locked.is_none() {
+            let apps: Vec<u32> = listing
+                .items
+                .iter()
+                .filter_map(|i| i.id.parse().ok())
+                .collect();
+            let read = self
+                .client
+                .evaluate(&client::scripts::names(&apps))
+                .ok()
+                .and_then(|value| client::parse_names(&value).ok());
+            if let Some(read) = read {
+                names.extend(read);
+            }
         }
+        localize(&mut listing.items, &names);
+        listing
     }
 
     /// An installed game runs through Steam; an owned one opens Steam's install dialog.
@@ -589,9 +634,42 @@ mod tests {
 
     use super::{
         Collection, Installed, Owned, collections, installed_app, library_folders, listing,
-        owned_games, picture, signed_in_account,
+        localize, owned_games, picture, signed_in_account,
     };
     use crate::library::{Label, Picture};
+
+    #[test]
+    fn games_go_by_the_names_steam_shows_and_keep_their_own() {
+        let local = [
+            installed(1_869_270, "Multi Turret Academy", 3),
+            installed(105_600, "Terraria", 2),
+            installed(1_364_780, "Street Fighter™ 6", 2),
+            installed(9, "Unknown", 1),
+        ];
+        let mut listing = listing(Err("no API key"), &local, &[]);
+        let names = [
+            (1_869_270, "多砲塔神教".to_owned()),
+            (105_600, "Terraria".to_owned()),
+            (1_364_780, "Street Fighter 6".to_owned()),
+        ]
+        .into();
+        localize(&mut listing.items, &names);
+        let rows: Vec<_> = listing
+            .items
+            .iter()
+            .map(|i| (i.name.as_str(), i.detail.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("多砲塔神教", Some("Multi Turret Academy")),
+                // Only a mark differs: no second line.
+                ("Street Fighter 6", None),
+                ("Terraria", None),
+                ("Unknown", None),
+            ]
+        );
+    }
 
     #[test]
     fn the_signed_in_account_is_the_most_recent_or_the_newest() {
@@ -892,6 +970,7 @@ mod tests {
         let client = std::sync::Arc::new(FakeClient::default());
         *client.answers.lock().unwrap() = vec![
             Ok(serde_json::json!([{"id": "hidden", "name": "非表示", "apps": [105_600]}])),
+            Ok(serde_json::json!({"105600": "テラリア"})),
             Err(ClientError::Unavailable(NOT_RUNNING.into())),
             Ok(serde_json::json!({"id": "uc-7", "name": "RPG"})),
             Err(ClientError::Script("Error: NOT_FOUND".into())),
@@ -903,11 +982,16 @@ mod tests {
         assert_eq!(live.items[0].labels, ["hidden"]);
         assert!(!live.labels[0].editable);
         assert_eq!(live.labels_locked, None);
+        // Named as Steam shows it, in Japanese here.
+        assert_eq!(live.items[0].name, "テラリア");
+        assert_eq!(live.items[0].detail.as_deref(), Some("Terraria"));
 
-        // Without Steam the labels are read from its file (none here) and locked.
+        // Without Steam the labels are read from its file (none here) and locked; the
+        // names Steam gave last stay.
         let offline = library.listing();
         assert!(offline.labels.is_empty());
         assert_eq!(offline.labels_locked.as_deref(), Some(NOT_RUNNING));
+        assert_eq!(offline.items[0].name, "テラリア");
 
         let made = library.create_label("RPG").unwrap();
         assert_eq!((made.id.as_str(), made.editable), ("uc-7", true));
@@ -928,8 +1012,9 @@ mod tests {
             Err(LabelError::NotFound)
         );
         let scripts = client.scripts.lock().unwrap();
-        assert!(scripts[2].contains("NewUnsavedCollection(\"RPG\""));
-        assert!(scripts[3].contains("AddOrRemoveApp([105600], true, \"uc-7\")"));
+        assert!(scripts[1].contains("GetAppOverviewByAppID"));
+        assert!(scripts[3].contains("NewUnsavedCollection(\"RPG\""));
+        assert!(scripts[4].contains("AddOrRemoveApp([105600], true, \"uc-7\")"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
