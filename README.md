@@ -224,7 +224,8 @@ collection file and `labels_locked` says why they cannot be changed. Names must 
 ## DLsite library
 
 A `dlsite.library` button gives a panel the DLsite games in the folders DLsiteNest makes,
-`<maker>\<title>` under `D:\DLsiteNest\Game`; DLsiteNest itself is not needed. For
+`<maker>\<title>` under `D:\DLsiteNest\Game`, leaving out the `<title>.bak` copies
+DLsiteNest keeps of updated games; DLsiteNest itself is not needed. For
 example in `desktops/アダルト.yaml`:
 
 ```yaml
@@ -250,14 +251,19 @@ state says `"pictures": "whole"`, as both are shown whole.
   answers `409 no_program`. Its window is brought to the front like a Steam game's.
 - **Labels**: お気に入り and 非表示 always exist and cannot be renamed or deleted; more can be
   made, renamed and deleted like Steam's. They, the chosen programs and the start times are
-  kept in `windows-link.db`, by an ID made from the game's maker and title folders, so
-  renaming a game's folder loses them.
+  kept in `windows-link.db` by the game's ID: its DLsite work ID once known, so they stay
+  when its folder is renamed, or else an ID made from its maker and title folders.
 - **Which work a game is**: at start and every 6 hours windows-link works out each game's
-  DLsite work (such as `RJ01464588`) and keeps it in `windows-link.db`, so it stays after
-  DLsiteNest is uninstalled:
-  1. DLsiteNest's own records (`%APPDATA%\DLsiteNest`), which name each work's folder;
-  2. otherwise the account's purchases with the same maker and title (or the only one
-     with that title), when `secrets.yaml` has a DLsite account.
+  DLsite work (such as `RJ01464588`) and keeps it with the game's folder in the
+  `dlsite_games` table of `windows-link.db` (`work_id`, `path` in lower case, `image`),
+  one row per work, so it stays after DLsiteNest is uninstalled. Each work goes to one
+  folder, found in this order:
+  1. the folder's row in `dlsite_games` (a row added by hand names a work it cannot find);
+  2. DLsiteNest's own records (`%APPDATA%\DLsiteNest`), which name each work's folder;
+  3. when `secrets.yaml` has a DLsite account, the purchase with the same title (the only
+     one, or the one by the same maker), first as written and then without sale text such
+     as `【30%OFF!!】` or `✅…特典✅`;
+  4. the maker's only purchase left, when the game is the maker's only one left.
 
   Pictures come from the purchases, or from DLsite's public product information for works
   known only through DLsiteNest. The account is also what downloading and updating games
@@ -270,8 +276,8 @@ state says `"pictures": "whole"`, as both are shown whole.
     password: your-password
   ```
 
-  The log says how many purchases were read and games identified, or why signing in
-  failed (such as DLsite asking for a CAPTCHA, which windows-link does not answer).
+  The log says how many purchases were read and games identified, which are not, or why
+  signing in failed (such as DLsite asking for a CAPTCHA, which windows-link does not answer).
 
 ## Discord
 

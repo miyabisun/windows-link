@@ -1,6 +1,7 @@
 //! A DLsite game library read from the folders DLsiteNest makes, `<root>\<maker>\<title>`,
-//! so it keeps working without DLsiteNest. Labels, the chosen programs and when each
-//! game was last started are kept in windows-link's database.
+//! so it keeps working without DLsiteNest. Which DLsite work each folder is, labels, the
+//! chosen programs and when each game was last started are kept in windows-link's
+//! database. A game goes by its work ID once known, else by an ID from its folder.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -34,6 +35,11 @@ pub struct Title {
     pub name: String,
     pub folder: PathBuf,
     pub modified: SystemTime,
+}
+
+/// How a folder is recorded: its path in lower case, as DLsiteNest records it too.
+fn folder_key(folder: &Path) -> String {
+    folder.to_string_lossy().to_lowercase()
 }
 
 /// A stable ID for a game from where it lives, safe in a URL.
@@ -127,7 +133,8 @@ pub fn default_program(candidates: &[String]) -> Option<&String> {
     }
 }
 
-/// Labels, chosen programs and start times, in windows-link's database.
+/// Which work each folder is, labels, chosen programs and start times, in windows-link's
+/// database. Labels, programs and start times are kept by the game's ID.
 pub struct DlsiteStore {
     conn: Mutex<Connection>,
 }
@@ -164,9 +171,9 @@ impl DlsiteStore {
                  item_id TEXT PRIMARY KEY,
                  at      INTEGER NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS dlsite_works (
-                 item_id TEXT PRIMARY KEY,
-                 work_id TEXT NOT NULL,
+             CREATE TABLE IF NOT EXISTS dlsite_games (
+                 work_id TEXT PRIMARY KEY,
+                 path    TEXT NOT NULL UNIQUE,
                  image   TEXT
              );",
         )?;
@@ -290,10 +297,11 @@ impl DlsiteStore {
         rows.collect()
     }
 
-    /// Which DLsite work each game is, by game ID.
-    pub fn works(&self) -> rusqlite::Result<HashMap<String, Known>> {
+    /// Which DLsite work each folder is, by `folder_key`. Works whose folder is gone
+    /// stay, so a game downloaded again gets its labels back.
+    pub fn games(&self) -> rusqlite::Result<HashMap<String, Known>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT item_id, work_id, image FROM dlsite_works")?;
+        let mut stmt = conn.prepare("SELECT path, work_id, image FROM dlsite_games")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -306,19 +314,57 @@ impl DlsiteStore {
         rows.collect()
     }
 
-    /// Add or update what is known; games not in `known` keep what was known before.
+    /// Record the work of each title in `known` (by title ID) with its folder, the first
+    /// of `titles` when several share a work, keeping the picture known before when there
+    /// is no new one, and move what was kept under the folder's ID (labels, program,
+    /// start time, pins) to the work's.
     #[allow(clippy::implicit_hasher, reason = "built by identify")]
-    pub fn save_works(&self, known: &HashMap<String, Known>) -> rusqlite::Result<()> {
+    pub fn remember(
+        &self,
+        titles: &[Title],
+        known: &HashMap<String, Known>,
+    ) -> rusqlite::Result<()> {
         let mut conn = self.conn();
         let saving = conn.transaction()?;
-        for (item, work) in known {
+        let pins: bool = saving.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'library_pins')",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut seen = HashSet::new();
+        for title in titles {
+            let Some(game) = known.get(&title.id) else {
+                continue;
+            };
+            if !seen.insert(game.work.as_str()) {
+                continue;
+            }
+            let path = folder_key(&title.folder);
             saving.execute(
-                "INSERT INTO dlsite_works (item_id, work_id, image) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (item_id) DO UPDATE SET
-                     work_id = excluded.work_id,
-                     image = COALESCE(excluded.image, dlsite_works.image)",
-                params![item, work.work, work.image],
+                "DELETE FROM dlsite_games WHERE path = ?1 AND work_id <> ?2",
+                params![path, game.work],
             )?;
+            saving.execute(
+                "INSERT INTO dlsite_games (work_id, path, image) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (work_id) DO UPDATE SET
+                     path = excluded.path,
+                     image = COALESCE(excluded.image, dlsite_games.image)",
+                params![game.work, path, game.image],
+            )?;
+            let mut tables = vec!["dlsite_label_items", "dlsite_programs", "dlsite_started"];
+            if pins {
+                tables.push("library_pins");
+            }
+            for table in tables {
+                saving.execute(
+                    &format!("UPDATE OR IGNORE {table} SET item_id = ?2 WHERE item_id = ?1"),
+                    params![title.id, game.work],
+                )?;
+                saving.execute(
+                    &format!("DELETE FROM {table} WHERE item_id = ?1"),
+                    params![title.id],
+                )?;
+            }
         }
         saving.commit()
     }
@@ -361,6 +407,10 @@ pub fn scan(root: &Path) -> Result<Vec<(Title, Vec<String>)>, String> {
     for maker in makers {
         let (_, names) = file_names(&root.join(&maker));
         for name in names {
+            // DLsiteNest keeps the previous copy of an updated game as `<title>.bak`.
+            if name.to_lowercase().ends_with(".bak") {
+                continue;
+            }
             let folder = root.join(&maker).join(&name);
             let (top, below) = file_names(&folder);
             let below: Vec<(String, Vec<String>)> =
@@ -412,11 +462,54 @@ impl DlsiteLibrary {
         Self { root, store }
     }
 
-    /// Find out again which DLsite work each game is: from DLsiteNest's records, and
-    /// from the account's purchases when `secrets.yaml` has one. Pictures of works known
-    /// only through DLsiteNest come from DLsite's public information. Failures are
-    /// logged and leave what was known.
+    /// Move what the previous version knew (`dlsite_works`, by folder ID) into
+    /// `dlsite_games`, then drop it. Kept while the games folder cannot be read.
+    pub fn adopt_legacy_works(&self) {
+        let legacy = || -> rusqlite::Result<HashMap<String, Known>> {
+            let conn = self.store.conn();
+            let Ok(mut stmt) = conn.prepare("SELECT item_id, work_id, image FROM dlsite_works")
+            else {
+                return Ok(HashMap::new());
+            };
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    Known {
+                        work: row.get(1)?,
+                        image: row.get(2)?,
+                    },
+                ))
+            })?;
+            rows.collect()
+        };
+        let adopt = || -> rusqlite::Result<()> {
+            let known = legacy()?;
+            if known.is_empty() {
+                return self
+                    .store
+                    .conn()
+                    .execute_batch("DROP TABLE IF EXISTS dlsite_works");
+            }
+            let Ok(games) = scan(&self.root) else {
+                return Ok(());
+            };
+            let titles: Vec<Title> = games.into_iter().map(|(title, _)| title).collect();
+            self.store.remember(&titles, &known)?;
+            self.store
+                .conn()
+                .execute_batch("DROP TABLE IF EXISTS dlsite_works")
+        };
+        if let Err(err) = adopt() {
+            tracing::warn!(%err, "cannot move the DLsite works the previous version knew");
+        }
+    }
+
+    /// Find out again which DLsite work each game is: from what was recorded, from
+    /// DLsiteNest's records, and from the account's purchases when `secrets.yaml` has
+    /// one. Pictures of works known only through DLsiteNest come from DLsite's public
+    /// information. Failures are logged and leave what was known.
     pub fn refresh(&self, account: Option<&crate::secrets::DlsiteAccount>) {
+        self.adopt_legacy_works();
         let Ok(games) = scan(&self.root) else {
             return;
         };
@@ -449,19 +542,38 @@ impl DlsiteLibrary {
             tracing::warn!(%reason, "cannot read DLsite's public product information");
             HashMap::new()
         });
-        let known = identify(&titles, &nest, &purchases, &images);
+        let remembered = self.store.games().unwrap_or_default();
+        let known = identify(&titles, &remembered, &nest, &purchases, &images);
+        let unknown: Vec<&str> = titles
+            .iter()
+            .filter(|t| !known.contains_key(&t.id))
+            .map(|t| t.name.as_str())
+            .collect();
         tracing::info!(
             games = titles.len(),
             identified = known.len(),
+            ?unknown,
             "DLsite games identified"
         );
-        if let Err(err) = self.store.save_works(&known) {
+        if let Err(err) = self.store.remember(&titles, &known) {
             tracing::warn!(%err, "cannot keep which DLsite work each game is");
         }
     }
 
+    /// The games, each by its work ID when known.
+    fn games(&self) -> Result<Vec<(Title, Vec<String>)>, String> {
+        let mut games = scan(&self.root)?;
+        let records = self.store.games().unwrap_or_default();
+        for (title, _) in &mut games {
+            if let Some(known) = records.get(&folder_key(&title.folder)) {
+                title.id.clone_from(&known.work);
+            }
+        }
+        Ok(games)
+    }
+
     fn find(&self, id: &str) -> Option<(Title, Vec<String>)> {
-        scan(&self.root).ok()?.into_iter().find(|(t, _)| t.id == id)
+        self.games().ok()?.into_iter().find(|(t, _)| t.id == id)
     }
 
     /// The program in use: the user's choice while it is still there, or the default.
@@ -483,7 +595,7 @@ fn stored<T>(result: rusqlite::Result<T>) -> Result<T, LabelError> {
 
 impl GameLibrary for DlsiteLibrary {
     fn listing(&self) -> Listing {
-        let games = match scan(&self.root) {
+        let games = match self.games() {
             Ok(games) => games,
             Err(reason) => {
                 return Listing {
@@ -501,8 +613,14 @@ impl GameLibrary for DlsiteLibrary {
         };
         let labels = self.store.labels().unwrap_or_default();
         let started = self.store.started().unwrap_or_default();
-        let known = self.store.works().unwrap_or_default();
-        let mut listing = listing(&games, &labels, &started, &known);
+        let images: HashMap<String, String> = self
+            .store
+            .games()
+            .unwrap_or_default()
+            .into_values()
+            .filter_map(|k| Some((k.work, k.image?)))
+            .collect();
+        let mut listing = listing(&games, &labels, &started, &images);
         if games.is_empty() {
             listing.partial = Some(format!("there are no games in {}", self.root.display()));
         }
@@ -525,8 +643,12 @@ impl GameLibrary for DlsiteLibrary {
     }
 
     fn picture(&self, id: &str) -> Option<Picture> {
-        let known = self.store.works().ok().and_then(|mut all| all.remove(id));
-        if let Some(image) = known.and_then(|k| k.image) {
+        let known = self.store.games().ok().and_then(|all| {
+            all.into_values()
+                .find(|k| k.work == id)
+                .and_then(|k| k.image)
+        });
+        if let Some(image) = known {
             return Some(Picture::Url(image));
         }
         let (title, candidates) = self.find(id)?;
@@ -598,68 +720,142 @@ pub struct Known {
     pub image: Option<String>,
 }
 
-/// Which work each game is: DLsiteNest's record of its folder, or else the purchase with
-/// the same maker and title, or else the only purchase with that title. Names are
-/// compared by their letters and digits only (folder names lose characters Windows does
-/// not allow), ignoring case and full-width letters. Pictures come from the purchases,
-/// else from `images` (DLsite's public information, by work ID).
+/// A title by its letters and digits only (folder names lose characters Windows does
+/// not allow), ignoring case and full-width letters.
+fn fold(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            // Full-width ASCII to ASCII.
+            '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xfee0).unwrap_or(c),
+            _ => c,
+        })
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A title without what was added for a while, such as `【30%OFF!!】` or `✅…特典✅`.
+fn without_sale_text(text: &str) -> String {
+    let mut plain = String::new();
+    let mut closing = None;
+    for c in text.chars() {
+        match (closing, c) {
+            (None, '【') => closing = Some('】'),
+            (None, '✅') => closing = Some('✅'),
+            (Some(end), _) if c == end => closing = None,
+            (Some(_), _) => {}
+            (None, _) => plain.push(c),
+        }
+    }
+    plain
+}
+
+/// Works given to games by title ID, each work to one game at most.
+#[derive(Default)]
+struct Claims {
+    works: HashMap<String, String>,
+    taken: HashSet<String>,
+}
+
+impl Claims {
+    /// Give `work` to `title` unless either already has its match.
+    fn give(&mut self, title: &Title, work: &str) {
+        if !self.works.contains_key(&title.id) && self.taken.insert(work.to_owned()) {
+            self.works.insert(title.id.clone(), work.to_owned());
+        }
+    }
+}
+
+/// Which work each game is, by title ID, each work for one game at most. In order:
+/// what was `remembered` of its folder, DLsiteNest's record of it, the purchase left
+/// with the same title (the only one, or the one by the same maker) as it is and then
+/// without sale text, and the maker's only purchase left when the game is the maker's
+/// only one left. Pictures come from the
+/// purchases, else from `images` (DLsite's public information, by work ID).
 #[allow(clippy::implicit_hasher, reason = "the maps are built here")]
 pub fn identify(
     titles: &[Title],
+    remembered: &HashMap<String, Known>,
     nest: &HashMap<String, String>,
     purchases: &[play::Work],
     images: &HashMap<String, String>,
 ) -> HashMap<String, Known> {
-    let fold = |text: &str| -> String {
-        text.chars()
-            .map(|c| match c {
-                // Full-width ASCII to ASCII.
-                '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xfee0).unwrap_or(c),
-                _ => c,
-            })
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect()
-    };
     let by_id: HashMap<&str, &play::Work> = purchases.iter().map(|w| (w.id.as_str(), w)).collect();
-    let mut by_title: HashMap<String, Vec<&play::Work>> = HashMap::new();
-    for work in purchases {
-        by_title.entry(fold(&work.name)).or_default().push(work);
-    }
-    let mut known = HashMap::new();
+    let mut claims = Claims::default();
     for title in titles {
-        let recorded = nest.get(&title.folder.to_string_lossy().to_lowercase());
-        let work = if let Some(id) = recorded {
-            id.clone()
-        } else {
-            let same = by_title
-                .get(&fold(&title.name))
-                .map_or(&[][..], Vec::as_slice);
-            let maker = fold(&title.maker);
-            match same {
-                [only] => only.id.clone(),
-                several => match several.iter().find(|w| fold(&w.maker) == maker) {
-                    Some(work) => work.id.clone(),
-                    None => continue,
-                },
-            }
-        };
-        let image = by_id
-            .get(work.as_str())
-            .and_then(|w| w.image.clone())
-            .or_else(|| images.get(&work).cloned());
-        known.insert(title.id.clone(), Known { work, image });
+        if let Some(known) = remembered.get(&folder_key(&title.folder)) {
+            claims.give(title, &known.work);
+        }
     }
-    known
+    for title in titles {
+        if let Some(work) = nest.get(&folder_key(&title.folder)) {
+            claims.give(title, work);
+        }
+    }
+    let keys: [fn(&str) -> String; 2] = [fold, |text| fold(&without_sale_text(text))];
+    for key in keys {
+        let mut by_title: HashMap<String, Vec<&play::Work>> = HashMap::new();
+        for work in purchases {
+            by_title.entry(key(&work.name)).or_default().push(work);
+        }
+        for title in titles {
+            if claims.works.contains_key(&title.id) {
+                continue;
+            }
+            let same: Vec<&play::Work> = by_title
+                .get(&key(&title.name))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|w| !claims.taken.contains(&w.id))
+                .collect();
+            let maker = fold(&title.maker);
+            let work = match same.as_slice() {
+                [only] => Some(*only),
+                several => several.iter().copied().find(|w| fold(&w.maker) == maker),
+            };
+            if let Some(work) = work {
+                claims.give(title, &work.id);
+            }
+        }
+    }
+    let mut left: HashMap<String, (Vec<&Title>, Vec<&play::Work>)> = HashMap::new();
+    for title in titles.iter().filter(|t| !claims.works.contains_key(&t.id)) {
+        left.entry(fold(&title.maker)).or_default().0.push(title);
+    }
+    for work in purchases {
+        if !claims.taken.contains(&work.id)
+            && let Some((_, theirs)) = left.get_mut(&fold(&work.maker))
+        {
+            theirs.push(work);
+        }
+    }
+    for (games, theirs) in left.values() {
+        if let ([game], [work]) = (games.as_slice(), theirs.as_slice()) {
+            claims.give(game, &work.id);
+        }
+    }
+    claims
+        .works
+        .into_iter()
+        .map(|(title, work)| {
+            let image = by_id
+                .get(work.as_str())
+                .and_then(|w| w.image.clone())
+                .or_else(|| images.get(&work).cloned());
+            (title, Known { work, image })
+        })
+        .collect()
 }
 
-/// The listing: most recently started first, then most recently installed.
+/// The listing: most recently started first, then most recently installed. `images`
+/// are the DLsite pictures by game ID.
 #[allow(clippy::implicit_hasher, reason = "the maps come from the store")]
 pub fn listing(
     titles: &[(Title, Vec<String>)],
     labels: &[(Label, HashSet<String>)],
     started: &HashMap<String, i64>,
-    known: &HashMap<String, Known>,
+    images: &HashMap<String, String>,
 ) -> Listing {
     let mut order: Vec<&(Title, Vec<String>)> = titles.iter().collect();
     order.sort_by(|(a, _), (b, _)| {
@@ -677,7 +873,7 @@ pub fn listing(
                 name: title.name.clone(),
                 detail: Some(title.maker.clone()),
                 choosable: programs.len() > 1,
-                image: known.get(&title.id).and_then(|k| k.image.clone()),
+                image: images.get(&title.id).cloned(),
                 installed: true,
                 labels: labels
                     .iter()
@@ -710,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn games_are_identified_by_dlsitenest_then_by_name() {
+    fn games_are_identified_by_record_then_dlsitenest_then_by_name_then_by_maker() {
         use super::{Known, identify, play::Work};
 
         let titles = [
@@ -719,11 +915,34 @@ mod tests {
             title("Other", "ＦＵＬＬ　ｗｉｄｔｈ: Title", 1),
             title("Unknown", "Nobody bought this", 1),
             title("Twice", "Same Name", 1),
+            title(
+                "ちょいや",
+                "あらがえ!!人妻サバイバー【リリース記念30%OFF!!】",
+                1,
+            ),
+            title(
+                "にゃんにゃんソフト",
+                "✅8_6まで早期限定特典✅さいみん！妹いたずらクリッカー",
+                1,
+            ),
+            title("スーパーバッド", "夜歩き", 1),
+            title("Kept", "Recorded", 1),
+            title("DLC", "LOOKhac【Hシーン全解放DLC】", 1),
+            title("DLC", "LOOKhac", 1),
         ];
-        let nest = HashMap::from([(
-            titles[0].folder.to_string_lossy().to_lowercase(),
-            "RJ01686872".to_owned(),
+        let path = |t: &Title| t.folder.to_string_lossy().to_lowercase();
+        let remembered = HashMap::from([(
+            path(&titles[8]),
+            Known {
+                work: "RJ8".into(),
+                image: None,
+            },
         )]);
+        let nest = HashMap::from([
+            (path(&titles[0]), "RJ01686872".to_owned()),
+            // The record of this folder wins over DLsiteNest's.
+            (path(&titles[8]), "RJ999".to_owned()),
+        ]);
         let work = |id: &str, name: &str, maker: &str, image: Option<&str>| Work {
             id: id.into(),
             name: name.into(),
@@ -740,10 +959,21 @@ mod tests {
             work("RJ3", "Full Width / Title", "someone else", None),
             work("RJ4", "Same Name", "A", None),
             work("RJ5", "Same Name", "B", None),
+            work("RJ6", "あらがえ!!人妻サバイバー", "ちょいや", None),
+            work(
+                "RJ7",
+                "さいみん!妹いたずらクリッカー",
+                "にゃんにゃんソフト",
+                None,
+            ),
+            work("RJ10", "夜歩き 完全版", "スーパーバッド", None),
+            work("RJ11", "LOOK.hac", "DLC", None),
+            work("RJ12", "LOOK.hac【Hシーン全解放DLC】", "DLC", None),
         ];
         let images = HashMap::from([("RJ01686872".to_owned(), "https://img/1.jpg".to_owned())]);
-        let known = identify(&titles, &nest, &purchases, &images);
+        let known = identify(&titles, &remembered, &nest, &purchases, &images);
         let got = |t: &Title| known.get(&t.id).cloned();
+        let work_of = |t: &Title| got(t).map(|k| k.work);
         assert_eq!(
             got(&titles[0]),
             Some(Known {
@@ -759,10 +989,19 @@ mod tests {
             })
         );
         // The maker differs, but no other purchase has that title.
-        assert_eq!(got(&titles[2]).map(|k| k.work), Some("RJ3".to_owned()));
-        assert_eq!(got(&titles[3]), None);
+        assert_eq!(work_of(&titles[2]), Some("RJ3".to_owned()));
+        assert_eq!(work_of(&titles[3]), None);
         // Two purchases share the title and neither maker matches: unknown.
-        assert_eq!(got(&titles[4]), None);
+        assert_eq!(work_of(&titles[4]), None);
+        // Sale text in 【】 or between ✅ is not part of the title.
+        assert_eq!(work_of(&titles[5]), Some("RJ6".to_owned()));
+        assert_eq!(work_of(&titles[6]), Some("RJ7".to_owned()));
+        // The maker's only unmatched purchase, for the maker's only unmatched game.
+        assert_eq!(work_of(&titles[7]), Some("RJ10".to_owned()));
+        assert_eq!(work_of(&titles[8]), Some("RJ8".to_owned()));
+        // 【】 that is part of the title on DLsite too is kept.
+        assert_eq!(work_of(&titles[9]), Some("RJ12".to_owned()));
+        assert_eq!(work_of(&titles[10]), Some("RJ11".to_owned()));
     }
 
     #[test]
@@ -870,14 +1109,8 @@ mod tests {
         };
         let labels = vec![(hidden.clone(), HashSet::from([a.id.clone()]))];
         let started = HashMap::from([(c.id.clone(), 50)]);
-        let known = HashMap::from([(
-            b.id.clone(),
-            super::Known {
-                work: "RJ1".into(),
-                image: Some("https://img/b.jpg".into()),
-            },
-        )]);
-        let listing = listing(&titles, &labels, &started, &known);
+        let images = HashMap::from([(b.id.clone(), "https://img/b.jpg".to_owned())]);
+        let listing = listing(&titles, &labels, &started, &images);
         let rows: Vec<_> = listing
             .items
             .iter()
@@ -916,6 +1149,8 @@ mod tests {
             ("Maker/One", &["One.exe", "UnityCrashHandler64.exe"][..]),
             ("Maker/Two", &["app.exe", "startup.exe"][..]),
             ("Other/None", &["readme.txt"][..]),
+            // A backup DLsiteNest leaves next to a game is not a game.
+            ("Maker/One.bak", &["One.exe"][..]),
         ] {
             let dir = root.join(folder);
             std::fs::create_dir_all(&dir).unwrap();
@@ -986,42 +1221,151 @@ mod tests {
     }
 
     #[test]
-    fn identified_games_keep_their_work_and_picture() {
+    fn a_known_game_goes_by_its_work_id_and_keeps_its_labels_when_its_folder_moves() {
+        use super::{Known, identify, play::Work, scan};
+
         let root = games("known");
         let library = library(&root);
-        let one = library
-            .listing()
-            .items
-            .iter()
-            .find(|i| i.name == "One")
-            .unwrap()
-            .id
-            .clone();
-        let known = std::collections::HashMap::from([(
-            one.clone(),
-            super::Known {
-                work: "RJ9".into(),
-                image: Some("https://img/9.jpg".into()),
-            },
-        )]);
-        library.store.save_works(&known).unwrap();
-        // Saving again without it keeps it: a failed lookup does not forget games.
+        let item = |name: &str| {
+            library
+                .listing()
+                .items
+                .into_iter()
+                .find(|i| i.name == name)
+                .unwrap()
+        };
+        let hashed = item("Two").id;
+        // Labels, the chosen program and the start time were kept under the folder's ID.
+        library.set_label("favorite", &hashed, true).unwrap();
+        library.choose_program(&hashed, "startup.exe").unwrap();
+        library.start(&hashed).unwrap();
+        // Pins live in the same database.
         library
             .store
-            .save_works(&std::collections::HashMap::new())
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TABLE library_pins (button_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                     name TEXT NOT NULL, position INTEGER NOT NULL, PRIMARY KEY (button_id, item_id));
+                 INSERT INTO library_pins VALUES ('dlsite', '{hashed}', 'Two', 1);"
+            ))
             .unwrap();
-        assert_eq!(library.store.works().unwrap(), known);
+
+        let identified = |library: &super::DlsiteLibrary, name: &str| {
+            let titles: Vec<Title> = scan(&root).unwrap().into_iter().map(|(t, _)| t).collect();
+            let remembered = library.store.games().unwrap();
+            let purchases = [Work {
+                id: "RJ9".into(),
+                name: name.into(),
+                maker: "Maker".into(),
+                image: Some("https://img/9.jpg".into()),
+            }];
+            let known = identify(
+                &titles,
+                &remembered,
+                &HashMap::new(),
+                &purchases,
+                &HashMap::new(),
+            );
+            library.store.remember(&titles, &known).unwrap();
+        };
+        identified(&library, "Two");
+        let two = item("Two");
+        assert_eq!(two.id, "RJ9");
+        assert_eq!(two.labels, ["favorite"]);
+        assert_eq!(two.image.as_deref(), Some("https://img/9.jpg"));
         assert_eq!(
-            library.picture(&one),
+            library.programs("RJ9").unwrap().chosen.as_deref(),
+            Some("startup.exe")
+        );
+        assert_eq!(
+            library.picture("RJ9"),
             Some(crate::library::Picture::Url("https://img/9.jpg".into()))
         );
-        let item = library
-            .listing()
-            .items
-            .into_iter()
-            .find(|i| i.id == one)
+        assert_eq!(library.listing().items[0].id, "RJ9");
+        let pinned: String = library
+            .store
+            .conn()
+            .query_row("SELECT item_id FROM library_pins", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(item.image.as_deref(), Some("https://img/9.jpg"));
+        assert_eq!(pinned, "RJ9");
+        // One record per work: the work ID and its folder.
+        assert_eq!(
+            library.store.games().unwrap(),
+            HashMap::from([(
+                root.join(r"Maker\Two").to_string_lossy().to_lowercase(),
+                Known {
+                    work: "RJ9".into(),
+                    image: Some("https://img/9.jpg".into())
+                }
+            )])
+        );
+
+        // Renamed on disk (sale text taken out, say): the work and its labels stay.
+        std::fs::rename(root.join(r"Maker\Two"), root.join(r"Maker\Two Renamed")).unwrap();
+        identified(&library, "Two Renamed");
+        let renamed = item("Two Renamed");
+        assert_eq!(renamed.id, "RJ9");
+        assert_eq!(renamed.labels, ["favorite"]);
+        let works: Vec<_> = library
+            .store
+            .games()
+            .unwrap()
+            .into_iter()
+            .map(|(path, k)| (path, k.work))
+            .collect();
+        assert_eq!(
+            works,
+            [(
+                root.join(r"Maker\Two Renamed")
+                    .to_string_lossy()
+                    .to_lowercase(),
+                "RJ9".to_owned()
+            )]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn games_found_by_the_previous_version_move_to_the_games_table() {
+        let root = games("legacy");
+        let library = library(&root);
+        let item = |name: &str| {
+            library
+                .listing()
+                .items
+                .into_iter()
+                .find(|i| i.name == name)
+                .unwrap()
+        };
+        let (one, two) = (item("One").id, item("Two").id);
+        library.set_label("hidden", &one, true).unwrap();
+        // The previous version could give one work to two folders (a copy left under
+        // another maker, say): the first keeps it.
+        library
+            .store
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TABLE dlsite_works (item_id TEXT PRIMARY KEY, work_id TEXT NOT NULL, image TEXT);
+                 INSERT INTO dlsite_works VALUES ('{one}', 'RJ5', 'https://img/5.jpg');
+                 INSERT INTO dlsite_works VALUES ('{two}', 'RJ5', NULL);"
+            ))
+            .unwrap();
+        library.adopt_legacy_works();
+        let adopted = item("One");
+        assert_eq!(adopted.id, "RJ5");
+        assert_eq!(adopted.labels, ["hidden"]);
+        assert_eq!(adopted.image.as_deref(), Some("https://img/5.jpg"));
+        assert_eq!(item("Two").id, two);
+        let left: i64 = library
+            .store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'dlsite_works'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
