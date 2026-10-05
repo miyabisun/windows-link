@@ -245,6 +245,10 @@ recently started first, then recently added. Its picture is the work's art on DL
 (`image` in the listing), or its program's icon until the work is known; the button's
 state says `"pictures": "whole"`, as both are shown whole.
 
+Some games ask for a license key (serial number) when they first start. `GET …/keys` reads it
+from DLsite each time it is asked (with the account in `secrets.yaml`), so the keys are kept
+nowhere on this PC and never logged; the panel shows them with a copy button.
+
 - **Programs**: the `.exe` files in the game's folder, or else in the folders right below
   it, leaving out helpers such as crash reporters, uninstallers and runtime installers.
   With one, or with one that is not a tool (settings, setup, patcher, launcher), starting
@@ -364,6 +368,7 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 | `POST /buttons/{id}/library/{item}/folder` | show an installed game's folder in Explorer (`204`; `404` when not installed) |
 | `GET /buttons/{id}/library/{item}/programs` | a game's programs to choose from: `{"candidates": ["Game.exe", …], "chosen": null}` (`404` when it has no choice) |
 | `PUT /buttons/{id}/library/{item}/program` | `{"program": …}`: remember which program starts the game (`204`) |
+| `GET /buttons/{id}/library/{item}/keys` | a game's license keys from its store: `{"keys": [{label, value}]}` (empty when it has none; `404` when the library does not know them; `409 keys_unavailable` with the reason when the store cannot be asked). A library button's state says `"license_keys": true` when its games have them (DLsite) |
 | `POST /buttons/{id}/labels` | `{"name": …}`: make a label; `201 {"label": {id, name, editable}}` |
 | `PATCH /buttons/{id}/labels/{label}`, `DELETE …` | rename a label (`{"name": …}`) or delete it, keeping its games (`204`) |
 | `PUT /buttons/{id}/labels/{label}/items/{item}`, `DELETE …` | put a game in a label, or take it out (`204`) |

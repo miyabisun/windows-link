@@ -59,6 +59,30 @@ pub struct Listing {
     pub labels_locked: Option<String>,
 }
 
+/// A license key (serial number) a game asks for, as its store shows it.
+#[derive(Clone, PartialEq, Serialize)]
+pub struct LicenseKey {
+    pub label: String,
+    pub value: String,
+}
+
+/// Keeps the key itself out of logs.
+impl std::fmt::Debug for LicenseKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LicenseKey")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a game's license keys cannot be read.
+#[derive(Debug, PartialEq)]
+pub enum KeyError {
+    NotFound,
+    /// The store cannot be asked now, and why.
+    Unavailable(String),
+}
+
 /// Why an item cannot be started.
 #[derive(Debug, PartialEq)]
 pub enum StartError {
@@ -146,6 +170,10 @@ pub trait GameLibrary: Send + Sync + 'static {
     /// Remember which program starts the item.
     fn choose_program(&self, _id: &str, _program: &str) -> Result<(), LabelError> {
         Err(LabelError::NotFound)
+    }
+    /// The license keys the item's store keeps for it (none when it has none).
+    fn license_keys(&self, _id: &str) -> Result<Vec<LicenseKey>, KeyError> {
+        Err(KeyError::NotFound)
     }
 }
 
@@ -321,7 +349,8 @@ pub mod fake {
     use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
 
     use super::{
-        GameLibrary, Item, Label, LabelError, Listing, Picture, Programs, Start, StartError,
+        GameLibrary, Item, KeyError, Label, LabelError, LicenseKey, Listing, Picture, Programs,
+        Start, StartError,
     };
 
     /// Items `"1"` (installed in `C:\Games\One`, a picture on the web) and `"2"` (not
@@ -465,6 +494,19 @@ pub mod fake {
             }
             *self.chosen.lock().unwrap() = Some(program.to_owned());
             Ok(())
+        }
+
+        /// "1" has a key, "2" none, "5" cannot be asked now.
+        fn license_keys(&self, id: &str) -> Result<Vec<LicenseKey>, KeyError> {
+            match id {
+                "1" => Ok(vec![LicenseKey {
+                    label: "ライセンスキー".into(),
+                    value: "ABCD-1234-EFGH-5678".into(),
+                }]),
+                "2" => Ok(vec![]),
+                "5" => Err(KeyError::Unavailable("no account".into())),
+                _ => Err(KeyError::NotFound),
+            }
         }
 
         fn picture(&self, id: &str) -> Option<Picture> {

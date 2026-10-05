@@ -17,7 +17,8 @@ use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use crate::library::{
-    GameLibrary, Item, Label, LabelError, Listing, Picture, Programs, Start, StartError,
+    GameLibrary, Item, KeyError, Label, LabelError, LicenseKey, Listing, Picture, Programs, Start,
+    StartError,
 };
 
 pub mod download;
@@ -517,6 +518,8 @@ pub struct DlsiteLibrary {
     purchases: Mutex<Vec<play::Work>>,
     /// How each download or update planned this round is going, by work ID.
     progress: Mutex<HashMap<String, String>>,
+    /// The account `refresh` was given, for reading license keys.
+    account: Mutex<Option<crate::secrets::DlsiteAccount>>,
 }
 
 /// The status of a game waiting to be downloaded.
@@ -529,6 +532,7 @@ impl DlsiteLibrary {
             store,
             purchases: Mutex::default(),
             progress: Mutex::default(),
+            account: Mutex::default(),
         }
     }
 
@@ -745,6 +749,10 @@ impl DlsiteLibrary {
     /// one. Pictures of works known only through DLsiteNest come from DLsite's public
     /// information. Failures are logged and leave what was known.
     pub fn refresh(&self, account: Option<&crate::secrets::DlsiteAccount>) {
+        *self
+            .account
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = account.cloned();
         self.adopt_legacy_works();
         let Ok(games) = scan(&self.root) else {
             return;
@@ -947,6 +955,28 @@ impl GameLibrary for DlsiteLibrary {
         let (_, candidates) = self.find(id)?;
         let chosen = self.program(id, &candidates);
         Some(Programs { candidates, chosen })
+    }
+
+    /// Read from DLsite each time, so the keys are kept nowhere on this PC.
+    fn license_keys(&self, id: &str) -> Result<Vec<LicenseKey>, KeyError> {
+        let bought = self
+            .purchases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|work| work.id == id);
+        if !bought {
+            return Err(KeyError::NotFound);
+        }
+        let account = self
+            .account
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| KeyError::Unavailable("secrets.yaml has no DLsite account".into()))?;
+        play::sign_in(&account)
+            .and_then(|session| session.license_keys(id))
+            .map_err(KeyError::Unavailable)
     }
 
     fn choose_program(&self, id: &str, program: &str) -> Result<(), LabelError> {

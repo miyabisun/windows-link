@@ -25,7 +25,7 @@ use crate::{
     discord::{NoVoice, Voice},
     icons,
     launch::{Launcher, windows::WindowsLauncher},
-    library::{self, GameLibrary, LabelError, NoLibrary, Picture, Pin, Pins},
+    library::{self, GameLibrary, KeyError, LabelError, NoLibrary, Picture, Pin, Pins},
     power,
 };
 
@@ -264,6 +264,7 @@ pub fn app(state: AppState) -> Router {
         .route("/buttons/{id}/library/{item}/image", get(item_picture))
         .route("/buttons/{id}/library/{item}/folder", post(open_folder))
         .route("/buttons/{id}/library/{item}/programs", get(item_programs))
+        .route("/buttons/{id}/library/{item}/keys", get(license_keys))
         .route(
             "/buttons/{id}/library/{item}/program",
             axum::routing::put(choose_program),
@@ -457,6 +458,32 @@ async fn item_programs(
             "not_found",
             "the game has no programs to choose from",
         ),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// A game's license keys, read from its store (`{"keys": [{"label", "value"}]}`).
+async fn license_keys(
+    State(state): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    let Some((_, library)) = state.library_button(&id) else {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    };
+    match tokio::task::spawn_blocking(move || library.license_keys(&item)).await {
+        Ok(Ok(keys)) => Json(json!({ "keys": keys })).into_response(),
+        Ok(Err(KeyError::NotFound)) => error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "the library does not know the game's license keys",
+        ),
+        Ok(Err(KeyError::Unavailable(reason))) => {
+            error(StatusCode::CONFLICT, "keys_unavailable", &reason)
+        }
         Err(join) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
@@ -1265,6 +1292,28 @@ buttons:
         let (status, body) = call(state, "POST", "/buttons/games/library/2/folder").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn a_games_license_keys_are_read_from_its_library() {
+        let (state, _) = library_state();
+        let (status, body) = call(state.clone(), "GET", "/buttons/games/library/1/keys").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({"keys": [{"label": "ライセンスキー", "value": "ABCD-1234-EFGH-5678"}]})
+        );
+        let (_, body) = call(state.clone(), "GET", "/buttons/games/library/2/keys").await;
+        assert_eq!(body, serde_json::json!({"keys": []}));
+        let (status, body) = call(state.clone(), "GET", "/buttons/games/library/5/keys").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "keys_unavailable");
+        assert_eq!(body["message"], "no account");
+        let (status, body) = call(state.clone(), "GET", "/buttons/games/library/9/keys").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+        let (status, _) = call(state, "GET", "/buttons/nope/library/1/keys").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -52,11 +52,13 @@ pub enum ButtonState {
         running: bool,
     },
     /// A game library the panel opens (`GET /buttons/{id}/library`) instead of
-    /// pressing; `pins` are the games pinned to the button's tab, in order, and
-    /// `pictures` says whether the games' pictures are store art or program icons.
+    /// pressing; `pins` are the games pinned to the button's tab, in order,
+    /// `pictures` says whether the games' pictures are store art or program icons, and
+    /// `license_keys` whether a game's license keys can be read (`GET …/keys`).
     Library {
         pins: Vec<Pin>,
         pictures: Pictures,
+        license_keys: bool,
     },
     Error {
         message: String,
@@ -245,6 +247,7 @@ fn state(
             ButtonState::Library {
                 pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
                 pictures: spec.pictures().unwrap_or_default(),
+                license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
             }
         }
     }
@@ -786,14 +789,16 @@ buttons:
             view(&config, &config.buttons[0], &readings, &audio).state,
             ButtonState::Library {
                 pins: vec![pinned],
-                pictures: Pictures::Cover
+                pictures: Pictures::Cover,
+                license_keys: false
             }
         );
         assert_eq!(
             view(&config, &config.buttons[1], &readings, &audio).state,
             ButtonState::Library {
                 pins: vec![],
-                pictures: Pictures::Whole
+                pictures: Pictures::Whole,
+                license_keys: true
             }
         );
         assert!(matches!(

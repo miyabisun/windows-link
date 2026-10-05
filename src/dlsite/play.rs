@@ -161,6 +161,21 @@ impl Session {
         Ok(pages)
     }
 
+    /// The license keys DLsite keeps for a work: its download leads to a page showing
+    /// them when it has any.
+    pub fn license_keys(&self, id: &str) -> Result<Vec<crate::library::LicenseKey>, String> {
+        let start = self.location(&format!(
+            "https://play.dlsite.com/api/v3/download?workno={id}"
+        ))?;
+        if !start.contains("/serial/") {
+            return Ok(Vec::new());
+        }
+        Ok(license_keys(&text(
+            self.agent.get(&start).call(),
+            "DLsite's page of license keys",
+        )?))
+    }
+
     /// The file a download page gives.
     pub fn resolve(&self, page: &str) -> Result<RemoteFile, String> {
         let url = self.location(page)?;
@@ -302,6 +317,53 @@ pub struct Work {
     pub version: String,
 }
 
+/// The license keys on DLsite's page of a work that has them (`/home/serial/…`): the
+/// table rows whose heading names a key or serial number.
+pub fn license_keys(html: &str) -> Vec<crate::library::LicenseKey> {
+    let named = |label: &str| {
+        let label = label.to_lowercase();
+        ["キー", "シリアル", "serial", "license", "key"]
+            .iter()
+            .any(|word| label.contains(word))
+    };
+    html.split("<tr")
+        .skip(1)
+        .filter_map(|row| {
+            let row = &row[..row.find("</tr>").unwrap_or(row.len())];
+            let label = cell(row, "th")?;
+            let value = cell(row, "td")?;
+            (named(&label) && !value.is_empty())
+                .then_some(crate::library::LicenseKey { label, value })
+        })
+        .collect()
+}
+
+/// The text of the first `<tag>` cell in a table row, without markup, entities decoded
+/// and spaces collapsed.
+fn cell(row: &str, tag: &str) -> Option<String> {
+    let start = row.find(&format!("<{tag}"))?;
+    let open = start + row[start..].find('>')? + 1;
+    let close = open + row[open..].find(&format!("</{tag}>"))?;
+    let mut text = String::new();
+    let mut in_tag = false;
+    for c in row[open..close].chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&amp;", "&");
+    Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 /// The download links on DLsite's page for a work split into parts, in order.
 pub fn split_parts(html: &str) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
@@ -428,8 +490,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Work, content_total, file_name, login_token, public_images, sales, signed_in, split_parts,
-        works,
+        Work, content_total, file_name, license_keys, login_token, public_images, sales, signed_in,
+        split_parts, works,
     };
 
     #[test]
@@ -520,6 +582,40 @@ mod tests {
                     .to_owned()
             )]
         );
+    }
+
+    #[test]
+    fn reads_the_license_keys_on_dlsites_page() {
+        let html = r#"<h2>ライセンスキー</h2>
+            <div class="table_inframe_box_fix"><div class="table_inframe_box_inner">
+            <table>
+              <tr>
+                <th>ライセンスキー</th>
+                <td><strong class="color_02">ABCD-1234-EFGH-5678</strong></td>
+              </tr>
+              <tr><th>シリアル番号 &amp; 2</th><td> XY12
+                 34 </td></tr>
+              <tr><th>注意</th><td>大切に保管してください</td></tr>
+              <tr><th>ライセンスキー</th><td></td></tr>
+            </table></div></div>"#;
+        let keys: Vec<(String, String)> = license_keys(html)
+            .into_iter()
+            .map(|k| (k.label, k.value))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (
+                    "ライセンスキー".to_owned(),
+                    "ABCD-1234-EFGH-5678".to_owned()
+                ),
+                ("シリアル番号 & 2".to_owned(), "XY12 34".to_owned()),
+            ]
+        );
+        assert!(license_keys("<p>no keys</p>").is_empty());
+        // The key stays out of logs.
+        let key = &license_keys(html)[0];
+        assert!(!format!("{key:?}").contains("ABCD"));
     }
 
     #[test]
