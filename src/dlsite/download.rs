@@ -203,7 +203,9 @@ pub fn unpack(first: &Path, out: &Path) -> Result<(), String> {
         if output.status.success() {
             return Ok(());
         }
-        said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .clone_into(&mut said);
         if !said.contains("cannot be converted") {
             break;
         }
