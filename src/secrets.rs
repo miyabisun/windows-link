@@ -7,6 +7,9 @@
 //!   client_secret: abcdef
 //! steam:
 //!   api_key: 0123456789ABCDEF0123456789ABCDEF
+//! dlsite:
+//!   login_id: you@example.com
+//!   password: your-password
 //! ```
 
 use std::{
@@ -22,6 +25,25 @@ pub struct Secrets {
     pub discord: Option<DiscordApp>,
     #[serde(default)]
     pub steam: Option<SteamKey>,
+    #[serde(default)]
+    pub dlsite: Option<DlsiteAccount>,
+}
+
+/// The DLsite account whose purchases the DLsite library reads (sign-in with Google or
+/// other services is not supported).
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DlsiteAccount {
+    #[serde(deserialize_with = "id_text")]
+    pub login_id: String,
+    #[serde(deserialize_with = "id_text")]
+    pub password: String,
+}
+
+impl fmt::Debug for DlsiteAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DlsiteAccount").finish_non_exhaustive()
+    }
 }
 
 /// A Steam Web API key (<https://steamcommunity.com/dev/apikey>), to list owned games.
@@ -137,6 +159,20 @@ mod tests {
         assert!(parse("").unwrap().steam.is_none());
         assert!(parse("steam:\n  apikey: x\n").is_err());
         assert!(parse("steam:\n  api_key: \"\"\n").is_err());
+    }
+
+    #[test]
+    fn reads_the_dlsite_account_and_hides_it_from_debug_output() {
+        let secrets =
+            parse("dlsite:\n  login_id: someone@example.com\n  password: 'p@ss: w0rd'\n").unwrap();
+        let account = secrets.dlsite.unwrap();
+        assert_eq!(account.login_id, "someone@example.com");
+        assert_eq!(account.password, "p@ss: w0rd");
+        let shown = format!("{account:?}");
+        assert!(!shown.contains("p@ss") && !shown.contains("someone"));
+        assert!(parse("").unwrap().dlsite.is_none());
+        assert!(parse("dlsite:\n  login_id: x\n").is_err());
+        assert!(parse("dlsite:\n  login_id: x\n  password: \"\"\n").is_err());
     }
 
     #[test]

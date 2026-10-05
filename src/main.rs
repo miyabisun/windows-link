@@ -135,7 +135,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let defined = Arc::new(config.desktops.clone());
     let voice = discord_voice(&config, changes.clone());
     let database = data_dir().join("windows-link.db");
-    let libraries = libraries(&config, &database)?;
+    let (libraries, dlsite_libraries) = libraries(&config, &database)?;
     let pins = Arc::new(Pins::open(&database)?);
     let mut state = AppState::new(config, audio)
         .with_desktops(desktops.clone())
@@ -145,6 +145,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         state = state.with_library(&button, library);
     }
     tokio::spawn(state.clone().run_refresher(changes));
+    if !dlsite_libraries.is_empty() {
+        tokio::spawn(refresh_dlsite(dlsite_libraries, state.clone()));
+    }
     let runtime = tokio::runtime::Handle::current();
     let publisher = state.clone();
     desktop_watch(move |reason| {
@@ -220,8 +223,32 @@ fn discord_voice(config: &config::Config, changes: Arc<Notify>) -> Arc<dyn Voice
     }
 }
 
-/// Library buttons by ID, with their libraries.
-type Libraries = Vec<(String, Arc<dyn GameLibrary>)>;
+/// Library buttons by ID with their libraries, and the DLsite libraries among them.
+type Libraries = (Vec<(String, Arc<dyn GameLibrary>)>, Vec<Arc<DlsiteLibrary>>);
+
+/// How often the DLsite games are identified again (new purchases and installs).
+const DLSITE_REFRESH: std::time::Duration = std::time::Duration::from_hours(6);
+
+/// Identify the DLsite games now and every `DLSITE_REFRESH`, with the account in
+/// `secrets.yaml` when there is one, then let the pictures be read again.
+async fn refresh_dlsite(libraries: Vec<Arc<DlsiteLibrary>>, state: AppState) {
+    let account = match secrets::load(&secrets::default_path()) {
+        Ok(secrets) => secrets.dlsite,
+        Err(reason) => {
+            error!(%reason, "DLsite games are identified without the account");
+            None
+        }
+    };
+    loop {
+        for library in &libraries {
+            let library = Arc::clone(library);
+            let account = account.clone();
+            let _ = tokio::task::spawn_blocking(move || library.refresh(account.as_ref())).await;
+        }
+        state.forget_pictures();
+        tokio::time::sleep(DLSITE_REFRESH).await;
+    }
+}
 
 /// The library behind each library button. The Steam library is read only when a
 /// button needs it, and shared by all such buttons.
@@ -231,6 +258,7 @@ fn libraries(
 ) -> Result<Libraries, Box<dyn std::error::Error>> {
     let mut steam: Option<Arc<dyn GameLibrary>> = None;
     let mut dlsite_store = None;
+    let mut dlsite = Vec::new();
     let mut out = Vec::new();
     for button in &config.buttons {
         let library: Arc<dyn GameLibrary> = match &button.spec {
@@ -246,13 +274,15 @@ fn libraries(
                 let root = root
                     .clone()
                     .unwrap_or_else(|| std::path::PathBuf::from(dlsite::DEFAULT_ROOT));
-                Arc::new(DlsiteLibrary::new(root, store))
+                let library = Arc::new(DlsiteLibrary::new(root, store));
+                dlsite.push(Arc::clone(&library));
+                library
             }
             _ => continue,
         };
         out.push((button.id.clone(), library));
     }
-    Ok(out)
+    Ok((out, dlsite))
 }
 
 fn steam_library() -> Arc<dyn GameLibrary> {

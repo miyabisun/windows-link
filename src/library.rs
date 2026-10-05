@@ -19,18 +19,21 @@ pub struct Item {
     pub detail: Option<String>,
     /// Whether the item has more than one program to start, of which the user picks one.
     pub choosable: bool,
+    /// Its picture's address on the web, when the library knows one; otherwise the
+    /// panel asks windows-link (`GET …/image`).
+    pub image: Option<String>,
     pub installed: bool,
     pub labels: Vec<String>,
 }
 
-/// What the items' pictures are: wide store art to fill a tile, or program icons to
-/// show whole.
+/// How the items' pictures are shown: wide store art filling a tile, or pictures of any
+/// shape (DLsite's 4:3 art, program icons) shown whole.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pictures {
     #[default]
     Cover,
-    Icon,
+    Whole,
 }
 
 /// A group of items, such as a Steam collection. Items name their labels by `id`.
@@ -353,6 +356,7 @@ pub mod fake {
                 name: name.into(),
                 detail: None,
                 choosable: false,
+                image: None,
                 installed,
                 labels: labels
                     .iter()

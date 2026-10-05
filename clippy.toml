@@ -1,1 +1,1 @@
-doc-valid-idents = ["DLsite", "DLsiteNest", ".."]
+doc-valid-idents = ["DLsite", "DLsiteNest", "LiteDB", ".."]

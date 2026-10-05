@@ -23,7 +23,7 @@ windows-core = "0.62"
 winvd = "0.0.49"
 # winvd takes the HWND type of the windows 0.58 crate.
 windows058 = { package = "windows", version = "0.58", features = ["Win32_Foundation"] }
-ureq = "3"
+ureq = { version = "3", features = ["cookies"] }
 sha2 = "0.11.0"
 png = "0.18.1"
 tungstenite = "0.30"

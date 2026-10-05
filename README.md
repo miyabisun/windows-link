@@ -13,8 +13,8 @@ Each button does one thing:
 | `discord.voice` | joins one Discord voice channel, or leaves it when you are in it | whether you are in that channel, or why Discord cannot be reached |
 | `app.launch` | opens a program, shortcut, URL or Store app, or brings it to the front while it runs | whether it runs |
 | `steam.game` | starts a Steam game, or closes it while it runs | whether it runs |
-| `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or program icons (`icon`) |
-| `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or program icons (`icon`) |
+| `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
+| `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -59,7 +59,7 @@ The server reads these environment variables:
 | `LOG_LEVEL` | `info` | `off`, `error`, `warn`, `info`, `debug` or `trace` |
 | `WINDOWS_LINK_CONFIG` | `%LOCALAPPDATA%\windows-link\config.yaml` | configuration file |
 | `WINDOWS_LINK_UPDATE_URL` | this repository's latest release in the GitHub API | where [updates](#updates) come from |
-| `WINDOWS_LINK_SECRETS` | `%LOCALAPPDATA%\windows-link\secrets.yaml` | credentials for outside services ([Discord](#discord), [Steam](#steam-library)) |
+| `WINDOWS_LINK_SECRETS` | `%LOCALAPPDATA%\windows-link\secrets.yaml` | credentials for outside services ([Discord](#discord), [Steam](#steam-library), [DLsite](#dlsite-library)) |
 
 The release build has no console window. When it is started without a terminal (for
 example at logon), logs go to `%LOCALAPPDATA%\windows-link\windows-link.log`.
@@ -238,7 +238,9 @@ buttons:
 
 The folder is read on every listing (a few hundred games take tens of milliseconds), so
 added and removed games show up at once. Each game lists its maker as `detail` and comes
-recently started first, then recently added. Its picture is the icon of its program.
+recently started first, then recently added. Its picture is the work's art on DLsite
+(`image` in the listing), or its program's icon until the work is known; the button's
+state says `"pictures": "whole"`, as both are shown whole.
 
 - **Programs**: the `.exe` files in the game's folder, or else in the folders right below
   it, leaving out helpers such as crash reporters, uninstallers and runtime installers.
@@ -250,6 +252,26 @@ recently started first, then recently added. Its picture is the icon of its prog
   made, renamed and deleted like Steam's. They, the chosen programs and the start times are
   kept in `windows-link.db`, by an ID made from the game's maker and title folders, so
   renaming a game's folder loses them.
+- **Which work a game is**: at start and every 6 hours windows-link works out each game's
+  DLsite work (such as `RJ01464588`) and keeps it in `windows-link.db`, so it stays after
+  DLsiteNest is uninstalled:
+  1. DLsiteNest's own records (`%APPDATA%\DLsiteNest`), which name each work's folder;
+  2. otherwise the account's purchases with the same maker and title (or the only one
+     with that title), when `secrets.yaml` has a DLsite account.
+
+  Pictures come from the purchases, or from DLsite's public product information for works
+  known only through DLsiteNest. The account is also what downloading and updating games
+  will use. Put it in `secrets.yaml` (a login ID and password; signing in through Google
+  or other services is not supported) and restart windows-link:
+
+  ```yaml
+  dlsite:
+    login_id: you@example.com
+    password: your-password
+  ```
+
+  The log says how many purchases were read and games identified, or why signing in
+  failed (such as DLsite asking for a CAPTCHA, which windows-link does not answer).
 
 ## Discord
 
@@ -297,7 +319,7 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, when `icon` is true |
-| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now) |
+| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now) |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
 | `PUT /buttons/{id}/pins/{item}`, `DELETE …` | pin a game to the button, or take it off; returns `{"button": …}` |

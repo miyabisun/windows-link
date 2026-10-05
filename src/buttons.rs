@@ -793,7 +793,7 @@ buttons:
             view(&config, &config.buttons[1], &readings, &audio).state,
             ButtonState::Library {
                 pins: vec![],
-                pictures: Pictures::Icon
+                pictures: Pictures::Whole
             }
         );
         assert!(matches!(

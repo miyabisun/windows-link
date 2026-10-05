@@ -82,6 +82,15 @@ impl AppState {
         self
     }
 
+    /// Read library pictures again when next asked (a game's picture may have changed
+    /// from its program's icon to its art).
+    pub fn forget_pictures(&self) {
+        self.pictures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// Keep library pins in `pins` (by default they last until the server stops).
     #[must_use]
     pub fn with_pins(mut self, pins: Arc<Pins>) -> Self {
@@ -680,7 +689,7 @@ async fn item_picture(
             (
                 [
                     (axum::http::header::CONTENT_TYPE, kind),
-                    (axum::http::header::CACHE_CONTROL, "max-age=86400"),
+                    (axum::http::header::CACHE_CONTROL, "no-cache"),
                 ],
                 bytes.as_ref().clone(),
             )

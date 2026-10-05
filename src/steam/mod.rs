@@ -557,6 +557,7 @@ pub fn listing(
             name: name.to_owned(),
             detail: None,
             choosable: false,
+            image: None,
             installed: local(id).is_some(),
             labels: collections
                 .iter()

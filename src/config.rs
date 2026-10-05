@@ -107,11 +107,12 @@ pub enum ButtonSpec {
 }
 
 impl ButtonSpec {
-    /// What a library button's pictures are: Steam's store art, or DLsite games' icons.
+    /// How a library button's pictures are shown: Steam's wide art fills a tile, DLsite's
+    /// pictures and icons are shown whole.
     pub fn pictures(&self) -> Option<Pictures> {
         match self {
             Self::SteamLibrary { .. } => Some(Pictures::Cover),
-            Self::DlsiteLibrary { .. } => Some(Pictures::Icon),
+            Self::DlsiteLibrary { .. } => Some(Pictures::Whole),
             _ => None,
         }
     }
