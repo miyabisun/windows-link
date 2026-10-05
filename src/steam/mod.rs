@@ -559,6 +559,7 @@ pub fn listing(
             choosable: false,
             image: None,
             installed: local(id).is_some(),
+            status: None,
             labels: collections
                 .iter()
                 .filter(|c| c.apps.contains(&id))

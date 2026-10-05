@@ -24,6 +24,8 @@ pub struct Item {
     pub image: Option<String>,
     pub installed: bool,
     pub labels: Vec<String>,
+    /// How getting or updating it is going, such as `ダウンロード中 40%`, when it is.
+    pub status: Option<String>,
 }
 
 /// How the items' pictures are shown: wide store art filling a tile, or pictures of any
@@ -65,6 +67,8 @@ pub enum StartError {
     Choose,
     /// It has no program to start.
     NoProgram,
+    /// It is bought but not on this PC yet; says how its download is going.
+    NotDownloaded(String),
 }
 
 /// The programs an item can be started with (paths relative to its folder), and the
@@ -201,6 +205,10 @@ pub fn start(
         StartError::NoProgram => PressError::Conflict {
             code: "no_program",
             message: "it has no program to start".into(),
+        },
+        StartError::NotDownloaded(status) => PressError::Conflict {
+            code: "not_downloaded",
+            message: status,
         },
     })?;
     let program = start.folder.map(Program::Folder);
@@ -358,6 +366,7 @@ pub mod fake {
                 choosable: false,
                 image: None,
                 installed,
+                status: None,
                 labels: labels
                     .iter()
                     .filter(|(_, items)| items.contains(id))
@@ -421,7 +430,8 @@ pub mod fake {
             Ok(())
         }
 
-        /// Also `"9"`, whose program must be chosen, and `"8"`, which has none.
+        /// Also `"9"`, whose program must be chosen, `"8"`, which has none, and `"6"`,
+        /// still downloading.
         fn start(&self, id: &str) -> Result<Start, StartError> {
             match id {
                 "1" => Ok(Start {
@@ -434,6 +444,7 @@ pub mod fake {
                 }),
                 "9" => Err(StartError::Choose),
                 "8" => Err(StartError::NoProgram),
+                "6" => Err(StartError::NotDownloaded("ダウンロード中 40%".into())),
                 _ => Err(StartError::NotFound),
             }
         }

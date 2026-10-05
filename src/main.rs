@@ -230,7 +230,8 @@ type Libraries = (Vec<(String, Arc<dyn GameLibrary>)>, Vec<Arc<DlsiteLibrary>>);
 const DLSITE_REFRESH: std::time::Duration = std::time::Duration::from_hours(6);
 
 /// Identify the DLsite games now and every `DLSITE_REFRESH`, with the account in
-/// `secrets.yaml` when there is one, then let the pictures be read again.
+/// `secrets.yaml` when there is one, let the pictures be read again, then download the
+/// games bought but not there yet and the updates (the next round waits for them).
 async fn refresh_dlsite(libraries: Vec<Arc<DlsiteLibrary>>, state: AppState) {
     let account = match secrets::load(&secrets::default_path()) {
         Ok(secrets) => secrets.dlsite,
@@ -246,6 +247,11 @@ async fn refresh_dlsite(libraries: Vec<Arc<DlsiteLibrary>>, state: AppState) {
             let _ = tokio::task::spawn_blocking(move || library.refresh(account.as_ref())).await;
         }
         state.forget_pictures();
+        for library in &libraries {
+            let library = Arc::clone(library);
+            let account = account.clone();
+            let _ = tokio::task::spawn_blocking(move || library.download(account.as_ref())).await;
+        }
         tokio::time::sleep(DLSITE_REFRESH).await;
     }
 }

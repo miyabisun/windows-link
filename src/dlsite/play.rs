@@ -1,11 +1,19 @@
 //! The user's DLsite purchases, through DLsite Play: sign in with the account in
-//! `secrets.yaml`, list the works bought, and read each work's name, maker and main
-//! picture. The same session will be needed to download and update games.
+//! `secrets.yaml`, list the works bought with each work's name, maker, main picture,
+//! type and latest version, and download a work's files.
 //!
-//! The flow follows dlsite-async (MIT, <https://github.com/bhrevol/dlsite-async>): the
-//! login form's `_token`, a form post, then DLsite Play's authorization.
+//! The login follows dlsite-async (MIT, <https://github.com/bhrevol/dlsite-async>): the
+//! login form's `_token`, a form post, then DLsite Play's authorization. Downloads
+//! follow what dlsite-manager (MIT, <https://github.com/AcrylicShrimp/dlsite-manager>)
+//! found: DLsite Play's download link leads to the archive, or to a page listing the
+//! parts of a split one.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    path::Path,
+    time::Duration,
+};
 
 use serde_json::Value;
 
@@ -13,6 +21,12 @@ use crate::secrets::DlsiteAccount;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const LIMIT: u64 = 32 * 1024 * 1024;
+/// How long one file may take to download; a stalled one is cut and continued later.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(6);
+/// How often a download reports its progress.
+const PROGRESS_STEP: u64 = 16 * 1024 * 1024;
+/// How many works DLsite Play describes in one request (its `page_limit`).
+const WORKS_PER_REQUEST: usize = 50;
 
 /// HTTPS with a cookie jar, which carries the session from the login to DLsite Play.
 fn agent() -> ureq::Agent {
@@ -44,8 +58,13 @@ fn json(
     serde_json::from_str(&text(response, what)?).map_err(|err| format!("{what}: {err}"))
 }
 
-/// Sign in and list every purchased work.
-pub fn fetch_purchases(account: &DlsiteAccount) -> Result<Vec<Work>, String> {
+/// A signed-in DLsite session, whose cookies let DLsite Play and the downloads in.
+pub struct Session {
+    agent: ureq::Agent,
+}
+
+/// Sign in with the account in `secrets.yaml`.
+pub fn sign_in(account: &DlsiteAccount) -> Result<Session, String> {
     let agent = agent();
     let page = text(
         agent.get("https://login.dlsite.com/login?user=self").call(),
@@ -77,24 +96,175 @@ pub fn fetch_purchases(account: &DlsiteAccount) -> Result<Vec<Work>, String> {
             .call(),
         "DLsite Play's authorization",
     )?;
-    let bought = sales(&json(
-        agent
-            .get("https://play.dlsite.com/api/v3/content/sales?last=0")
-            .call(),
-        "the DLsite purchases",
-    )?);
-    let mut found = Vec::new();
-    for batch in bought.chunks(100) {
-        let body = serde_json::to_string(batch).unwrap_or_default();
-        found.extend(works(&json(
-            agent
-                .post("https://play.dlsite.com/api/v3/content/works")
-                .header("Content-Type", "application/json")
-                .send(body),
-            "the DLsite works",
-        )?));
+    Ok(Session { agent })
+}
+
+/// Sign in and list every purchased work.
+pub fn fetch_purchases(account: &DlsiteAccount) -> Result<Vec<Work>, String> {
+    sign_in(account)?.purchases()
+}
+
+/// A file of a work's download.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteFile {
+    pub name: String,
+    pub url: String,
+}
+
+impl Session {
+    /// Every purchased work.
+    pub fn purchases(&self) -> Result<Vec<Work>, String> {
+        let bought = sales(&json(
+            self.agent
+                .get("https://play.dlsite.com/api/v3/content/sales?last=0")
+                .call(),
+            "the DLsite purchases",
+        )?);
+        let mut found = Vec::new();
+        for batch in bought.chunks(WORKS_PER_REQUEST) {
+            let body = serde_json::to_string(batch).unwrap_or_default();
+            found.extend(works(&json(
+                self.agent
+                    .post("https://play.dlsite.com/api/v3/content/works")
+                    .header("Content-Type", "application/json")
+                    .send(body),
+                "the DLsite works",
+            )?));
+        }
+        Ok(found)
     }
-    Ok(found)
+
+    /// The download pages of a work, in order: one archive, or the parts of a split one.
+    /// A work with serial numbers downloads like any other (the numbers are on DLsite).
+    /// Each page is `resolve`d just before its file is fetched: DLsite serves the part
+    /// whose page was opened last.
+    pub fn parts(&self, id: &str) -> Result<Vec<String>, String> {
+        let start = self.location(&format!(
+            "https://play.dlsite.com/api/v3/download?workno={id}"
+        ))?;
+        let pages = if start.contains("/download/split/") {
+            let parts = split_parts(&text(
+                self.agent.get(&start).call(),
+                "DLsite's page of a split download",
+            )?);
+            if parts.is_empty() {
+                return Err(format!("DLsite lists no parts for {id}"));
+            }
+            parts
+        } else if start.contains("/serial/") {
+            vec![format!(
+                "https://www.dlsite.com/home/download/=/product_id/{id}.html"
+            )]
+        } else {
+            vec![start]
+        };
+        Ok(pages)
+    }
+
+    /// The file a download page gives.
+    pub fn resolve(&self, page: &str) -> Result<RemoteFile, String> {
+        let url = self.location(page)?;
+        let name = file_name(&url).ok_or_else(|| format!("{page} does not give a file: {url}"))?;
+        Ok(RemoteFile { name, url })
+    }
+
+    /// Where `url` leads.
+    fn location(&self, url: &str) -> Result<String, String> {
+        let response = self
+            .agent
+            .get(url)
+            .config()
+            .max_redirects(0)
+            .build()
+            .call()
+            .map_err(|err| format!("{url}: {err}"))?;
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok());
+        match location {
+            Some(path) if path.starts_with('/') => Ok(format!("https://www.dlsite.com{path}")),
+            Some(url) => Ok(url.to_owned()),
+            None => Err(format!("{url}: no download (HTTP {})", response.status())),
+        }
+    }
+
+    /// Download `file` to `path`, going on from a part already there. `progress`
+    /// hears the bytes on disk and the whole size now and then.
+    pub fn fetch(
+        &self,
+        file: &RemoteFile,
+        path: &Path,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), String> {
+        let failed = |err: &dyn std::fmt::Display| format!("{}: {err}", file.name);
+        let have = std::fs::metadata(path).map_or(0, |meta| meta.len());
+        let request = self.agent.get(&file.url);
+        let request = if have > 0 {
+            request.header("Range", format!("bytes={have}-"))
+        } else {
+            request
+        };
+        let mut response = match request
+            .config()
+            .timeout_global(Some(DOWNLOAD_TIMEOUT))
+            .build()
+            .call()
+        {
+            Ok(response) => response,
+            // Nothing is left after the part already there.
+            Err(ureq::Error::StatusCode(416)) if have > 0 => return Ok(()),
+            Err(err) => return Err(failed(&err)),
+        };
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        if header("content-type").is_some_and(|kind| kind.contains("html")) {
+            return Err(failed(&"DLsite answered with a page instead of the file"));
+        }
+        let resumed = response.status() == 206;
+        let start = if resumed { have } else { 0 };
+        let total = header("content-range")
+            .and_then(|range| content_total(&range))
+            .or_else(|| {
+                header("content-length")
+                    .and_then(|length| length.parse::<u64>().ok())
+                    .map(|length| start + length)
+            })
+            .ok_or_else(|| failed(&"DLsite did not say how big it is"))?;
+        let mut out = if resumed {
+            std::fs::OpenOptions::new().append(true).open(path)
+        } else {
+            std::fs::File::create(path)
+        }
+        .map_err(|err| failed(&err))?;
+        let mut reader = response.body_mut().with_config().limit(u64::MAX).reader();
+        let mut buffer = vec![0; 1 << 20];
+        let mut written = start;
+        let mut reported = start;
+        loop {
+            let read = reader.read(&mut buffer).map_err(|err| failed(&err))?;
+            if read == 0 {
+                break;
+            }
+            out.write_all(&buffer[..read]).map_err(|err| failed(&err))?;
+            written += read as u64;
+            if written - reported >= PROGRESS_STEP {
+                progress(written, total);
+                reported = written;
+            }
+        }
+        progress(written, total);
+        if written == total {
+            Ok(())
+        } else {
+            Err(failed(&format!("got {written} of {total} bytes")))
+        }
+    }
 }
 
 /// Main pictures of works by ID, from DLsite's public product information.
@@ -115,7 +285,7 @@ pub fn fetch_public_images(ids: &[String]) -> Result<HashMap<String, String>, St
 }
 
 /// A purchased work.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Work {
     /// Such as `RJ01464588`.
     pub id: String,
@@ -123,6 +293,55 @@ pub struct Work {
     pub maker: String,
     /// The main picture's URL.
     pub image: Option<String>,
+    /// DLsite's work type, such as `RPG` or `SOU` (voice).
+    pub kind: String,
+    /// Whether it runs on Windows.
+    pub windows: bool,
+    /// When its latest version came out (its last update, else its release), as DLsite
+    /// writes it.
+    pub version: String,
+}
+
+/// The download links on DLsite's page for a work split into parts, in order.
+pub fn split_parts(html: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for link in html
+        .split("href=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+    {
+        if !link.contains("/download/=/number/") {
+            continue;
+        }
+        let link = if link.starts_with('/') {
+            format!("https://www.dlsite.com{link}")
+        } else {
+            link.to_owned()
+        };
+        if !parts.contains(&link) {
+            parts.push(link);
+        }
+    }
+    parts
+}
+
+/// The name of the file a download URL serves (`…/file/<name>/…`), when it is a plain
+/// file name.
+pub fn file_name(url: &str) -> Option<String> {
+    let name = url.split("/file/").nth(1)?.split(['/', '?']).next()?;
+    let plain =
+        !name.is_empty() && name.chars().any(|c| c != '.') && !name.contains(['\\', ':', '\0']);
+    plain.then(|| name.to_owned())
+}
+
+/// The whole size in a `Content-Range` header, such as `bytes 0-0/478276006`.
+pub fn content_total(range: &str) -> Option<u64> {
+    range
+        .strip_prefix("bytes ")?
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// The `_token` hidden field of DLsite's login form.
@@ -166,11 +385,20 @@ pub fn works(answer: &Value) -> Vec<Work> {
         .into_iter()
         .flatten()
         .filter_map(|work| {
+            let date = |key: &str| work[key].as_str().filter(|d| !d.is_empty());
             Some(Work {
                 id: work["workno"].as_str()?.to_owned(),
                 name: localized(&work["name"]).unwrap_or_default(),
                 maker: localized(&work["maker"]["name"]).unwrap_or_default(),
                 image: work["work_files"]["main"].as_str().map(str::to_owned),
+                kind: work["work_type"].as_str().unwrap_or_default().to_owned(),
+                windows: work["os"]
+                    .as_array()
+                    .is_some_and(|os| os.iter().any(|o| o == "windows")),
+                version: date("upgrade_date")
+                    .or_else(|| date("regist_date"))
+                    .unwrap_or_default()
+                    .to_owned(),
             })
         })
         .collect()
@@ -199,7 +427,10 @@ pub fn public_images(answer: &Value) -> Vec<(String, String)> {
 mod tests {
     use serde_json::json;
 
-    use super::{Work, login_token, public_images, sales, signed_in, works};
+    use super::{
+        Work, content_total, file_name, login_token, public_images, sales, signed_in, split_parts,
+        works,
+    };
 
     #[test]
     fn finds_the_login_forms_token() {
@@ -232,13 +463,21 @@ mod tests {
                 "workno": "RJ01464588",
                 "name": {"ja_JP": "ギャルベヤ！?", "en_US": "Gal Room"},
                 "maker": {"id": "RG01", "name": {"ja_JP": "サークル"}},
-                "work_files": {"main": "https://img.dlsite.jp/a_img_main.jpg", "sam": "https://img.dlsite.jp/a_img_sam.jpg"}
+                "work_files": {"main": "https://img.dlsite.jp/a_img_main.jpg", "sam": "https://img.dlsite.jp/a_img_sam.jpg"},
+                "work_type": "RPG",
+                "os": ["android", "windows"],
+                "regist_date": "2023-05-17T15:00:00.000000Z",
+                "upgrade_date": "2025-11-09T15:00:00.000000Z"
             },
             {
                 "workno": "VJ0001",
                 "name": {"en_US": "Only English"},
                 "maker": {"name": {"en_US": "Brand"}},
-                "work_files": {}
+                "work_files": {},
+                "work_type": "ADV",
+                "os": ["android"],
+                "regist_date": "2005-10-02T15:00:00.000000Z",
+                "upgrade_date": null
             },
             {"name": {"ja_JP": "no id"}}
         ]});
@@ -250,12 +489,18 @@ mod tests {
                     name: "ギャルベヤ！?".into(),
                     maker: "サークル".into(),
                     image: Some("https://img.dlsite.jp/a_img_main.jpg".into()),
+                    kind: "RPG".into(),
+                    windows: true,
+                    version: "2025-11-09T15:00:00.000000Z".into(),
                 },
                 Work {
                     id: "VJ0001".into(),
                     name: "Only English".into(),
                     maker: "Brand".into(),
                     image: None,
+                    kind: "ADV".into(),
+                    windows: false,
+                    version: "2005-10-02T15:00:00.000000Z".into(),
                 },
             ]
         );
@@ -275,5 +520,53 @@ mod tests {
                     .to_owned()
             )]
         );
+    }
+
+    #[test]
+    fn finds_the_parts_of_a_split_download() {
+        let html = r#"<table>
+            <a href="https://www.dlsite.com/home/download/=/number/1/product_id/RJ263258.html">part1</a>
+            <a href="https://www.dlsite.com/home/download/=/number/2/product_id/RJ263258.html">part2</a>
+            <a href="https://www.dlsite.com/home/download/=/number/2/product_id/RJ263258.html">again</a>
+            <a href="https://www.dlsite.com/home/work/=/product_id/RJ263258.html">the work</a>
+            <a href="/home/download/=/number/3/product_id/RJ263258.html">part3</a>
+        </table>"#;
+        assert_eq!(
+            split_parts(html),
+            [
+                "https://www.dlsite.com/home/download/=/number/1/product_id/RJ263258.html",
+                "https://www.dlsite.com/home/download/=/number/2/product_id/RJ263258.html",
+                "https://www.dlsite.com/home/download/=/number/3/product_id/RJ263258.html",
+            ]
+        );
+        assert!(split_parts("<p>no parts</p>").is_empty());
+    }
+
+    #[test]
+    fn names_the_downloaded_file() {
+        assert_eq!(
+            file_name("https://download.dlsite.com/get/=/type/work/domain/doujin/dir/RJ264000/file/RJ263258.part1.exe/_/20200522121604?update_date=20200522121604").as_deref(),
+            Some("RJ263258.part1.exe")
+        );
+        assert_eq!(
+            file_name("https://download.dlsite.com/get/=/file/RJ004727.zip/_/1").as_deref(),
+            Some("RJ004727.zip")
+        );
+        assert_eq!(
+            file_name("https://download.dlsite.com/get/=/file/../_/1"),
+            None
+        );
+        assert_eq!(
+            file_name("https://www.dlsite.com/home/download/=/product_id/RJ1.html"),
+            None
+        );
+    }
+
+    #[test]
+    fn reads_the_whole_size_of_a_range() {
+        assert_eq!(content_total("bytes 0-0/478276006"), Some(478_276_006));
+        assert_eq!(content_total("bytes */123"), Some(123));
+        assert_eq!(content_total("bytes 0-9/*"), None);
+        assert_eq!(content_total("nonsense"), None);
     }
 }

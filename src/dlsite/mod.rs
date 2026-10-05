@@ -1,5 +1,7 @@
 //! A DLsite game library read from the folders DLsiteNest makes, `<root>\<maker>\<title>`,
-//! so it keeps working without DLsiteNest. Which DLsite work each folder is, labels, the
+//! so it keeps working without DLsiteNest. With the account in `secrets.yaml`, the
+//! games bought but not there yet are downloaded into the same layout, and updated
+//! games are brought up to date. Which DLsite work each folder is, labels, the
 //! chosen programs and when each game was last started are kept in windows-link's
 //! database. A game goes by its work ID once known, else by an ID from its folder.
 
@@ -18,6 +20,7 @@ use crate::library::{
     GameLibrary, Item, Label, LabelError, Listing, Picture, Programs, Start, StartError,
 };
 
+pub mod download;
 pub mod nest;
 pub mod play;
 
@@ -174,9 +177,19 @@ impl DlsiteStore {
              CREATE TABLE IF NOT EXISTS dlsite_games (
                  work_id TEXT PRIMARY KEY,
                  path    TEXT NOT NULL UNIQUE,
-                 image   TEXT
+                 image   TEXT,
+                 version TEXT
              );",
         )?;
+        // The previous version's table has no version yet.
+        let versioned: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('dlsite_games') WHERE name = 'version')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !versioned {
+            conn.execute_batch("ALTER TABLE dlsite_games ADD COLUMN version TEXT")?;
+        }
         for (position, (id, name)) in FIXED_LABELS.iter().enumerate() {
             conn.execute(
                 "INSERT OR IGNORE INTO dlsite_labels (id, name, position) VALUES (?1, ?2, ?3)",
@@ -369,6 +382,50 @@ impl DlsiteStore {
         saving.commit()
     }
 
+    /// The version of each game windows-link downloaded or found current, by work ID.
+    pub fn versions(&self) -> rusqlite::Result<HashMap<String, String>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT work_id, version FROM dlsite_games WHERE version IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Remember that a game's folder holds `version`.
+    pub fn set_version(&self, work: &str, version: &str) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "UPDATE dlsite_games SET version = ?2 WHERE work_id = ?1",
+            params![work, version],
+        )?;
+        Ok(())
+    }
+
+    /// Record a work downloaded into `folder` at `version`, keeping the picture known
+    /// before when there is no new one.
+    pub fn record_download(
+        &self,
+        work: &str,
+        folder: &Path,
+        image: Option<&str>,
+        version: &str,
+    ) -> rusqlite::Result<()> {
+        let path = folder_key(folder);
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM dlsite_games WHERE path = ?1 AND work_id <> ?2",
+            params![path, work],
+        )?;
+        conn.execute(
+            "INSERT INTO dlsite_games (work_id, path, image, version) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (work_id) DO UPDATE SET
+                 path = excluded.path,
+                 image = COALESCE(excluded.image, dlsite_games.image),
+                 version = excluded.version",
+            params![work, path, image, version],
+        )?;
+        Ok(())
+    }
+
     /// Record a start, ordered after every earlier one.
     pub fn mark_started(&self, item: &str) -> rusqlite::Result<()> {
         self.conn().execute(
@@ -404,7 +461,8 @@ pub fn scan(root: &Path) -> Result<Vec<(Title, Vec<String>)>, String> {
     }
     let mut games = Vec::new();
     let (_, makers) = file_names(root);
-    for maker in makers {
+    // `.windows-link` holds downloads in progress.
+    for maker in makers.into_iter().filter(|maker| !maker.starts_with('.')) {
         let (_, names) = file_names(&root.join(&maker));
         for name in names {
             // DLsiteNest keeps the previous copy of an updated game as `<title>.bak`.
@@ -455,11 +513,189 @@ fn program_path(folder: &Path, program: &str) -> PathBuf {
 pub struct DlsiteLibrary {
     root: PathBuf,
     store: std::sync::Arc<DlsiteStore>,
+    /// The account's purchases as last read.
+    purchases: Mutex<Vec<play::Work>>,
+    /// How each download or update planned this round is going, by work ID.
+    progress: Mutex<HashMap<String, String>>,
 }
+
+/// The status of a game waiting to be downloaded.
+const WAITING: &str = "ダウンロード待ち";
 
 impl DlsiteLibrary {
     pub fn new(root: PathBuf, store: std::sync::Arc<DlsiteStore>) -> Self {
-        Self { root, store }
+        Self {
+            root,
+            store,
+            purchases: Mutex::default(),
+            progress: Mutex::default(),
+        }
+    }
+
+    fn progress(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Download the games bought but not in the folder yet, and update those whose
+    /// folder is older than their latest version, one at a time. Needs the purchases
+    /// `refresh` read. Failures are logged and shown in the listing, and tried again
+    /// next time.
+    pub fn download(&self, account: Option<&crate::secrets::DlsiteAccount>) {
+        let Some(account) = account else {
+            return;
+        };
+        let purchases = self
+            .purchases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Ok(games) = scan(&self.root) else {
+            return;
+        };
+        let records = self.store.games().unwrap_or_default();
+        let versions = self.store.versions().unwrap_or_default();
+        let on_disk: HashMap<String, download::OnDisk> = games
+            .iter()
+            .filter_map(|(title, _)| {
+                let work = &records.get(&folder_key(&title.folder))?.work;
+                let disk = download::OnDisk {
+                    folder: title.folder.clone(),
+                    version: versions.get(work).cloned(),
+                    modified: title.modified,
+                };
+                Some((work.clone(), disk))
+            })
+            .collect();
+        let plan = download::plan(&purchases, &on_disk);
+        for (work, version) in &plan.current {
+            let _ = self.store.set_version(&work.id, version);
+        }
+        {
+            let mut progress = self.progress();
+            progress.clear();
+            for work in &plan.fresh {
+                progress.insert(work.id.clone(), WAITING.to_owned());
+            }
+            for (work, _) in &plan.updates {
+                progress.insert(work.id.clone(), "更新待ち".to_owned());
+            }
+        }
+        tracing::info!(
+            new = plan.fresh.len(),
+            updates = plan.updates.len(),
+            "DLsite downloads planned"
+        );
+        let jobs = plan.fresh.iter().map(|work| (*work, None)).chain(
+            plan.updates
+                .iter()
+                .map(|(work, folder)| (*work, Some(folder.as_path()))),
+        );
+        let (mut done, mut failed) = (0, 0);
+        for (work, folder) in jobs {
+            match self.download_one(account, work, folder) {
+                Ok(folder) => {
+                    done += 1;
+                    self.progress().remove(&work.id);
+                    tracing::info!(work = %work.id, folder = %folder.display(), "DLsite game downloaded");
+                }
+                Err(reason) => {
+                    failed += 1;
+                    let verb = if folder.is_some() {
+                        "更新"
+                    } else {
+                        "ダウンロード"
+                    };
+                    self.progress()
+                        .insert(work.id.clone(), format!("{verb}に失敗: {reason}"));
+                    tracing::warn!(work = %work.id, %reason, "cannot download a DLsite game");
+                }
+            }
+        }
+        tracing::info!(done, failed, "DLsite downloads finished");
+    }
+
+    /// Download one work into a new folder, or over `folder` to update it. The files
+    /// wait in `<root>\.windows-link\<ID>` until they are in place, so a stopped
+    /// download goes on next time.
+    fn download_one(
+        &self,
+        account: &crate::secrets::DlsiteAccount,
+        work: &play::Work,
+        folder: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        let verb = if folder.is_some() {
+            "更新"
+        } else {
+            "ダウンロード"
+        };
+        let session = play::sign_in(account)?;
+        let staging = self.root.join(".windows-link").join(&work.id);
+        std::fs::create_dir_all(&staging).map_err(|err| format!("{}: {err}", staging.display()))?;
+        let mut files = Vec::new();
+        for page in session.parts(&work.id)? {
+            let file = session.resolve(&page)?;
+            session.fetch(&file, &staging.join(&file.name), &mut |have, total| {
+                let percent = have * 100 / total.max(1);
+                self.progress()
+                    .insert(work.id.clone(), format!("{verb}中 {percent}%"));
+            })?;
+            files.push(file);
+        }
+        self.progress().insert(work.id.clone(), "展開中".to_owned());
+        let out = staging.join("out");
+        let _ = std::fs::remove_dir_all(&out);
+        let first = staging.join(&files.first().ok_or("DLsite gave no files")?.name);
+        let placed = download::unpack(&first, &out).and_then(|()| {
+            let target = folder.map_or_else(|| self.new_folder(work), Path::to_path_buf);
+            download::place(&download::content_root(&out, &target), &target)
+                .map_err(|err| format!("{}: {err}", target.display()))?;
+            Ok(target)
+        });
+        match placed {
+            Ok(target) => {
+                self.store
+                    .record_download(&work.id, &target, work.image.as_deref(), &work.version)
+                    .map_err(|err| err.to_string())?;
+                let _ = std::fs::remove_dir_all(&staging);
+                Ok(target)
+            }
+            Err(reason) => {
+                let _ = std::fs::remove_dir_all(&out);
+                Err(reason)
+            }
+        }
+    }
+
+    /// Where a new game goes: `<root>\<maker>\<title>`, or with its work ID after the
+    /// title when another game has that folder.
+    fn new_folder(&self, work: &play::Work) -> PathBuf {
+        let maker = self.root.join(download::folder_name(&work.maker));
+        let title = download::folder_name(&work.name);
+        let folder = maker.join(&title);
+        if folder.exists() {
+            maker.join(format!("{title} ({})", work.id))
+        } else {
+            folder
+        }
+    }
+
+    /// Why a game bought but not here cannot start yet, or `None` when `id` is not one.
+    fn not_downloaded(&self, id: &str) -> Option<String> {
+        let purchases = self
+            .purchases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        purchases
+            .iter()
+            .any(|work| work.id == id && download::is_game(work))
+            .then(|| {
+                self.progress()
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| WAITING.to_owned())
+            })
     }
 
     /// Move what the previous version knew (`dlsite_works`, by folder ID) into
@@ -518,6 +754,12 @@ impl DlsiteLibrary {
         let purchases = match account.map(play::fetch_purchases) {
             Some(Ok(works)) => {
                 tracing::info!(works = works.len(), "DLsite purchases read");
+                works.clone_into(
+                    &mut self
+                        .purchases
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
                 works
             }
             Some(Err(reason)) => {
@@ -624,11 +866,26 @@ impl GameLibrary for DlsiteLibrary {
         if games.is_empty() {
             listing.partial = Some(format!("there are no games in {}", self.root.display()));
         }
+        let progress = self.progress().clone();
+        for item in &mut listing.items {
+            item.status = progress.get(&item.id).cloned();
+        }
+        let here: HashSet<String> = listing.items.iter().map(|i| i.id.clone()).collect();
+        let purchases = self
+            .purchases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let coming = waiting(&purchases, &here, &labels, &progress);
+        listing.items.splice(0..0, coming);
         listing
     }
 
     fn start(&self, id: &str) -> Result<Start, StartError> {
-        let (title, candidates) = self.find(id).ok_or(StartError::NotFound)?;
+        let Some((title, candidates)) = self.find(id) else {
+            return Err(self
+                .not_downloaded(id)
+                .map_or(StartError::NotFound, StartError::NotDownloaded));
+        };
         if candidates.is_empty() {
             return Err(StartError::NoProgram);
         }
@@ -848,6 +1105,40 @@ pub fn identify(
         .collect()
 }
 
+/// The games bought but not in the folder yet (by work ID, with DLsite's name, maker and
+/// picture), and how getting each is going.
+#[allow(clippy::implicit_hasher, reason = "built by the library")]
+pub fn waiting(
+    purchases: &[play::Work],
+    here: &HashSet<String>,
+    labels: &[(Label, HashSet<String>)],
+    progress: &HashMap<String, String>,
+) -> Vec<Item> {
+    purchases
+        .iter()
+        .filter(|work| download::is_game(work) && !here.contains(&work.id))
+        .map(|work| Item {
+            id: work.id.clone(),
+            name: work.name.clone(),
+            detail: Some(work.maker.clone()),
+            choosable: false,
+            image: work.image.clone(),
+            installed: false,
+            labels: labels
+                .iter()
+                .filter(|(_, items)| items.contains(&work.id))
+                .map(|(label, _)| label.id.clone())
+                .collect(),
+            status: Some(
+                progress
+                    .get(&work.id)
+                    .cloned()
+                    .unwrap_or_else(|| WAITING.to_owned()),
+            ),
+        })
+        .collect()
+}
+
 /// The listing: most recently started first, then most recently installed. `images`
 /// are the DLsite pictures by game ID.
 #[allow(clippy::implicit_hasher, reason = "the maps come from the store")]
@@ -875,6 +1166,7 @@ pub fn listing(
                 choosable: programs.len() > 1,
                 image: images.get(&title.id).cloned(),
                 installed: true,
+                status: None,
                 labels: labels
                     .iter()
                     .filter(|(_, items)| items.contains(&title.id))
@@ -948,6 +1240,7 @@ mod tests {
             name: name.into(),
             maker: maker.into(),
             image: image.map(str::to_owned),
+            ..Work::default()
         };
         let purchases = [
             work(
@@ -1151,6 +1444,8 @@ mod tests {
             ("Other/None", &["readme.txt"][..]),
             // A backup DLsiteNest leaves next to a game is not a game.
             ("Maker/One.bak", &["One.exe"][..]),
+            // Nor are windows-link's downloads in progress.
+            (".windows-link/RJ1", &["RJ1.zip"][..]),
         ] {
             let dir = root.join(folder);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1258,6 +1553,7 @@ mod tests {
                 name: name.into(),
                 maker: "Maker".into(),
                 image: Some("https://img/9.jpg".into()),
+                ..Work::default()
             }];
             let known = identify(
                 &titles,
@@ -1366,6 +1662,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(left, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_download_is_remembered_with_its_version() {
+        let store = DlsiteStore::in_memory().unwrap();
+        store
+            .record_download(
+                "RJ1",
+                std::path::Path::new(r"D:\Game\M\T"),
+                Some("https://img/1.jpg"),
+                "2024-01-01",
+            )
+            .unwrap();
+        store
+            .record_download(
+                "RJ1",
+                std::path::Path::new(r"D:\Game\M\T"),
+                None,
+                "2025-01-01",
+            )
+            .unwrap();
+        assert_eq!(
+            store.versions().unwrap(),
+            HashMap::from([("RJ1".to_owned(), "2025-01-01".to_owned())])
+        );
+        let games = store.games().unwrap();
+        let known = &games[r"d:\game\m\t"];
+        assert_eq!(known.work, "RJ1");
+        assert_eq!(known.image.as_deref(), Some("https://img/1.jpg"));
+        store.set_version("RJ1", "2026-01-01").unwrap();
+        assert_eq!(store.versions().unwrap()["RJ1"], "2026-01-01");
+    }
+
+    #[test]
+    fn bought_games_not_here_yet_are_listed_first_and_cannot_start() {
+        use super::play::Work;
+
+        let root = games("waiting");
+        let library = library(&root);
+        let bought = |id: &str, name: &str, kind: &str, windows: bool| Work {
+            id: id.into(),
+            name: name.into(),
+            maker: "Brand".into(),
+            image: Some(format!("https://img/{id}.jpg")),
+            kind: kind.into(),
+            windows,
+            version: "2024-01-01T00:00:00.000000Z".into(),
+        };
+        *library.purchases.lock().unwrap() = vec![
+            bought("RJ7", "Coming", "RPG", true),
+            bought("RJ8", "Downloading", "SLN", true),
+            bought("RJ9", "Voice", "SOU", true),
+            bought("RJ10", "Phone", "ADV", false),
+        ];
+        library
+            .progress
+            .lock()
+            .unwrap()
+            .insert("RJ8".into(), "ダウンロード中 40%".into());
+        library.set_label("favorite", "RJ7", true).unwrap();
+        let listing = library.listing();
+        let rows: Vec<_> = listing
+            .items
+            .iter()
+            .map(|i| (i.id.as_str(), i.installed, i.status.as_deref()))
+            .take(3)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("RJ7", false, Some("ダウンロード待ち")),
+                ("RJ8", false, Some("ダウンロード中 40%")),
+                (listing.items[2].id.as_str(), true, None),
+            ]
+        );
+        assert_eq!(listing.items.len(), 5);
+        let coming = &listing.items[0];
+        assert_eq!(coming.name, "Coming");
+        assert_eq!(coming.detail.as_deref(), Some("Brand"));
+        assert_eq!(coming.image.as_deref(), Some("https://img/RJ7.jpg"));
+        assert_eq!(coming.labels, ["favorite"]);
+        assert_eq!(
+            library.start("RJ8"),
+            Err(StartError::NotDownloaded("ダウンロード中 40%".into()))
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

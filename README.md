@@ -225,7 +225,9 @@ collection file and `labels_locked` says why they cannot be changed. Names must 
 
 A `dlsite.library` button gives a panel the DLsite games in the folders DLsiteNest makes,
 `<maker>\<title>` under `D:\DLsiteNest\Game`, leaving out the `<title>.bak` copies
-DLsiteNest keeps of updated games; DLsiteNest itself is not needed. For
+DLsiteNest keeps of updated games; DLsiteNest itself is not needed. With a DLsite account,
+windows-link also downloads the games bought but not there yet and keeps every game up to
+date ([Downloads and updates](#downloads-and-updates)). For
 example in `desktops/アダルト.yaml`:
 
 ```yaml
@@ -267,7 +269,7 @@ state says `"pictures": "whole"`, as both are shown whole.
 
   Pictures come from the purchases, or from DLsite's public product information for works
   known only through DLsiteNest. The account is also what downloading and updating games
-  will use. Put it in `secrets.yaml` (a login ID and password; signing in through Google
+  uses. Put it in `secrets.yaml` (a login ID and password; signing in through Google
   or other services is not supported) and restart windows-link:
 
   ```yaml
@@ -278,6 +280,35 @@ state says `"pictures": "whole"`, as both are shown whole.
 
   The log says how many purchases were read and games identified, which are not, or why
   signing in failed (such as DLsite asking for a CAPTCHA, which windows-link does not answer).
+
+### Downloads and updates
+
+After working out the games (at start and every 6 hours), windows-link downloads, one at a
+time, the purchased games that are not in the folder yet, then the updates. Nothing pops
+up; the panel's list and the log show how it goes.
+
+- **Which games**: games (DLsite's game work types) that run on Windows. The AI-translated
+  game data in other languages that comes with some purchases (`…ゲームデータ（AI翻訳）`),
+  phone-only games and other works (voice, manga, video) are left out.
+- **In the list**: a game not here yet is listed first by its work ID, with its maker and
+  picture, `installed: false` and a `status` such as `ダウンロード待ち`, `ダウンロード中 40%`,
+  `展開中` or why it failed; an updating game has a `status` too. Starting one not here yet
+  answers `409 not_downloaded` with its status.
+- **Where**: a new game goes to `<root>\<maker>\<title>`, named as DLsiteNest names folders
+  (characters Windows does not allow become `_`, dots are left out), with its work ID after
+  the title when that folder is taken. DLsite's archives wrap the game in a folder named
+  after the work; that folder is left out. The download waits in `<root>\.windows-link\<ID>`
+  (not listed) until it is unpacked and in place, so a stopped download goes on next time.
+  ZIPs are unpacked with Windows' own `tar.exe` (names without the UTF-8 mark read as
+  CP932); RARs, which DLsite uses for works split into parts, with UnRAR.
+- **Updates**: a game's version is DLsite's `upgrade_date` (else its release date), kept in
+  `dlsite_games.version`. A folder windows-link filled is updated when DLsite has a newer
+  version; a folder DLsiteNest filled is taken as current when it changed after the latest
+  version came out, and updated otherwise. An update is laid over the folder: new files
+  are added, files are replaced except saves (anything under a folder or named with
+  `save` in it), and files the update lacks stay.
+- **Failures** (DLsite refusing, a full disk, an archive that does not unpack) are logged,
+  shown as the game's `status`, and tried again 6 hours later.
 
 ## Discord
 
@@ -525,4 +556,6 @@ cargo run --example steam_labels -- 105600   # an app ID you own
 
 ## License
 
-MIT
+MIT. The released exe includes UnRAR (through the [unrar](https://crates.io/crates/unrar) crate),
+which comes under the [UnRAR license](https://www.rarlab.com/license.htm): it may be used to
+unpack RAR archives but not to make a RAR-compatible archiver.

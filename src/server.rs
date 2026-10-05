@@ -1268,6 +1268,15 @@ buttons:
     }
 
     #[tokio::test]
+    async fn a_game_still_downloading_says_how_it_is_going() {
+        let (state, _) = library_state();
+        let (status, body) = call(state, "POST", "/buttons/games/library/6/start").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_downloaded");
+        assert_eq!(body["message"], "ダウンロード中 40%");
+    }
+
+    #[tokio::test]
     async fn a_game_with_several_programs_asks_once_which_one() {
         use serde_json::json;
 
