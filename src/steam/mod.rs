@@ -1,6 +1,7 @@
 //! The Steam library: owned games from the Steam Web API, install state from the Steam
 //! folder's manifests, and the user's collections, for a `steam.library` button.
 
+pub mod client;
 pub mod vdf;
 
 use std::{
@@ -14,7 +15,7 @@ use std::{
 use tracing::{info, warn};
 
 use crate::{
-    library::{GameLibrary, Item, Listing, Picture, Start},
+    library::{GameLibrary, Item, Label, LabelError, Listing, Picture, Start},
     secrets::SteamKey,
 };
 
@@ -58,6 +59,8 @@ pub fn steam_dir() -> PathBuf {
 pub struct SteamLibrary {
     dir: PathBuf,
     key: Option<String>,
+    /// Steam itself, for live collections and for changing them.
+    client: Arc<dyn client::Client>,
     /// The last fetched owned games, or why there are none.
     owned: Mutex<Result<Vec<Owned>, String>>,
 }
@@ -72,8 +75,46 @@ impl SteamLibrary {
         Self {
             dir,
             key: key.map(|k| k.api_key),
+            client: Arc::new(client::CefClient::new()),
             owned: Mutex::new(Err(reason.to_owned())),
         }
+    }
+
+    /// Reach Steam through `client` instead (tests use a fake).
+    #[must_use]
+    pub fn with_client(mut self, client: Arc<dyn client::Client>) -> Self {
+        self.client = client;
+        self
+    }
+
+    /// Steam's current collections, or those in its file and why they cannot be
+    /// changed now.
+    fn live_collections(&self) -> (Vec<Collection>, Option<String>) {
+        let read =
+            self.client
+                .evaluate(&client::scripts::collections())
+                .map_err(|err| match err {
+                    client::ClientError::Unavailable(reason)
+                    | client::ClientError::Script(reason) => reason,
+                })
+                .and_then(|value| client::parse_collections(&value));
+        match read {
+            Ok(collections) => (collections, None),
+            Err(reason) => (self.collections(), Some(reason)),
+        }
+    }
+
+    fn change(&self, script: &str) -> Result<serde_json::Value, LabelError> {
+        self.client.evaluate(script).map_err(|err| match err {
+            client::ClientError::Unavailable(reason) => LabelError::Unavailable(reason),
+            client::ClientError::Script(message) if message.contains("NOT_FOUND") => {
+                LabelError::NotFound
+            }
+            client::ClientError::Script(message) if message.contains("STORE_NOT_READY") => {
+                LabelError::Unavailable("Steam's library is not ready yet".into())
+            }
+            client::ClientError::Script(message) => LabelError::Failed(message),
+        })
     }
 
     fn account(&self) -> Option<u64> {
@@ -161,13 +202,16 @@ impl SteamLibrary {
 impl GameLibrary for SteamLibrary {
     fn listing(&self) -> Listing {
         let installed = self.installed();
-        let collections = self.collections();
+        let (collections, locked) = self.live_collections();
         let owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
-        listing(
-            owned.as_deref().map_err(String::as_str),
-            &installed,
-            &collections,
-        )
+        Listing {
+            labels_locked: locked,
+            ..listing(
+                owned.as_deref().map_err(String::as_str),
+                &installed,
+                &collections,
+            )
+        }
     }
 
     /// An installed game runs through Steam; an owned one opens Steam's install dialog.
@@ -189,6 +233,40 @@ impl GameLibrary for SteamLibrary {
                 open: format!("steam://install/{app_id}"),
                 folder: None,
             })
+    }
+
+    fn folder(&self, id: &str) -> Option<PathBuf> {
+        let app_id: u32 = id.parse().ok()?;
+        self.installed()
+            .into_iter()
+            .find(|g| g.app_id == app_id)
+            .map(|g| g.folder)
+    }
+
+    fn create_label(&self, name: &str) -> Result<Label, LabelError> {
+        let made = self.change(&client::scripts::create(name))?;
+        let id = made["id"].as_str().ok_or_else(|| {
+            LabelError::Failed(format!("Steam did not say the new label's id: {made}"))
+        })?;
+        Ok(Label {
+            id: id.to_owned(),
+            name: made["name"].as_str().unwrap_or(name).to_owned(),
+            editable: true,
+        })
+    }
+
+    fn rename_label(&self, label: &str, name: &str) -> Result<(), LabelError> {
+        self.change(&client::scripts::rename(label, name)).map(drop)
+    }
+
+    fn delete_label(&self, label: &str) -> Result<(), LabelError> {
+        self.change(&client::scripts::delete(label)).map(drop)
+    }
+
+    fn set_label(&self, label: &str, item: &str, on: bool) -> Result<(), LabelError> {
+        let app_id: u32 = item.parse().map_err(|_| LabelError::NotFound)?;
+        self.change(&client::scripts::set(label, app_id, on))
+            .map(drop)
     }
 
     fn picture(&self, id: &str) -> Option<Picture> {
@@ -282,12 +360,17 @@ pub struct Installed {
     pub last_played: u64,
 }
 
-/// A collection the user made by hand (dynamic collections are left out).
+/// A collection the user made by hand (dynamic collections are left out), or one of
+/// Steam's own: `favorite` and `hidden`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Collection {
+    pub id: String,
     pub name: String,
     pub apps: HashSet<u32>,
 }
+
+/// Steam's own collections, which hold games but cannot be renamed or deleted.
+pub const FIXED_COLLECTIONS: [&str; 2] = ["favorite", "hidden"];
 
 /// `StateFlags` bit of a game whose files are all in place.
 const FULLY_INSTALLED: u32 = 4;
@@ -362,6 +445,7 @@ pub fn collections(cloud_storage: &str) -> Vec<Collection> {
     }
     #[derive(serde::Deserialize)]
     struct Value {
+        id: String,
         name: String,
         #[serde(default)]
         added: Vec<u32>,
@@ -381,6 +465,7 @@ pub fn collections(cloud_storage: &str) -> Vec<Collection> {
         .map(|value| {
             let removed: HashSet<u32> = value.removed.into_iter().collect();
             Collection {
+                id: value.id,
                 name: value.name,
                 apps: value
                     .added
@@ -470,19 +555,23 @@ pub fn listing(
             labels: collections
                 .iter()
                 .filter(|c| c.apps.contains(&id))
-                .map(|c| c.name.clone())
+                .map(|c| c.id.clone())
                 .collect(),
         })
         .collect();
     let labels = collections
         .iter()
-        .filter(|c| items.iter().any(|item| item.labels.contains(&c.name)))
-        .map(|c| c.name.clone())
+        .map(|c| Label {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            editable: !FIXED_COLLECTIONS.contains(&c.id.as_str()),
+        })
         .collect();
     Listing {
         items,
         labels,
         partial,
+        labels_locked: None,
     }
 }
 
@@ -494,7 +583,7 @@ mod tests {
         Collection, Installed, Owned, collections, installed_app, library_folders, listing,
         owned_games, picture, signed_in_account,
     };
-    use crate::library::Picture;
+    use crate::library::{Label, Picture};
 
     #[test]
     fn the_signed_in_account_is_the_most_recent_or_the_newest() {
@@ -562,10 +651,12 @@ mod tests {
             found,
             [
                 Collection {
+                    id: "favorite".into(),
                     name: "お気に入り".into(),
                     apps: [].into()
                 },
                 Collection {
+                    id: "uc-1".into(),
                     name: "outdate".into(),
                     apps: [10, 30].into()
                 },
@@ -634,10 +725,12 @@ mod tests {
         let local = [installed(2, "Alpha", 100), installed(9, "Not owned", 999)];
         let sets = [
             Collection {
+                id: "favorite".into(),
                 name: "お気に入り".into(),
                 apps: [].into(),
             },
             Collection {
+                id: "uc-1".into(),
                 name: "outdate".into(),
                 apps: [1, 3].into(),
             },
@@ -659,12 +752,26 @@ mod tests {
             rows,
             [
                 ("2", "Alpha", true, vec![]),
-                ("3", "Gamma", false, vec!["outdate".to_owned()]),
-                ("1", "beta", false, vec!["outdate".to_owned()]),
+                ("3", "Gamma", false, vec!["uc-1".to_owned()]),
+                ("1", "beta", false, vec!["uc-1".to_owned()]),
             ]
         );
-        // Labels without any listed game are left out.
-        assert_eq!(listing.labels, ["outdate"]);
+        // Every collection is a label, even an empty one; Steam's own cannot be edited.
+        assert_eq!(
+            listing.labels,
+            [
+                Label {
+                    id: "favorite".into(),
+                    name: "お気に入り".into(),
+                    editable: false
+                },
+                Label {
+                    id: "uc-1".into(),
+                    name: "outdate".into(),
+                    editable: true
+                },
+            ]
+        );
         assert_eq!(listing.partial, None);
     }
 
@@ -732,15 +839,17 @@ mod tests {
         .unwrap();
         std::fs::write(
             cloud.join("cloud-storage-namespace-1.json"),
-            r#"[["user-collections.uc-1",{"value":"{\"name\":\"outdate\",\"added\":[105600],\"removed\":[]}"}]]"#,
+            r#"[["user-collections.uc-1",{"value":"{\"id\":\"uc-1\",\"name\":\"outdate\",\"added\":[105600],\"removed\":[]}"}]]"#,
         )
         .unwrap();
 
-        let library = super::SteamLibrary::new(dir.clone(), None);
+        let library = super::SteamLibrary::new(dir.clone(), None).with_client(std::sync::Arc::new(
+            super::client::fake::FakeClient::default(),
+        ));
         let listing = library.listing();
         assert_eq!(listing.items.len(), 1);
         assert_eq!(listing.items[0].name, "Terraria");
-        assert_eq!(listing.items[0].labels, ["outdate"]);
+        assert_eq!(listing.items[0].labels, ["uc-1"]);
         assert_eq!(
             listing.partial.as_deref(),
             Some("secrets.yaml has no steam api_key")
@@ -753,6 +862,63 @@ mod tests {
             })
         );
         assert_eq!(library.start("1364780"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn labels_come_from_steam_while_it_answers_and_from_its_file_otherwise() {
+        use super::client::{ClientError, NOT_RUNNING, fake::FakeClient};
+        use crate::library::{GameLibrary, LabelError};
+
+        let dir = std::env::temp_dir().join(format!("windows-link-labels-{}", std::process::id()));
+        let apps = dir.join("steamapps");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(
+            apps.join("appmanifest_105600.acf"),
+            "AppState { appid 105600 name Terraria StateFlags 4 installdir Terraria LastPlayed 5 }",
+        )
+        .unwrap();
+        let client = std::sync::Arc::new(FakeClient::default());
+        *client.answers.lock().unwrap() = vec![
+            Ok(serde_json::json!([{"id": "hidden", "name": "非表示", "apps": [105_600]}])),
+            Err(ClientError::Unavailable(NOT_RUNNING.into())),
+            Ok(serde_json::json!({"id": "uc-7", "name": "RPG"})),
+            Err(ClientError::Script("Error: NOT_FOUND".into())),
+            Err(ClientError::Script("TypeError: boom".into())),
+        ];
+        let library = super::SteamLibrary::new(dir.clone(), None).with_client(client.clone());
+
+        let live = library.listing();
+        assert_eq!(live.items[0].labels, ["hidden"]);
+        assert!(!live.labels[0].editable);
+        assert_eq!(live.labels_locked, None);
+
+        // Without Steam the labels are read from its file (none here) and locked.
+        let offline = library.listing();
+        assert!(offline.labels.is_empty());
+        assert_eq!(offline.labels_locked.as_deref(), Some(NOT_RUNNING));
+
+        let made = library.create_label("RPG").unwrap();
+        assert_eq!((made.id.as_str(), made.editable), ("uc-7", true));
+        assert_eq!(
+            library.set_label("uc-7", "105600", true),
+            Err(LabelError::NotFound)
+        );
+        assert!(matches!(
+            library.delete_label("uc-7"),
+            Err(LabelError::Failed(_))
+        ));
+        assert!(matches!(
+            library.rename_label("uc-7", "x"),
+            Err(LabelError::Unavailable(_))
+        ));
+        assert_eq!(
+            library.set_label("uc-7", "not-a-number", true),
+            Err(LabelError::NotFound)
+        );
+        let scripts = client.scripts.lock().unwrap();
+        assert!(scripts[2].contains("NewUnsavedCollection(\"RPG\""));
+        assert!(scripts[3].contains("AddOrRemoveApp([105600], true, \"uc-7\")"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

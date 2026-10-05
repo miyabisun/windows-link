@@ -1550,6 +1550,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tungstenite 0.30.0",
  "ureq",
  "windows 0.58.0",
  "windows 0.62.2",

@@ -25,7 +25,7 @@ use crate::{
     discord::{NoVoice, Voice},
     icons,
     launch::{Launcher, windows::WindowsLauncher},
-    library::{self, GameLibrary, NoLibrary, Picture, Pin, Pins},
+    library::{self, GameLibrary, LabelError, NoLibrary, Picture, Pin, Pins},
     power,
 };
 
@@ -237,6 +237,16 @@ pub fn app(state: AppState) -> Router {
         .route("/buttons/{id}/library", get(library_listing))
         .route("/buttons/{id}/library/{item}/start", post(start_item))
         .route("/buttons/{id}/library/{item}/image", get(item_picture))
+        .route("/buttons/{id}/library/{item}/folder", post(open_folder))
+        .route("/buttons/{id}/labels", post(create_label))
+        .route(
+            "/buttons/{id}/labels/{label}",
+            axum::routing::patch(rename_label).delete(delete_label),
+        )
+        .route(
+            "/buttons/{id}/labels/{label}/items/{item}",
+            axum::routing::put(add_to_label).delete(remove_from_label),
+        )
         .route(
             "/buttons/{id}/pins/{item}",
             axum::routing::put(pin_item).delete(unpin_item),
@@ -346,6 +356,12 @@ async fn library_listing(State(state): State<AppState>, Path(id): Path<String>) 
         }
     };
     let pinned = pins.get(&id).cloned().unwrap_or_default();
+    let hidden: Vec<&str> = listing
+        .labels
+        .iter()
+        .filter(|label| hide.iter().any(|name| name == &label.name))
+        .map(|label| label.id.as_str())
+        .collect();
     let items: Vec<Value> = listing
         .items
         .iter()
@@ -358,10 +374,179 @@ async fn library_listing(State(state): State<AppState>, Path(id): Path<String>) 
     Json(json!({
         "items": items,
         "labels": listing.labels,
-        "hide": hide,
+        "hide": hidden,
         "partial": listing.partial,
+        "labels_locked": listing.labels_locked,
     }))
     .into_response()
+}
+
+/// Show an installed game's folder in Explorer (`204`).
+async fn open_folder(
+    State(state): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    if state.library_button(&id).is_none() {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    }
+    let library = state.library.clone();
+    let launcher = state.launcher.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        let folder = library.folder(&item).ok_or(PressError::NotFound)?;
+        launcher
+            .open(&folder.to_string_lossy(), None, false)
+            .map_err(PressError::Launch)
+    })
+    .await;
+    match opened {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(failure)) => press_error(&id, failure, "the game is not installed"),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LabelName {
+    name: String,
+}
+
+fn label_error(failure: LabelError) -> Response {
+    match failure {
+        LabelError::NotFound => error(StatusCode::NOT_FOUND, "not_found", "no such label or game"),
+        LabelError::Invalid(message) => error(StatusCode::BAD_REQUEST, "invalid_label", &message),
+        LabelError::Unavailable(message) => {
+            error(StatusCode::CONFLICT, "labels_unavailable", &message)
+        }
+        LabelError::Failed(message) => {
+            warn!(%message, "cannot change a label");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "labels", &message)
+        }
+    }
+}
+
+/// Run a label change on the blocking pool with the current listing at hand.
+async fn change_labels<T: Send + 'static>(
+    state: &AppState,
+    id: &str,
+    change: impl FnOnce(&dyn GameLibrary, &library::Listing) -> Result<T, LabelError> + Send + 'static,
+) -> Result<T, Response> {
+    if state.library_button(id).is_none() {
+        return Err(error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY));
+    }
+    let library = state.library.clone();
+    let changed = tokio::task::spawn_blocking(move || {
+        let listing = library.listing();
+        change(library.as_ref(), &listing)
+    })
+    .await;
+    match changed {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(failure)) => Err(label_error(failure)),
+        Err(join) => Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        )),
+    }
+}
+
+/// A label the panel may rename or delete.
+fn editable(listing: &library::Listing, label: &str) -> Result<(), LabelError> {
+    match listing.labels.iter().find(|l| l.id == label) {
+        None => Err(LabelError::NotFound),
+        Some(l) if !l.editable => Err(LabelError::Invalid(format!(
+            "{:?} is Steam's own label and cannot be renamed or deleted",
+            l.name
+        ))),
+        Some(_) => Ok(()),
+    }
+}
+
+/// `{"name": …}`: make a label; answers `201 {"label": …}`.
+async fn create_label(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<LabelName>,
+) -> Response {
+    let created = change_labels(&state, &id, move |library, listing| {
+        let name = library::check_name(&body.name, &listing.labels, None)?;
+        library.create_label(&name)
+    })
+    .await;
+    match created {
+        Ok(label) => (StatusCode::CREATED, Json(json!({ "label": label }))).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// `{"name": …}`: rename a label (`204`).
+async fn rename_label(
+    State(state): State<AppState>,
+    Path((id, label)): Path<(String, String)>,
+    Json(body): Json<LabelName>,
+) -> Response {
+    no_content(
+        change_labels(&state, &id, move |library, listing| {
+            editable(listing, &label)?;
+            let name = library::check_name(&body.name, &listing.labels, Some(&label))?;
+            library.rename_label(&label, &name)
+        })
+        .await,
+    )
+}
+
+/// Delete a label; its games stay in the library (`204`).
+async fn delete_label(
+    State(state): State<AppState>,
+    Path((id, label)): Path<(String, String)>,
+) -> Response {
+    no_content(
+        change_labels(&state, &id, move |library, listing| {
+            editable(listing, &label)?;
+            library.delete_label(&label)
+        })
+        .await,
+    )
+}
+
+async fn add_to_label(
+    State(state): State<AppState>,
+    Path((id, label, item)): Path<(String, String, String)>,
+) -> Response {
+    set_label(&state, &id, label, item, true).await
+}
+
+async fn remove_from_label(
+    State(state): State<AppState>,
+    Path((id, label, item)): Path<(String, String, String)>,
+) -> Response {
+    set_label(&state, &id, label, item, false).await
+}
+
+/// Put a game in a label or take it out (`204`).
+async fn set_label(state: &AppState, id: &str, label: String, item: String, on: bool) -> Response {
+    no_content(
+        change_labels(state, id, move |library, listing| {
+            if !listing.labels.iter().any(|l| l.id == label)
+                || !listing.items.iter().any(|i| i.id == item)
+            {
+                return Err(LabelError::NotFound);
+            }
+            library.set_label(&label, &item, on)
+        })
+        .await,
+    )
+}
+
+fn no_content(result: Result<(), Response>) -> Response {
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(response) => response,
+    }
 }
 
 /// Start a library game, or bring it to the front when it runs (`204`).
@@ -806,7 +991,7 @@ buttons:
         assert_eq!(change["desktops"][1]["current"], true);
     }
 
-    const LIBRARY: &str = "buttons:\n  - id: games\n    label: Games\n    type: steam.library\n    hide: [outdate]\n  - id: other\n    label: Other\n    type: app.launch\n    target: a.exe\n";
+    const LIBRARY: &str = "buttons:\n  - id: games\n    label: Games\n    type: steam.library\n    hide: [非表示]\n  - id: other\n    label: Other\n    type: app.launch\n    target: a.exe\n";
 
     fn library_state() -> (AppState, Arc<crate::launch::fake::FakeLauncher>) {
         let launcher = Arc::new(crate::launch::fake::FakeLauncher::default());
@@ -815,7 +1000,7 @@ buttons:
             Arc::new(FakeAudio::new(Vec::new(), None)),
         )
         .with_launcher(launcher.clone())
-        .with_library(Arc::new(crate::library::fake::FakeLibrary));
+        .with_library(Arc::new(crate::library::fake::FakeLibrary::new()));
         (state, launcher)
     }
 
@@ -826,10 +1011,18 @@ buttons:
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["items"][0]["id"], "1");
         assert_eq!(body["items"][0]["pinned"], false);
-        assert_eq!(body["items"][1]["labels"], serde_json::json!(["outdate"]));
-        assert_eq!(body["labels"], serde_json::json!(["outdate"]));
-        assert_eq!(body["hide"], serde_json::json!(["outdate"]));
+        assert_eq!(body["items"][1]["labels"], serde_json::json!(["hidden"]));
+        assert_eq!(
+            body["labels"],
+            serde_json::json!([
+                {"id": "hidden", "name": "非表示", "editable": false},
+                {"id": "uc-1", "name": "outdate", "editable": true}
+            ])
+        );
+        // `hide` names labels in the configuration; the answer gives their IDs.
+        assert_eq!(body["hide"], serde_json::json!(["hidden"]));
         assert_eq!(body["partial"], Value::Null);
+        assert_eq!(body["labels_locked"], Value::Null);
 
         let (status, _) = call(state, "GET", "/buttons/other/library").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -844,6 +1037,7 @@ buttons:
         assert_eq!(body["button"]["state"]["pins"][0]["name"], "Two");
         let (_, body) = call(state.clone(), "GET", "/buttons/games/library").await;
         assert_eq!(body["items"][1]["pinned"], true);
+        assert_eq!(body["items"][0]["pinned"], false);
 
         let (status, _) = call(state.clone(), "PUT", "/buttons/games/pins/9").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -873,6 +1067,110 @@ buttons:
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = call(state, "GET", "/buttons/other/library/1/image").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    async fn send(state: AppState, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn labels_are_created_renamed_filled_and_deleted() {
+        use serde_json::json;
+
+        let (state, _) = library_state();
+        let (status, body) = send(
+            state.clone(),
+            "POST",
+            "/buttons/games/labels",
+            json!({"name": " RPG "}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            body["label"],
+            json!({"id": "uc-3", "name": "RPG", "editable": true})
+        );
+
+        let (status, body) = send(
+            state.clone(),
+            "POST",
+            "/buttons/games/labels",
+            json!({"name": "rpg"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_label");
+
+        let (status, _) = call(state.clone(), "PUT", "/buttons/games/labels/uc-3/items/1").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = send(
+            state.clone(),
+            "PATCH",
+            "/buttons/games/labels/uc-3",
+            json!({"name": "JRPG"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = call(state.clone(), "GET", "/buttons/games/library").await;
+        assert_eq!(body["items"][0]["labels"], json!(["uc-3"]));
+        assert_eq!(body["labels"][2]["name"], "JRPG");
+
+        let (status, _) = call(
+            state.clone(),
+            "DELETE",
+            "/buttons/games/labels/uc-3/items/1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(state.clone(), "DELETE", "/buttons/games/labels/uc-3").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = call(state.clone(), "DELETE", "/buttons/games/labels/uc-3").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+        let (_, body) = call(state, "GET", "/buttons/games/library").await;
+        assert_eq!(body["labels"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fixed_labels_hold_games_but_cannot_be_renamed_or_deleted() {
+        let (state, _) = library_state();
+        let (status, _) = call(state.clone(), "PUT", "/buttons/games/labels/hidden/items/1").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = send(
+            state.clone(),
+            "PATCH",
+            "/buttons/games/labels/hidden",
+            serde_json::json!({"name": "x"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_label");
+        let (status, _) = call(state, "DELETE", "/buttons/games/labels/hidden").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn browsing_a_game_opens_its_folder() {
+        let (state, launcher) = library_state();
+        let (status, _) = call(state.clone(), "POST", "/buttons/games/library/1/folder").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(*launcher.opened.lock().unwrap(), [r"C:\Games\One"]);
+        let (status, body) = call(state, "POST", "/buttons/games/library/2/folder").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
     }
 
     #[tokio::test]

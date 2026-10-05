@@ -19,13 +19,57 @@ pub struct Item {
     pub labels: Vec<String>,
 }
 
+/// A group of items, such as a Steam collection. Items name their labels by `id`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Label {
+    pub id: String,
+    pub name: String,
+    /// False for the library's own labels (Steam's favorites and hidden), which hold
+    /// items but cannot be renamed or deleted.
+    pub editable: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Listing {
     pub items: Vec<Item>,
-    /// Label names in display order.
-    pub labels: Vec<String>,
+    /// Labels in display order.
+    pub labels: Vec<Label>,
     /// Why only part of the library is listed, when it is.
     pub partial: Option<String>,
+    /// Why labels cannot be changed right now, when they cannot.
+    pub labels_locked: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum LabelError {
+    NotFound,
+    /// The request is wrong, such as an empty or taken name, or a fixed label.
+    Invalid(String),
+    /// Labels cannot be changed right now; says why.
+    Unavailable(String),
+    Failed(String),
+}
+
+/// A label's new name: trimmed, not empty, and not another label's name (ignoring
+/// case). `renaming` is the label being renamed.
+pub fn check_name(
+    name: &str,
+    labels: &[Label],
+    renaming: Option<&str>,
+) -> Result<String, LabelError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(LabelError::Invalid("the name is empty".into()));
+    }
+    let taken = labels
+        .iter()
+        .any(|l| Some(l.id.as_str()) != renaming && l.name.to_lowercase() == name.to_lowercase());
+    if taken {
+        return Err(LabelError::Invalid(format!(
+            "a label named {name:?} exists"
+        )));
+    }
+    Ok(name.to_owned())
 }
 
 /// What to open to start an item, and the folder its program then runs from (to bring
@@ -48,6 +92,13 @@ pub trait GameLibrary: Send + Sync + 'static {
     /// `None` for an item the library does not have.
     fn start(&self, id: &str) -> Option<Start>;
     fn picture(&self, id: &str) -> Option<Picture>;
+    /// The folder an installed item lives in, to show in Explorer.
+    fn folder(&self, id: &str) -> Option<PathBuf>;
+    fn create_label(&self, name: &str) -> Result<Label, LabelError>;
+    fn rename_label(&self, label: &str, name: &str) -> Result<(), LabelError>;
+    fn delete_label(&self, label: &str) -> Result<(), LabelError>;
+    /// Put an item in a label, or take it out.
+    fn set_label(&self, label: &str, item: &str, on: bool) -> Result<(), LabelError>;
 }
 
 /// The library before one is set up: empty, saying why.
@@ -67,6 +118,26 @@ impl GameLibrary for NoLibrary {
 
     fn picture(&self, _id: &str) -> Option<Picture> {
         None
+    }
+
+    fn folder(&self, _id: &str) -> Option<PathBuf> {
+        None
+    }
+
+    fn create_label(&self, _name: &str) -> Result<Label, LabelError> {
+        Err(LabelError::Unavailable(self.0.clone()))
+    }
+
+    fn rename_label(&self, _label: &str, _name: &str) -> Result<(), LabelError> {
+        Err(LabelError::Unavailable(self.0.clone()))
+    }
+
+    fn delete_label(&self, _label: &str) -> Result<(), LabelError> {
+        Err(LabelError::Unavailable(self.0.clone()))
+    }
+
+    fn set_label(&self, _label: &str, _item: &str, _on: bool) -> Result<(), LabelError> {
+        Err(LabelError::Unavailable(self.0.clone()))
     }
 }
 
@@ -185,30 +256,107 @@ impl Pins {
 
 #[cfg(test)]
 pub mod fake {
-    use std::path::PathBuf;
+    use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
 
-    use super::{GameLibrary, Item, Listing, Picture, Start};
+    use super::{GameLibrary, Item, Label, LabelError, Listing, Picture, Start};
 
     /// Items `"1"` (installed in `C:\Games\One`, a picture on the web) and `"2"` (not
-    /// installed, a picture file).
-    pub struct FakeLibrary;
+    /// installed, a picture file); labels `hidden` (fixed, named 非表示, holding "2") and
+    /// `uc-1` (outdate, empty), kept in memory.
+    pub struct FakeLibrary {
+        labels: Mutex<Vec<(Label, BTreeSet<String>)>>,
+    }
+
+    impl Default for FakeLibrary {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl FakeLibrary {
+        pub fn new() -> Self {
+            let label = |id: &str, name: &str, editable| Label {
+                id: id.into(),
+                name: name.into(),
+                editable,
+            };
+            Self {
+                labels: Mutex::new(vec![
+                    (label("hidden", "非表示", false), ["2".to_owned()].into()),
+                    (label("uc-1", "outdate", true), BTreeSet::new()),
+                ]),
+            }
+        }
+    }
 
     impl GameLibrary for FakeLibrary {
         fn listing(&self) -> Listing {
-            let item = |id: &str, name: &str, installed, labels: &[&str]| Item {
+            let labels = self.labels.lock().unwrap();
+            let item = |id: &str, name: &str, installed| Item {
                 id: id.into(),
                 name: name.into(),
                 installed,
-                labels: labels.iter().map(|&l| l.to_owned()).collect(),
+                labels: labels
+                    .iter()
+                    .filter(|(_, items)| items.contains(id))
+                    .map(|(label, _)| label.id.clone())
+                    .collect(),
             };
             Listing {
-                items: vec![
-                    item("1", "One", true, &[]),
-                    item("2", "Two", false, &["outdate"]),
-                ],
-                labels: vec!["outdate".into()],
+                items: vec![item("1", "One", true), item("2", "Two", false)],
+                labels: labels.iter().map(|(label, _)| label.clone()).collect(),
                 partial: None,
+                labels_locked: None,
             }
+        }
+
+        fn folder(&self, id: &str) -> Option<PathBuf> {
+            (id == "1").then(|| PathBuf::from(r"C:\Games\One"))
+        }
+
+        fn create_label(&self, name: &str) -> Result<Label, LabelError> {
+            let mut labels = self.labels.lock().unwrap();
+            let label = Label {
+                id: format!("uc-{}", labels.len() + 1),
+                name: name.into(),
+                editable: true,
+            };
+            labels.push((label.clone(), BTreeSet::new()));
+            Ok(label)
+        }
+
+        fn rename_label(&self, label: &str, name: &str) -> Result<(), LabelError> {
+            let mut labels = self.labels.lock().unwrap();
+            let found = labels
+                .iter_mut()
+                .find(|(l, _)| l.id == label)
+                .ok_or(LabelError::NotFound)?;
+            found.0.name = name.into();
+            Ok(())
+        }
+
+        fn delete_label(&self, label: &str) -> Result<(), LabelError> {
+            let mut labels = self.labels.lock().unwrap();
+            let before = labels.len();
+            labels.retain(|(l, _)| l.id != label);
+            if labels.len() == before {
+                return Err(LabelError::NotFound);
+            }
+            Ok(())
+        }
+
+        fn set_label(&self, label: &str, item: &str, on: bool) -> Result<(), LabelError> {
+            let mut labels = self.labels.lock().unwrap();
+            let (_, items) = labels
+                .iter_mut()
+                .find(|(l, _)| l.id == label)
+                .ok_or(LabelError::NotFound)?;
+            if on {
+                items.insert(item.to_owned());
+            } else {
+                items.remove(item);
+            }
+            Ok(())
         }
 
         fn start(&self, id: &str) -> Option<Start> {
@@ -239,7 +387,7 @@ pub mod fake {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Pin, Pins, fake::FakeLibrary, start};
+    use super::{Label, LabelError, Pin, Pins, check_name, fake::FakeLibrary, start};
     use crate::{
         buttons::PressError,
         launch::{Program, fake::FakeLauncher},
@@ -288,9 +436,32 @@ mod tests {
     }
 
     #[test]
+    fn a_label_name_is_trimmed_and_must_be_new() {
+        let labels = [Label {
+            id: "uc-1".into(),
+            name: "Outdate".into(),
+            editable: true,
+        }];
+        assert_eq!(check_name("  RPG ", &labels, None), Ok("RPG".to_owned()));
+        assert!(matches!(
+            check_name(" ", &labels, None),
+            Err(LabelError::Invalid(_))
+        ));
+        assert!(matches!(
+            check_name("outdate", &labels, None),
+            Err(LabelError::Invalid(_))
+        ));
+        // Renaming a label to a different case of its own name is fine.
+        assert_eq!(
+            check_name("outdate", &labels, Some("uc-1")),
+            Ok("outdate".to_owned())
+        );
+    }
+
+    #[test]
     fn starting_an_installed_game_waits_to_bring_it_forward() {
         let launcher = FakeLauncher::default();
-        start(&FakeLibrary, &launcher, "1").unwrap();
+        start(&FakeLibrary::new(), &launcher, "1").unwrap();
         assert_eq!(*launcher.opened.lock().unwrap(), ["game://run/1"]);
         assert_eq!(
             *launcher.awaited.lock().unwrap(),
@@ -306,7 +477,7 @@ mod tests {
             .lock()
             .unwrap()
             .push(PathBuf::from(r"C:\Games\One"));
-        start(&FakeLibrary, &launcher, "1").unwrap();
+        start(&FakeLibrary::new(), &launcher, "1").unwrap();
         assert!(launcher.opened.lock().unwrap().is_empty());
         assert_eq!(
             *launcher.focused.lock().unwrap(),
@@ -317,11 +488,11 @@ mod tests {
     #[test]
     fn a_game_that_is_not_installed_opens_its_install_and_unknown_ones_are_not_found() {
         let launcher = FakeLauncher::default();
-        start(&FakeLibrary, &launcher, "2").unwrap();
+        start(&FakeLibrary::new(), &launcher, "2").unwrap();
         assert_eq!(*launcher.opened.lock().unwrap(), ["game://install/2"]);
         assert!(launcher.awaited.lock().unwrap().is_empty());
         assert_eq!(
-            start(&FakeLibrary, &launcher, "3"),
+            start(&FakeLibrary::new(), &launcher, "3"),
             Err(PressError::NotFound)
         );
     }

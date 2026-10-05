@@ -164,15 +164,15 @@ Restart the server after editing the file.
 ## Steam library
 
 A `steam.library` button gives a panel your Steam library: every game you own, whether it
-is installed, and the collections you made in Steam (dynamic collections are left out).
-For example in `desktops/ゲーム.yaml`:
+is installed, and its labels: Steam's favorites and hidden collections and the collections
+you made (dynamic collections are left out). For example in `desktops/ゲーム.yaml`:
 
 ```yaml
 buttons:
   - id: steam-library
     label: Game search
     type: steam.library
-    hide: [outdate]       # collections whose games are listed only while selected
+    hide: [非表示]         # collections whose games are listed only while selected
     icon: C:\Program Files (x86)\Steam\steam.exe
 ```
 
@@ -188,8 +188,8 @@ steam:
 windows-link fetches the list at start and every 30 minutes, so a new purchase shows up
 within half an hour (or after a restart). Without a key, or while the API cannot be
 reached, the library lists the installed games and says why in `partial`. Install state
-and collections are read from the Steam folder (found through the registry) on every
-listing, so they are always current.
+is read from the Steam folder (found through the registry) on every listing, so it is
+always current.
 
 Starting a game opens `steam://rungameid/<app ID>` and brings the game's window to the front
 once a program from its install folder shows one; while such a window exists, starting
@@ -198,6 +198,27 @@ brings it to the front instead. A game that is not installed opens Steam's insta
 Steam's library cache, which follows the Steam client's language, or the store's.
 
 Pinned games are kept per button in `windows-link.db`, in the order they were pinned.
+
+### Labels
+
+A panel can make, rename and delete collections and put games in them or take them out
+(Steam's favorites and hidden can hold games but cannot be renamed or deleted). Steam has
+no API for this, so windows-link asks the Steam client itself, as if you did it in Steam's
+window, and Steam saves and syncs the change. For that, Steam must accept remote control:
+
+```powershell
+New-Item -ItemType File -Force "${env:ProgramFiles(x86)}\Steam\.cef-enable-remote-debugging"
+```
+
+then restart Steam. Steam then serves the Chrome DevTools protocol on `127.0.0.1:8080`,
+where windows-link calls the collection store of Steam's library page. Accepted risk: any
+program on this PC can control the Steam client through that port; remove the file and
+restart Steam to close it.
+
+While Steam answers there, the labels come from it, so changes show at once. When it is
+not running or does not accept remote control, the labels are read from Steam's
+collection file and `labels_locked` says why they cannot be changed. Names must be new
+(ignoring case): Steam would replace a collection with the same name.
 
 ## Discord
 
@@ -245,10 +266,14 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, when `icon` is true |
-| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, installed, labels, pinned}], "labels":[…], "hide":[…], "partial": null}` (`partial` says why only the installed games are listed) |
+| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null}` (`labels` of an item are label IDs; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now) |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
 | `PUT /buttons/{id}/pins/{item}`, `DELETE …` | pin a game to the button, or take it off; returns `{"button": …}` |
+| `POST /buttons/{id}/library/{item}/folder` | show an installed game's folder in Explorer (`204`; `404` when not installed) |
+| `POST /buttons/{id}/labels` | `{"name": …}`: make a label; `201 {"label": {id, name, editable}}` |
+| `PATCH /buttons/{id}/labels/{label}`, `DELETE …` | rename a label (`{"name": …}`) or delete it, keeping its games (`204`) |
+| `PUT /buttons/{id}/labels/{label}/items/{item}`, `DELETE …` | put a game in a label, or take it out (`204`) |
 | `GET /desktops` | virtual desktops, and the desktop files without a desktop: `{"desktops":[{id, name, index, current}], "unmatched":[name], "error": null}` |
 | `POST /desktops` | `{"name": …}`: create a desktop with this name and switch to it (`201`, the new `GET /desktops` body; `409 exists`) |
 | `POST /desktops/{id}/switch` | switch to a virtual desktop; returns the new `GET /desktops` body |
@@ -262,6 +287,8 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_unavailable`,
 `409 not_running`, `500 audio`, `409 discord_unavailable`, `409 discord_rejected`,
 `500 discord`, `409 no_window`, `500 launch`, `409 not_pressable` (a library button),
+`400 invalid_label` (an empty or taken name, or Steam's own label), `409 labels_unavailable`
+(Steam cannot be asked now, with the reason), `500 labels`,
 `500 storage`, `400 invalid_hwnd`, `400 invalid_name`, `409 exists`, `503 desktops`, or
 `502 update`.
 
