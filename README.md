@@ -453,6 +453,14 @@ The tool prints the cursor position before and 300 ms after the gesture. Point i
 window on the touch monitor that shows whether the tap arrived (for example a page that
 counts clicks in its title).
 
+To try the label scripts against the Steam client on this PC (it must accept remote
+control, see [Labels](#labels)), run them on a throwaway label: it is made, renamed, given
+the game and emptied again, then deleted.
+
+```powershell
+cargo run --example steam_labels -- 105600   # an app ID you own
+```
+
 ## License
 
 MIT

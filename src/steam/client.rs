@@ -67,7 +67,8 @@ pub mod scripts {
         if (!c) throw new Error(\"NOT_FOUND\"); return c; };";
 
     /// Steam's own collections (favorites, hidden) and the user's static ones, each
-    /// with its app IDs.
+    /// with its app IDs. `userCollections` also has Steam's own groupings (soundtracks,
+    /// uncategorized), which cannot be deleted; only the user's can.
     pub fn collections() -> String {
         format!(
             "(() => {{ {STORE} \
@@ -75,7 +76,7 @@ pub mod scripts {
                ? {{ id: c.id, name: c.displayName || c.id, apps: (c.allApps || []).map((a) => a.appid) }} \
                : null; \
              const fixed = [\"favorite\", \"hidden\"].map((id) => pick(cs.GetCollection(id))); \
-             const own = (cs.userCollections || []).map(pick); \
+             const own = (cs.userCollections || []).filter((c) => c.bIsDeletable).map(pick); \
              const seen = new Set(); \
              return fixed.concat(own).filter((c) => c && !seen.has(c.id) && seen.add(c.id)); \
              }})()"
@@ -92,15 +93,17 @@ pub mod scripts {
         )
     }
 
+    /// Steam keeps the name in `m_strName` and has no setter for it.
     pub fn rename(id: &str, name: &str) -> String {
         format!(
             "(async () => {{ {STORE} \
              const c = found({}); \
-             if (typeof c.SetName === \"function\") c.SetName({name}); else c.m_strName = {name}; \
-             if (typeof c.Save === \"function\") await c.Save(); else await cs.SaveCollection(c); \
+             if (!c.bIsEditable) throw new Error(\"NOT_EDITABLE\"); \
+             c.m_strName = {}; \
+             await c.Save(); \
              return true; }})()",
             json!(id),
-            name = json!(name)
+            json!(name)
         )
     }
 
@@ -108,23 +111,22 @@ pub mod scripts {
         format!(
             "(async () => {{ {STORE} \
              const c = found({id}); \
-             const d = c.AsDeletableCollection ? c.AsDeletableCollection() : null; \
-             if (d && typeof d.Delete === \"function\") await d.Delete(); \
-             else await cs.DeleteCollection({id}); \
+             if (!c.bIsDeletable) throw new Error(\"NOT_EDITABLE\"); \
+             await c.AsDeletableCollection().Delete(); \
              return true; }})()",
             id = json!(id)
         )
     }
 
-    /// `AddOrRemoveApp` takes app IDs and works for Steam's own collections too.
+    /// `AddOrRemoveApp` takes app IDs and works for Steam's own collections too, which
+    /// save themselves; the user's are saved after it.
     pub fn set(id: &str, app_id: u32, on: bool) -> String {
         format!(
             "(async () => {{ {STORE} \
              const c = found({id}); \
              if (!globalThis.appStore.GetAppOverviewByAppID({app_id})) throw new Error(\"NOT_FOUND\"); \
              cs.AddOrRemoveApp([{app_id}], {on}, {id}); \
-             if (!c.AsDeletableCollection || !c.AsDeletableCollection()) return true; \
-             if (typeof c.Save === \"function\") await c.Save(); \
+             if (c.bIsDeletable) await c.Save(); \
              return true; }})()",
             id = json!(id)
         )

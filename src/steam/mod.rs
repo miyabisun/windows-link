@@ -110,6 +110,9 @@ impl SteamLibrary {
             client::ClientError::Script(message) if message.contains("NOT_FOUND") => {
                 LabelError::NotFound
             }
+            client::ClientError::Script(message) if message.contains("NOT_EDITABLE") => {
+                LabelError::Invalid("Steam's own label cannot be renamed or deleted".into())
+            }
             client::ClientError::Script(message) if message.contains("STORE_NOT_READY") => {
                 LabelError::Unavailable("Steam's library is not ready yet".into())
             }
