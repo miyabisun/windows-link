@@ -32,7 +32,8 @@ pub struct ButtonConfig {
     /// Shared buttons only: desktop names whose tab leaves this button out.
     #[serde(default)]
     pub except: Vec<String>,
-    /// File (exe, shortcut, image) whose Windows icon the button shows.
+    /// File (exe, shortcut, image) whose Windows icon the button shows, or a picture's
+    /// `http(s)` URL.
     #[serde(default)]
     pub icon: Option<PathBuf>,
     /// The desktop whose file defines the button; `None` for shared buttons.
@@ -49,12 +50,25 @@ struct DesktopFile {
     buttons: Vec<ButtonConfig>,
 }
 
+/// What an output device is, for its icon on the panel.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceIcon {
+    Speaker,
+    Headphones,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum ButtonSpec {
     /// Toggle the Windows default output between two device aliases.
     #[serde(rename = "audio.output_toggle")]
-    OutputToggle { devices: [String; 2] },
+    OutputToggle {
+        devices: [String; 2],
+        /// What each device is, in the same order, for the panel's icon.
+        #[serde(default)]
+        device_icons: Option<[DeviceIcon; 2]>,
+    },
     /// Toggle one process's session volume between two levels (0.0-1.0).
     #[serde(rename = "audio.app_volume_toggle")]
     AppVolumeToggle { process: String, levels: [f32; 2] },
@@ -249,7 +263,7 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             return Err(ConfigError(format!("duplicate button id {id:?}")));
         }
         match &button.spec {
-            ButtonSpec::OutputToggle { devices } => {
+            ButtonSpec::OutputToggle { devices, .. } => {
                 if devices[0] == devices[1] {
                     return Err(ConfigError(format!(
                         "button {id:?}: the two devices must differ"
@@ -335,7 +349,7 @@ buttons:
         assert_eq!(config.buttons[0].id, "output");
         assert!(matches!(
             &config.buttons[0].spec,
-            ButtonSpec::OutputToggle { devices } if devices == &["motu".to_owned(), "jbl".to_owned()]
+            ButtonSpec::OutputToggle { devices, .. } if devices == &["motu".to_owned(), "jbl".to_owned()]
         ));
         assert!(matches!(
             &config.buttons[1].spec,

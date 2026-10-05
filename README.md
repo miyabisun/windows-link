@@ -86,6 +86,7 @@ buttons:
     label: Output
     type: audio.output_toggle
     devices: [speakers, earbuds]
+    device_icons: [speaker, headphones]   # optional: what each is, for the panel's icon
     except: [dev]           # optional: desktops whose tab leaves it out
   - id: mute
     label: Mute
@@ -169,8 +170,13 @@ buttons:
   while `process` runs; pressing it then asks the game's windows to close, like their close
   button (`409 no_window` while it has none yet).
 - `icon` (optional, any button type) is a file whose Windows icon the button shows: an exe,
-  a shortcut, an image or a `shell:AppsFolder\…` app. `app.launch` buttons show their
-  target's icon without it.
+  a shortcut, an image or a `shell:AppsFolder\…` app; or a picture's `https://` URL, which
+  the panel loads itself (`GET …/icon` redirects there). `app.launch` buttons show their
+  target's icon without it, and `dlsite.library` buttons DLsite's favicon.
+- `device_icons` (optional, `audio.output_toggle`) says what each of the two devices is,
+  `speaker` or `headphones`, in the same order: each option in the state carries it as
+  `icon`, so the panel can show the current one. Windows calls Bluetooth earbuds
+  speakers too, so it is not read from Windows.
 
 Restart the server after editing the file.
 
@@ -378,7 +384,7 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 | `GET /healthz` | `ok` |
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
-| `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, when `icon` is true |
+| `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, or a redirect to it on the web, when `icon` is true |
 | `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now) |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |

@@ -17,6 +17,8 @@ pub struct OutputOption {
     pub alias: String,
     pub name: Option<String>,
     pub connected: bool,
+    /// What the device is, when the button says (`device_icons`).
+    pub icon: Option<crate::config::DeviceIcon>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -147,9 +149,29 @@ impl AudioSnapshot {
     }
 }
 
-/// The file whose Windows icon the button shows: its `icon`, or what an
-/// `app.launch` button opens when that is a file.
+/// DLsite's favicon, which a `dlsite.library` button shows unless it names another icon.
+pub const DLSITE_ICON: &str = "https://www.dlsite.com/images/web/common/favicon.ico";
+
+/// The picture on the web the button shows: its `icon` when that is an `http(s)` URL,
+/// else DLsite's favicon for a DLsite library.
+pub fn icon_url(button: &ButtonConfig) -> Option<String> {
+    match &button.icon {
+        Some(icon) => {
+            let icon = icon.to_string_lossy();
+            (icon.starts_with("https://") || icon.starts_with("http://")).then(|| icon.into_owned())
+        }
+        None => {
+            matches!(button.spec, ButtonSpec::DlsiteLibrary { .. }).then(|| DLSITE_ICON.to_owned())
+        }
+    }
+}
+
+/// The file whose Windows icon the button shows: its `icon` (unless that is on the
+/// web), or what an `app.launch` button opens when that is a file.
 pub fn icon_path(button: &ButtonConfig) -> Option<PathBuf> {
+    if icon_url(button).is_some() {
+        return None;
+    }
     if let Some(icon) = &button.icon {
         return Some(icon.clone());
     }
@@ -181,9 +203,10 @@ pub fn view(
         label: button.label.clone(),
         desktop: button.desktop.clone(),
         except: button.except.clone(),
-        icon: icon_path(button).is_some_and(|path| {
-            path.to_string_lossy().to_lowercase().starts_with("shell:") || path.exists()
-        }),
+        icon: icon_url(button).is_some()
+            || icon_path(button).is_some_and(|path| {
+                path.to_string_lossy().to_lowercase().starts_with("shell:") || path.exists()
+            }),
         state: state(config, button, readings, audio),
     }
 }
@@ -198,10 +221,14 @@ fn state(
     let snapshot = readings.audio;
     let voice = readings.voice;
     match spec {
-        ButtonSpec::OutputToggle { devices } => {
+        ButtonSpec::OutputToggle {
+            devices,
+            device_icons,
+        } => {
             let options = devices
                 .iter()
-                .map(|alias| {
+                .enumerate()
+                .map(|(index, alias)| {
                     let device = config
                         .devices
                         .get(alias)
@@ -210,6 +237,7 @@ fn state(
                         alias: alias.clone(),
                         name: device.map(|d| d.name.clone()),
                         connected: device.is_some_and(|d| d.connected),
+                        icon: device_icons.map(|icons| icons[index]),
                     }
                 })
                 .collect();
@@ -317,7 +345,7 @@ pub fn press(
         .find(|b| b.id == id)
         .ok_or(PressError::NotFound)?;
     match &button.spec {
-        ButtonSpec::OutputToggle { devices } => press_output(config, devices, audio),
+        ButtonSpec::OutputToggle { devices, .. } => press_output(config, devices, audio),
         ButtonSpec::AppVolumeToggle { process, levels } => {
             let Some(current) = audio.app_volume(process).map_err(PressError::Audio)? else {
                 return Err(PressError::Conflict {
@@ -423,6 +451,71 @@ mod tests {
             processes: &NO_PROCESSES,
             pins: &NO_PINS,
         }
+    }
+
+    #[test]
+    fn output_options_carry_the_icon_given_to_each_device() {
+        use super::OutputOption;
+        use crate::config::DeviceIcon;
+
+        let config = config::parse(
+            "devices:\n  motu: id-motu\n  jbl: id-jbl\nbuttons:\n  - id: output\n    label: Output\n    type: audio.output_toggle\n    devices: [motu, jbl]\n    device_icons: [speaker, headphones]\n  - id: plain\n    label: Plain\n    type: audio.output_toggle\n    devices: [motu, jbl]\n",
+        )
+        .unwrap();
+        let audio = FakeAudio::new(devices(), Some("id-jbl"));
+        let snapshot = AudioSnapshot::read(&audio).unwrap();
+        let options = |index: usize| match view(
+            &config,
+            &config.buttons[index],
+            &readings(&snapshot, &no_voice()),
+            &audio,
+        )
+        .state
+        {
+            ButtonState::Output { options, .. } => options,
+            other => panic!("{other:?}"),
+        };
+        let icons: Vec<_> = options(0).iter().map(|o: &OutputOption| o.icon).collect();
+        assert_eq!(
+            icons,
+            [Some(DeviceIcon::Speaker), Some(DeviceIcon::Headphones)]
+        );
+        assert!(options(1).iter().all(|o| o.icon.is_none()));
+        assert!(config::parse(
+            "devices:\n  a: id-a\n  b: id-b\nbuttons:\n  - id: o\n    label: O\n    type: audio.output_toggle\n    devices: [a, b]\n    device_icons: [speaker, tuba]\n",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn icons_from_the_web_and_dlsites_own() {
+        use super::{DLSITE_ICON, icon_url};
+
+        let config = config::parse(
+            "buttons:\n  - id: web\n    label: Web\n    type: app.launch\n    target: https://example.com\n    icon: https://example.com/favicon.ico\n  - id: dlsite\n    label: DLsite\n    type: dlsite.library\n  - id: steam\n    label: Steam\n    type: steam.library\n",
+        )
+        .unwrap();
+        let urls: Vec<_> = config.buttons.iter().map(icon_url).collect();
+        assert_eq!(
+            urls,
+            [
+                Some("https://example.com/favicon.ico".to_owned()),
+                Some(DLSITE_ICON.to_owned()),
+                None
+            ]
+        );
+        let audio = FakeAudio::new(devices(), None);
+        let snapshot = AudioSnapshot::read(&audio).unwrap();
+        let shows = |index: usize| {
+            view(
+                &config,
+                &config.buttons[index],
+                &readings(&snapshot, &no_voice()),
+                &audio,
+            )
+            .icon
+        };
+        assert!(shows(0) && shows(1) && !shows(2));
     }
 
     #[test]

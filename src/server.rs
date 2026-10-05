@@ -918,6 +918,16 @@ async fn unpin_item(
 
 /// The button's Windows icon as PNG, read once and then kept.
 async fn button_icon(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    // A picture on the web is the panel's to fetch.
+    let url = state
+        .config
+        .buttons
+        .iter()
+        .find(|b| b.id == id)
+        .and_then(buttons::icon_url);
+    if let Some(url) = url {
+        return axum::response::Redirect::temporary(&url).into_response();
+    }
     let cached = state
         .icons
         .lock()
@@ -1437,6 +1447,28 @@ buttons:
         assert_eq!(body["error"], "not_found");
         let (status, _) = call(state, "GET", "/buttons/nope/library/1/keys").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_icon_on_the_web_is_a_redirect_to_it() {
+        let state = AppState::new(
+            config::parse(
+                "buttons:\n  - id: dlsite\n    label: DLsite\n    type: dlsite.library\n",
+            )
+            .unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        );
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/buttons/dlsite/icon")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+        assert_eq!(response.headers()["location"], crate::buttons::DLSITE_ICON);
     }
 
     #[tokio::test]
