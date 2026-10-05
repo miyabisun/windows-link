@@ -13,7 +13,8 @@ Each button does one thing:
 | `discord.voice` | joins one Discord voice channel, or leaves it when you are in it | whether you are in that channel, or why Discord cannot be reached |
 | `app.launch` | opens a program, shortcut, URL or Store app, or brings it to the front while it runs | whether it runs |
 | `steam.game` | starts a Steam game, or closes it while it runs | whether it runs |
-| `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button |
+| `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or program icons (`icon`) |
+| `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or program icons (`icon`) |
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -220,6 +221,36 @@ not running or does not accept remote control, the labels are read from Steam's
 collection file and `labels_locked` says why they cannot be changed. Names must be new
 (ignoring case): Steam would replace a collection with the same name.
 
+## DLsite library
+
+A `dlsite.library` button gives a panel the DLsite games in the folders DLsiteNest makes,
+`<maker>\<title>` under `D:\DLsiteNest\Game`; DLsiteNest itself is not needed. For
+example in `desktops/アダルト.yaml`:
+
+```yaml
+buttons:
+  - id: dlsite
+    label: DLsite
+    type: dlsite.library
+    root: D:\DLsiteNest\Game   # optional; this is the default
+    hide: [非表示]
+```
+
+The folder is read on every listing (a few hundred games take tens of milliseconds), so
+added and removed games show up at once. Each game lists its maker as `detail` and comes
+recently started first, then recently added. Its picture is the icon of its program.
+
+- **Programs**: the `.exe` files in the game's folder, or else in the folders right below
+  it, leaving out helpers such as crash reporters, uninstallers and runtime installers.
+  With one, or with one that is not a tool (settings, setup, patcher, launcher), starting
+  runs it in its own folder. Otherwise starting answers `409 choose_program` until one is
+  chosen with `PUT …/program`; the choice is remembered. A game without any program
+  answers `409 no_program`. Its window is brought to the front like a Steam game's.
+- **Labels**: お気に入り and 非表示 always exist and cannot be renamed or deleted; more can be
+  made, renamed and deleted like Steam's. They, the chosen programs and the start times are
+  kept in `windows-link.db`, by an ID made from the game's maker and title folders, so
+  renaming a game's folder loses them.
+
 ## Discord
 
 The `discord.voice` buttons drive the Discord desktop app on the same PC through its local
@@ -266,11 +297,13 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, when `icon` is true |
-| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null}` (`labels` of an item are label IDs; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now) |
+| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now) |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
 | `PUT /buttons/{id}/pins/{item}`, `DELETE …` | pin a game to the button, or take it off; returns `{"button": …}` |
 | `POST /buttons/{id}/library/{item}/folder` | show an installed game's folder in Explorer (`204`; `404` when not installed) |
+| `GET /buttons/{id}/library/{item}/programs` | a game's programs to choose from: `{"candidates": ["Game.exe", …], "chosen": null}` (`404` when it has no choice) |
+| `PUT /buttons/{id}/library/{item}/program` | `{"program": …}`: remember which program starts the game (`204`) |
 | `POST /buttons/{id}/labels` | `{"name": …}`: make a label; `201 {"label": {id, name, editable}}` |
 | `PATCH /buttons/{id}/labels/{label}`, `DELETE …` | rename a label (`{"name": …}`) or delete it, keeping its games (`204`) |
 | `PUT /buttons/{id}/labels/{label}/items/{item}`, `DELETE …` | put a game in a label, or take it out (`204`) |
@@ -287,6 +320,7 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_unavailable`,
 `409 not_running`, `500 audio`, `409 discord_unavailable`, `409 discord_rejected`,
 `500 discord`, `409 no_window`, `500 launch`, `409 not_pressable` (a library button),
+`409 choose_program`, `409 no_program`,
 `400 invalid_label` (an empty or taken name, or Steam's own label), `409 labels_unavailable`
 (Steam cannot be asked now, with the reason), `500 labels`,
 `500 storage`, `400 invalid_hwnd`, `400 invalid_name`, `409 exists`, `503 desktops`, or
