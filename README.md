@@ -12,7 +12,7 @@ Each button does one thing:
 | `audio.app_volume_toggle` | toggles one application's volume between two levels | the application's current volume, or not running |
 | `audio.mute_toggle` | mutes the default output, or unmutes it | whether it is muted, and its volume |
 | `audio.mixer` | nothing: a panel opens the mixer (`GET /audio/mixer`) | the default output's volume and whether it is muted |
-| `discord.voice` | joins one Discord voice channel, or leaves it when you are in it | whether you are in that channel, or why Discord cannot be reached |
+| `discord.server` | brings Discord to the front showing one server, starting Discord if needed | whether Discord runs; the button shows the server's icon |
 | `app.launch` | opens a program, shortcut, URL or Store app, or brings it to the front while it runs | whether it runs |
 | `steam.game` | starts a Steam game, or closes it while it runs | whether it runs |
 | `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
@@ -115,10 +115,10 @@ buttons:
     app_id: 1364780                # from the store page URL
     process: StreetFighter6.exe
     icon: C:\Program Files (x86)\Steam\steamapps\common\Street Fighter 6\StreetFighter6.exe
-  - id: vc-friends
-    label: Friends VC
-    type: discord.voice
-    channel_id: 1533091153086251103   # from `windows-link discord-channels`
+  - id: friends
+    label: Friends
+    type: discord.server
+    guild_id: 1533091152293789877   # from `windows-link discord-servers`
 ```
 
 and `desktops/dev.yaml`:
@@ -155,9 +155,10 @@ buttons:
   output's volume and mute and the applications with sound on it (one per program, named
   by its file name without `.exe`), and `PUT /audio/master` and `PUT /audio/apps/{process}`
   change them. Moving the volume of a muted output unmutes it, as Windows' own slider does.
-- `discord.voice` joins its channel (moving you out of any other voice channel), or
-  leaves it when you are already there. Add one button per channel. See
-  [Discord](#discord) for the one-time setup.
+- `discord.server` opens `discord://-/channels/<guild_id>`: Discord starts if needed,
+  shows the server and comes to the front. Its state is `launch` (running while Discord
+  runs). The button shows the server's icon once windows-link has read it from Discord;
+  see [Discord](#discord) for the one-time setup that needs.
 - `app.launch` opens `target` (an exe, a shortcut, a document, a URL, or a Store app as
   `shell:AppsFolder\<app ID>`; PowerShell's `Get-StartApps` lists the IDs) the way
   double-clicking it in Explorer does, with optional `args`. A program starts in its own
@@ -341,8 +342,9 @@ up; the panel's list and the log show how it goes.
 
 ## Discord
 
-The `discord.voice` buttons drive the Discord desktop app on the same PC through its local
-RPC, signed in as a Discord application of your own:
+A `discord.server` button opens its server without any setup. To show the server's icon,
+windows-link reads it from the Discord desktop app on the same PC through its local RPC,
+signed in as a Discord application of your own:
 
 1. In the [Developer Portal](https://discord.com/developers/applications), signed in
    with the account you use in the Discord app, create an application. Under OAuth2, add
@@ -357,25 +359,21 @@ RPC, signed in as a Discord application of your own:
      client_secret: your-client-secret
    ```
 
-3. With Discord running, run `windows-link discord-channels`. The first time, Discord
-   asks you to approve windows-link; then it lists the voice channels you can join:
+3. With Discord running, run `windows-link discord-servers`. The first time, Discord
+   asks you to approve windows-link; then it lists your servers with their IDs:
 
    ```text
-   My server
-     1556097803241918564  general-voice
+   1533091152293789877  My server
    ```
 
-4. Add a `discord.voice` button per channel you want, using the IDs from the list, and
+4. Add a `discord.server` button per server you want, using the IDs from the list, and
    restart the server.
 
 windows-link keeps the approval in `%LOCALAPPDATA%\windows-link\discord-token.json` and
-renews it before it expires. It connects to Discord while Discord runs and reconnects
-after Discord restarts; until then the buttons report `available: false` with the reason.
-Pressing one while Discord is not running starts Discord minimized and joins once it is
-ready (up to a minute). Joining does not bring Discord's window to the front.
-
-Press errors: `409 discord_unavailable` (Discord did not start or cannot be used, with the
-reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
+renews it before it expires. It connects to Discord while Discord runs, reads the
+servers' icons then and every hour, and reconnects after Discord restarts; the icons read
+last stay while Discord is closed. `GET /buttons/{id}/icon` redirects to the icon on
+Discord's CDN.
 
 ## API
 
@@ -410,8 +408,7 @@ reason), `409 discord_rejected` (the approval was turned down), `500 discord`.
 | `GET /events` | WebSocket: one `snapshot` message, then `button` and `desktops` messages as things change (below) |
 
 Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_unavailable`,
-`409 not_running`, `500 audio`, `409 discord_unavailable`, `409 discord_rejected`,
-`500 discord`, `409 no_window`, `500 launch`, `409 not_pressable` (a library button),
+`409 not_running`, `500 audio`, `409 no_window`, `500 launch`, `409 not_pressable` (a library button),
 `409 choose_program`, `409 no_program`,
 `400 invalid_label` (an empty or taken name, or Steam's own label), `409 labels_unavailable`
 (Steam cannot be asked now, with the reason), `500 labels`,

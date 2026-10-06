@@ -99,34 +99,11 @@ pub fn classify(message: &Value) -> Option<Incoming> {
     })
 }
 
-/// The channel to select when the button for `channel` is pressed: leave it (`None`)
-/// when already there, otherwise go there (moving from any other voice channel).
-pub fn toggle_target<'a>(selected: Option<&str>, channel: &'a str) -> Option<&'a str> {
-    (selected != Some(channel)).then_some(channel)
-}
-
-pub fn select_voice_channel(target: Option<&str>) -> Value {
-    // `force` moves the user out of another channel: pressing the button is the
-    // approval Discord asks for. `navigate: false` leaves Discord's window alone.
-    json!({ "channel_id": target, "force": true, "navigate": false })
-}
-
-/// The channel id in a channel object or `VOICE_CHANNEL_SELECT` payload (`null` = none).
-pub fn selected_channel(data: &Value) -> Option<String> {
-    data.get("channel_id")
-        .or_else(|| data.get("id"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{
-        Incoming, OP_FRAME, OP_HANDSHAKE, RpcError, classify, command, encode, header,
-        select_voice_channel, selected_channel, toggle_target,
-    };
+    use super::{Incoming, OP_FRAME, OP_HANDSHAKE, RpcError, classify, command, encode, header};
 
     #[test]
     fn frames_carry_the_opcode_and_length_little_endian() {
@@ -191,29 +168,5 @@ mod tests {
             })
         );
         assert_eq!(classify(&json!({ "cmd": "DISPATCH" })), None);
-    }
-
-    #[test]
-    fn pressing_joins_or_moves_unless_already_in_that_channel() {
-        assert_eq!(toggle_target(None, "1"), Some("1"));
-        assert_eq!(toggle_target(Some("2"), "1"), Some("1"));
-        assert_eq!(toggle_target(Some("1"), "1"), None);
-        assert_eq!(select_voice_channel(None)["channel_id"], json!(null));
-        assert_eq!(select_voice_channel(Some("1"))["force"], json!(true));
-        assert_eq!(select_voice_channel(Some("1"))["navigate"], json!(false));
-    }
-
-    #[test]
-    fn reads_the_selected_channel_from_events_and_channel_objects() {
-        assert_eq!(
-            selected_channel(&json!({ "channel_id": "9", "guild_id": "8" })).as_deref(),
-            Some("9")
-        );
-        assert_eq!(selected_channel(&json!({ "channel_id": null })), None);
-        assert_eq!(
-            selected_channel(&json!({ "id": "7", "name": "VC" })).as_deref(),
-            Some("7")
-        );
-        assert_eq!(selected_channel(&json!(null)), None);
     }
 }

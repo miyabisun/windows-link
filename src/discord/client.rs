@@ -30,7 +30,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the user has to answer Discord's authorization dialog.
 const AUTHORIZE_TIMEOUT: Duration = Duration::from_mins(3);
-/// The only scope needed: guilds, channels, voice channel selection and its events.
+/// The only scope needed: reading the servers and their icons.
 pub const SCOPES: [&str; 1] = ["rpc"];
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, RpcError>>>>>;
@@ -225,12 +225,6 @@ impl Client {
         self.command_with(cmd, args, None, COMMAND_TIMEOUT).await
     }
 
-    pub async fn subscribe(&self, evt: &str) -> Result<Value, CommandError> {
-        self.command_with("SUBSCRIBE", json!({}), Some(evt), COMMAND_TIMEOUT)
-            .await
-    }
-
-    /// The next event, or `None` once Discord has closed the connection.
     pub async fn next_event(&mut self) -> Option<(String, Value)> {
         self.events.recv().await
     }
@@ -249,7 +243,7 @@ impl std::fmt::Display for SignInError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NeedsApproval => f.write_str(
-                "windows-link needs approval in Discord: press a Discord button or run `windows-link discord-channels`",
+                "windows-link needs approval in Discord: run `windows-link discord-servers`",
             ),
             Self::Rejected => f.write_str("the authorization was turned down in Discord"),
             Self::Failed(message) => f.write_str(message),

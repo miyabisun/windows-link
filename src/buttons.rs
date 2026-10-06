@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::{
     audio::{Audio, AudioError, Device},
     config::{ButtonConfig, ButtonSpec, Config},
-    discord::{Voice, VoiceError, VoiceStatus},
+    discord::ServerIcons,
     launch::{Launcher, Processes, Program, is_running},
     library::{Pictures, Pin, Pinned},
 };
@@ -48,15 +48,9 @@ pub enum ButtonState {
         muted: bool,
         volume: f64,
     },
-    /// A Discord voice channel: `available` is false while Discord cannot be reached
-    /// (`reason` says why); a press still tries, starting Discord if needed.
-    Voice {
-        available: bool,
-        joined: bool,
-        reason: Option<String>,
-    },
     /// A program, shortcut or URL to open; `running` while its `process` runs, when
-    /// the button names one (a press then brings it to the front).
+    /// the button names one (a press then brings it to the front). A Discord server
+    /// button is `running` while Discord runs.
     Launch {
         running: bool,
     },
@@ -102,7 +96,6 @@ pub enum PressError {
         message: String,
     },
     Audio(AudioError),
-    Discord(String),
     Launch(String),
 }
 
@@ -152,24 +145,27 @@ impl AudioSnapshot {
 /// DLsite's favicon, which a `dlsite.library` button shows unless it names another icon.
 pub const DLSITE_ICON: &str = "https://www.dlsite.com/images/web/common/favicon.ico";
 
+/// The Discord desktop app's executable.
+const DISCORD_EXE: &str = "Discord.exe";
+
 /// The picture on the web the button shows: its `icon` when that is an `http(s)` URL,
-/// else DLsite's favicon for a DLsite library.
-pub fn icon_url(button: &ButtonConfig) -> Option<String> {
-    match &button.icon {
-        Some(icon) => {
+/// else DLsite's favicon for a DLsite library, or a Discord server's icon once read.
+pub fn icon_url(button: &ButtonConfig, server_icons: &ServerIcons) -> Option<String> {
+    match (&button.icon, &button.spec) {
+        (Some(icon), _) => {
             let icon = icon.to_string_lossy();
             (icon.starts_with("https://") || icon.starts_with("http://")).then(|| icon.into_owned())
         }
-        None => {
-            matches!(button.spec, ButtonSpec::DlsiteLibrary { .. }).then(|| DLSITE_ICON.to_owned())
-        }
+        (None, ButtonSpec::DlsiteLibrary { .. }) => Some(DLSITE_ICON.to_owned()),
+        (None, ButtonSpec::DiscordServer { guild_id }) => server_icons.get(guild_id).cloned(),
+        (None, _) => None,
     }
 }
 
 /// The file whose Windows icon the button shows: its `icon` (unless that is on the
 /// web), or what an `app.launch` button opens when that is a file.
 pub fn icon_path(button: &ButtonConfig) -> Option<PathBuf> {
-    if icon_url(button).is_some() {
+    if icon_url(button, &ServerIcons::new()).is_some() {
         return None;
     }
     if let Some(icon) = &button.icon {
@@ -186,7 +182,8 @@ pub fn icon_path(button: &ButtonConfig) -> Option<PathBuf> {
 /// Everything read once per refresh that the button states need.
 pub struct Readings<'a> {
     pub audio: &'a AudioSnapshot,
-    pub voice: &'a VoiceStatus,
+    /// Discord servers' icons read so far.
+    pub server_icons: &'a ServerIcons,
     pub processes: &'a Processes,
     pub pins: &'a Pinned,
 }
@@ -203,7 +200,7 @@ pub fn view(
         label: button.label.clone(),
         desktop: button.desktop.clone(),
         except: button.except.clone(),
-        icon: icon_url(button).is_some()
+        icon: icon_url(button, readings.server_icons).is_some()
             || icon_path(button).is_some_and(|path| {
                 path.to_string_lossy().to_lowercase().starts_with("shell:") || path.exists()
             }),
@@ -219,7 +216,6 @@ fn state(
 ) -> ButtonState {
     let spec = &button.spec;
     let snapshot = readings.audio;
-    let voice = readings.voice;
     match spec {
         ButtonSpec::OutputToggle {
             devices,
@@ -282,10 +278,8 @@ fn state(
                 message: error.to_string(),
             },
         },
-        ButtonSpec::DiscordVoice { channel_id } => ButtonState::Voice {
-            available: voice.available,
-            joined: voice.available && voice.selected.as_deref() == Some(channel_id.as_str()),
-            reason: voice.reason.clone(),
+        ButtonSpec::DiscordServer { .. } => ButtonState::Launch {
+            running: is_running(readings.processes, DISCORD_EXE),
         },
         ButtonSpec::AppLaunch { process, .. } => ButtonState::Launch {
             running: process
@@ -336,7 +330,6 @@ pub fn press(
     config: &Config,
     id: &str,
     audio: &dyn Audio,
-    voice: &dyn Voice,
     launcher: &dyn Launcher,
 ) -> Result<(), PressError> {
     let button = config
@@ -368,18 +361,14 @@ pub fn press(
             code: "not_pressable",
             message: "the mixer opens on the panel; use GET /audio/mixer".into(),
         }),
-        ButtonSpec::DiscordVoice { channel_id } => {
-            voice.toggle(channel_id).map_err(|error| match error {
-                VoiceError::Unavailable(message) => PressError::Conflict {
-                    code: "discord_unavailable",
-                    message,
-                },
-                VoiceError::Rejected => PressError::Conflict {
-                    code: "discord_rejected",
-                    message: error.to_string(),
-                },
-                VoiceError::Failed(message) => PressError::Discord(message),
-            })
+        ButtonSpec::DiscordServer { guild_id } => {
+            // Discord starts if needed and shows the server; it may come up behind the
+            // window that had the focus, so bring it forward too.
+            launcher
+                .open(&format!("discord://-/channels/{guild_id}"), None, false)
+                .map_err(PressError::Launch)?;
+            launcher.focus_when_ready(Program::Exe(DISCORD_EXE.into()));
+            Ok(())
         }
         ButtonSpec::AppLaunch {
             target,
@@ -432,22 +421,19 @@ mod tests {
         audio::{Audio, Device, fake::FakeAudio},
         buttons::AudioSnapshot,
         config,
-        discord::{Voice, VoiceStatus, fake::FakeVoice},
         launch::{Launcher, Processes, Program, fake::FakeLauncher},
         library::{Pictures, Pin, Pinned},
     };
 
-    fn no_voice() -> VoiceStatus {
-        VoiceStatus::unavailable("no Discord buttons")
-    }
-
     static NO_PROCESSES: std::sync::LazyLock<Processes> = std::sync::LazyLock::new(Processes::new);
     static NO_PINS: std::sync::LazyLock<Pinned> = std::sync::LazyLock::new(Pinned::new);
+    static NO_ICONS: std::sync::LazyLock<crate::discord::ServerIcons> =
+        std::sync::LazyLock::new(crate::discord::ServerIcons::new);
 
-    fn readings<'a>(audio: &'a AudioSnapshot, voice: &'a VoiceStatus) -> super::Readings<'a> {
+    fn readings(audio: &AudioSnapshot) -> super::Readings<'_> {
         super::Readings {
             audio,
-            voice,
+            server_icons: &NO_ICONS,
             processes: &NO_PROCESSES,
             pins: &NO_PINS,
         }
@@ -467,7 +453,7 @@ mod tests {
         let options = |index: usize| match view(
             &config,
             &config.buttons[index],
-            &readings(&snapshot, &no_voice()),
+            &readings(&snapshot),
             &audio,
         )
         .state
@@ -495,7 +481,11 @@ mod tests {
             "buttons:\n  - id: web\n    label: Web\n    type: app.launch\n    target: https://example.com\n    icon: https://example.com/favicon.ico\n  - id: dlsite\n    label: DLsite\n    type: dlsite.library\n  - id: steam\n    label: Steam\n    type: steam.library\n",
         )
         .unwrap();
-        let urls: Vec<_> = config.buttons.iter().map(icon_url).collect();
+        let urls: Vec<_> = config
+            .buttons
+            .iter()
+            .map(|b| icon_url(b, &crate::discord::ServerIcons::new()))
+            .collect();
         assert_eq!(
             urls,
             [
@@ -510,7 +500,7 @@ mod tests {
             view(
                 &config,
                 &config.buttons[index],
-                &readings(&snapshot, &no_voice()),
+                &readings(&snapshot),
                 &audio,
             )
             .icon
@@ -530,7 +520,7 @@ mod tests {
             view(
                 &config,
                 &config.buttons[index],
-                &readings(&snapshot, &no_voice()),
+                &readings(&snapshot),
                 &audio,
             )
             .state
@@ -542,9 +532,8 @@ mod tests {
                 volume: 0.5
             }
         );
-        let voice = FakeVoice::new(false, None);
         let launcher = FakeLauncher::default();
-        press(&config, "mute", &audio, &voice, &launcher).unwrap();
+        press(&config, "mute", &audio, &launcher).unwrap();
         assert!(audio.master().unwrap().muted);
         assert_eq!(
             state(1),
@@ -553,10 +542,10 @@ mod tests {
                 volume: 0.5
             }
         );
-        press(&config, "mute", &audio, &voice, &launcher).unwrap();
+        press(&config, "mute", &audio, &launcher).unwrap();
         assert!(!audio.master().unwrap().muted);
         assert!(matches!(
-            press(&config, "mixer", &audio, &voice, &launcher),
+            press(&config, "mixer", &audio, &launcher),
             Err(PressError::Conflict {
                 code: "not_pressable",
                 ..
@@ -578,14 +567,6 @@ buttons:
     type: audio.app_volume_toggle
     process: StreetFighter6.exe
     levels: [0.2, 1.0]
-  - id: vc-apex
-    label: APEX
-    type: discord.voice
-    channel_id: 111
-  - id: vc-sf6
-    label: SF6 VC
-    type: discord.voice
-    channel_id: 222
 ";
 
     fn devices() -> Vec<Device> {
@@ -628,23 +609,11 @@ buttons:
     fn output_press_switches_the_default_and_the_state_follows() {
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), Some("id-motu"));
-        press(
-            &config,
-            "output",
-            &audio,
-            &FakeVoice::new(false, None),
-            &FakeLauncher::default(),
-        )
-        .unwrap();
+        press(&config, "output", &audio, &FakeLauncher::default()).unwrap();
         assert_eq!(audio.default_output().unwrap().as_deref(), Some("id-jbl"));
 
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let view = view(
-            &config,
-            &config.buttons[0],
-            &readings(&snapshot, &no_voice()),
-            &audio,
-        );
+        let view = view(&config, &config.buttons[0], &readings(&snapshot), &audio);
         assert!(matches!(
             view.state,
             ButtonState::Output { current: Some(ref a), current_name: Some(ref n), .. }
@@ -657,14 +626,7 @@ buttons:
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), Some("id-motu"));
         audio.set_connected("id-jbl", false);
-        let error = press(
-            &config,
-            "output",
-            &audio,
-            &FakeVoice::new(false, None),
-            &FakeLauncher::default(),
-        )
-        .unwrap_err();
+        let error = press(&config, "output", &audio, &FakeLauncher::default()).unwrap_err();
         assert!(matches!(
             error,
             PressError::Conflict { code: "device_unavailable", ref message } if message.contains("JBL")
@@ -677,12 +639,7 @@ buttons:
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), Some("id-hdmi"));
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let view = view(
-            &config,
-            &config.buttons[0],
-            &readings(&snapshot, &no_voice()),
-            &audio,
-        );
+        let view = view(&config, &config.buttons[0], &readings(&snapshot), &audio);
         assert!(matches!(
             view.state,
             ButtonState::Output { current: None, current_name: Some(ref n), .. } if n == "HDMI"
@@ -694,21 +651,9 @@ buttons:
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), None);
         audio.set_volume("streetfighter6.exe", 1.0);
-        press(
-            &config,
-            "sf6",
-            &audio,
-            &FakeVoice::new(false, None),
-            &FakeLauncher::default(),
-        )
-        .unwrap();
+        press(&config, "sf6", &audio, &FakeLauncher::default()).unwrap();
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let view = view(
-            &config,
-            &config.buttons[1],
-            &readings(&snapshot, &no_voice()),
-            &audio,
-        );
+        let view = view(&config, &config.buttons[1], &readings(&snapshot), &audio);
         assert_eq!(
             view.state,
             ButtonState::Volume {
@@ -724,12 +669,7 @@ buttons:
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), None);
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let view = view(
-            &config,
-            &config.buttons[1],
-            &readings(&snapshot, &no_voice()),
-            &audio,
-        );
+        let view = view(&config, &config.buttons[1], &readings(&snapshot), &audio);
         assert!(matches!(
             view.state,
             ButtonState::Volume {
@@ -739,13 +679,7 @@ buttons:
             }
         ));
         assert!(matches!(
-            press(
-                &config,
-                "sf6",
-                &audio,
-                &FakeVoice::new(false, None),
-                &FakeLauncher::default()
-            ),
+            press(&config, "sf6", &audio, &FakeLauncher::default()),
             Err(PressError::Conflict {
                 code: "not_running",
                 ..
@@ -754,88 +688,60 @@ buttons:
     }
 
     #[test]
-    fn voice_buttons_each_show_whether_their_own_channel_is_joined() {
-        let config = config::parse(CONFIG).unwrap();
+    fn discord_server_buttons_bring_discord_up_on_their_server_with_its_icon() {
+        use super::icon_url;
+        use crate::discord::ServerIcons;
+
+        let config = config::parse(
+            "buttons:\n  - id: uf4\n    label: UF4\n    type: discord.server\n    guild_id: 1533\n  - id: other\n    label: Other\n    type: discord.server\n    guild_id: 99\n",
+        )
+        .unwrap();
         let audio = FakeAudio::new(devices(), None);
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let voice = FakeVoice::new(true, Some("111"));
-        let state = |i: usize| {
-            view(
-                &config,
-                &config.buttons[i],
-                &readings(&snapshot, &voice.status()),
-                &audio,
-            )
-            .state
-        };
+        let picture = "https://cdn.discordapp.com/icons/1533/d08.webp?size=128";
+        let icons = ServerIcons::from([("1533".to_owned(), picture.to_owned())]);
         let launcher = FakeLauncher::default();
+        launcher
+            .running
+            .lock()
+            .unwrap()
+            .insert("discord.exe".into());
+        let processes = launcher.processes();
+        let readings = super::Readings {
+            audio: &snapshot,
+            server_icons: &icons,
+            processes: &processes,
+            pins: &NO_PINS,
+        };
+        let uf4 = view(&config, &config.buttons[0], &readings, &audio);
+        assert_eq!(uf4.state, ButtonState::Launch { running: true });
+        assert!(uf4.icon);
         assert_eq!(
-            state(2),
-            ButtonState::Voice {
-                available: true,
-                joined: true,
-                reason: None
-            }
+            icon_url(&config.buttons[0], &icons).as_deref(),
+            Some(picture)
         );
-        assert_eq!(
-            state(3),
-            ButtonState::Voice {
-                available: true,
-                joined: false,
-                reason: None
-            }
-        );
-
-        // Pressing the other button moves there; pressing it again leaves.
-        press(&config, "vc-sf6", &audio, &voice, &launcher).unwrap();
-        assert_eq!(
-            state(2),
-            ButtonState::Voice {
-                available: true,
-                joined: false,
-                reason: None
-            }
-        );
-        assert_eq!(
-            state(3),
-            ButtonState::Voice {
-                available: true,
-                joined: true,
-                reason: None
-            }
-        );
-        press(&config, "vc-sf6", &audio, &voice, &launcher).unwrap();
-        assert_eq!(voice.status().selected, None);
-        assert_eq!(*voice.presses.lock().unwrap(), ["222", "222"]);
-    }
-
-    #[test]
-    fn voice_buttons_report_an_unreachable_discord() {
-        let config = config::parse(CONFIG).unwrap();
-        let audio = FakeAudio::new(devices(), None);
-        let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let voice = FakeVoice::new(false, None);
+        // A server whose icon has not been read (yet) has none.
+        assert!(!view(&config, &config.buttons[1], &readings, &audio).icon);
         assert_eq!(
             view(
                 &config,
-                &config.buttons[2],
-                &readings(&snapshot, &voice.status()),
-                &audio,
+                &config.buttons[0],
+                &self::readings(&snapshot),
+                &audio
             )
             .state,
-            ButtonState::Voice {
-                available: false,
-                joined: false,
-                reason: Some("Discord is not running".into())
-            }
+            ButtonState::Launch { running: false }
         );
-        assert!(matches!(
-            press(&config, "vc-apex", &audio, &voice, &FakeLauncher::default()),
-            Err(PressError::Conflict {
-                code: "discord_unavailable",
-                ..
-            })
-        ));
+
+        press(&config, "uf4", &audio, &launcher).unwrap();
+        assert_eq!(
+            *launcher.opened.lock().unwrap(),
+            ["discord://-/channels/1533"]
+        );
+        assert_eq!(
+            *launcher.awaited.lock().unwrap(),
+            [Program::Exe("Discord.exe".into())]
+        );
     }
 
     #[test]
@@ -846,9 +752,8 @@ buttons:
         .unwrap();
         let launcher = FakeLauncher::default();
         let audio = FakeAudio::new(devices(), None);
-        let voice = FakeVoice::new(false, None);
-        press(&config, "ba", &audio, &voice, &launcher).unwrap();
-        press(&config, "site", &audio, &voice, &launcher).unwrap();
+        press(&config, "ba", &audio, &launcher).unwrap();
+        press(&config, "site", &audio, &launcher).unwrap();
         assert_eq!(
             *launcher.opened.lock().unwrap(),
             ["C:/Games/ba.exe --fast", "https://example.com/"]
@@ -868,8 +773,7 @@ buttons:
         .unwrap();
         let launcher = FakeLauncher::default();
         let audio = FakeAudio::new(devices(), None);
-        let voice = FakeVoice::new(false, None);
-        press(&config, "ba", &audio, &voice, &launcher).unwrap();
+        press(&config, "ba", &audio, &launcher).unwrap();
         assert_eq!(*launcher.opened.lock().unwrap(), ["C:/Games/launcher.exe"]);
 
         launcher
@@ -879,10 +783,9 @@ buttons:
             .insert("bluearchive.exe".into());
         let snapshot = AudioSnapshot::read(&audio).unwrap();
         let processes = launcher.processes();
-        let status = no_voice();
         let readings = super::Readings {
             audio: &snapshot,
-            voice: &status,
+            server_icons: &NO_ICONS,
             processes: &processes,
             pins: &NO_PINS,
         };
@@ -890,14 +793,14 @@ buttons:
             view(&config, &config.buttons[0], &readings, &audio).state,
             ButtonState::Launch { running: true }
         );
-        press(&config, "ba", &audio, &voice, &launcher).unwrap();
+        press(&config, "ba", &audio, &launcher).unwrap();
         assert_eq!(
             *launcher.focused.lock().unwrap(),
             [Program::Exe("BlueArchive.exe".into())]
         );
         assert_eq!(launcher.opened.lock().unwrap().len(), 1);
 
-        press(&config, "admin", &audio, &voice, &launcher).unwrap();
+        press(&config, "admin", &audio, &launcher).unwrap();
         assert_eq!(launcher.opened.lock().unwrap()[1], "wt.exe (admin)");
         assert!(view(&config, &config.buttons[1], &readings, &audio).icon);
     }
@@ -910,21 +813,19 @@ buttons:
         .unwrap();
         let launcher = FakeLauncher::default();
         let audio = FakeAudio::new(devices(), None);
-        let voice = FakeVoice::new(false, None);
         let snapshot = AudioSnapshot::read(&audio).unwrap();
         let state = |launcher: &FakeLauncher| {
             let processes = launcher.processes();
-            let status = no_voice();
             let readings = super::Readings {
                 audio: &snapshot,
-                voice: &status,
+                server_icons: &NO_ICONS,
                 processes: &processes,
                 pins: &NO_PINS,
             };
             view(&config, &config.buttons[0], &readings, &audio).state
         };
         assert_eq!(state(&launcher), ButtonState::Game { running: false });
-        press(&config, "sf6", &audio, &voice, &launcher).unwrap();
+        press(&config, "sf6", &audio, &launcher).unwrap();
         assert_eq!(
             *launcher.opened.lock().unwrap(),
             ["steam://rungameid/1364780"]
@@ -940,7 +841,7 @@ buttons:
             .unwrap()
             .insert("streetfighter6.exe".into());
         assert_eq!(state(&launcher), ButtonState::Game { running: true });
-        press(&config, "sf6", &audio, &voice, &launcher).unwrap();
+        press(&config, "sf6", &audio, &launcher).unwrap();
         assert_eq!(state(&launcher), ButtonState::Game { running: false });
         assert_eq!(launcher.opened.lock().unwrap().len(), 1);
     }
@@ -953,7 +854,6 @@ buttons:
         .unwrap();
         let audio = FakeAudio::new(devices(), None);
         let snapshot = AudioSnapshot::read(&audio).unwrap();
-        let status = no_voice();
         let pinned = Pin {
             id: "1364780".into(),
             name: "Street Fighter 6".into(),
@@ -961,7 +861,7 @@ buttons:
         let pins: Pinned = [("library".to_owned(), vec![pinned.clone()])].into();
         let readings = super::Readings {
             audio: &snapshot,
-            voice: &status,
+            server_icons: &NO_ICONS,
             processes: &NO_PROCESSES,
             pins: &pins,
         };
@@ -982,13 +882,7 @@ buttons:
             }
         );
         assert!(matches!(
-            press(
-                &config,
-                "library",
-                &audio,
-                &FakeVoice::new(false, None),
-                &FakeLauncher::default()
-            ),
+            press(&config, "library", &audio, &FakeLauncher::default()),
             Err(PressError::Conflict {
                 code: "not_pressable",
                 ..
@@ -1001,13 +895,7 @@ buttons:
         let config = config::parse(CONFIG).unwrap();
         let audio = FakeAudio::new(devices(), None);
         assert_eq!(
-            press(
-                &config,
-                "nope",
-                &audio,
-                &FakeVoice::new(false, None),
-                &FakeLauncher::default()
-            ),
+            press(&config, "nope", &audio, &FakeLauncher::default()),
             Err(PressError::NotFound)
         );
     }

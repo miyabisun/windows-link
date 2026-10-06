@@ -22,7 +22,7 @@ use crate::{
     buttons::{self, AudioSnapshot, ButtonState, ButtonView, PressError},
     config::{ButtonSpec, Config},
     desktops::{self, VirtualDesktops},
-    discord::{NoVoice, Voice},
+    discord::{Discord, NoDiscord},
     icons,
     launch::{Launcher, windows::WindowsLauncher},
     library::{self, GameLibrary, KeyError, LabelError, NoLibrary, Picture, Pin, Pins},
@@ -41,7 +41,7 @@ pub struct AppState {
     audio: Arc<dyn Audio>,
     hub: Arc<Hub>,
     desktops: Option<Arc<dyn VirtualDesktops>>,
-    voice: Arc<dyn Voice>,
+    discord: Arc<dyn Discord>,
     launcher: Arc<dyn Launcher>,
     icons: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>>,
     pictures: Arc<std::sync::Mutex<Pictures>>,
@@ -66,7 +66,7 @@ impl AppState {
                 events,
             }),
             desktops: None,
-            voice: Arc::new(NoVoice("no Discord connection".into())),
+            discord: Arc::new(NoDiscord),
             launcher: Arc::new(WindowsLauncher),
             icons: Arc::default(),
             pictures: Arc::default(),
@@ -127,10 +127,10 @@ impl AppState {
         self
     }
 
-    /// Back the `discord.voice` buttons with a Discord connection.
+    /// Read the `discord.server` buttons' icons from a Discord connection.
     #[must_use]
-    pub fn with_voice(mut self, voice: Arc<dyn Voice>) -> Self {
-        self.voice = voice;
+    pub fn with_discord(mut self, discord: Arc<dyn Discord>) -> Self {
+        self.discord = discord;
         self
     }
 
@@ -172,14 +172,14 @@ impl AppState {
     pub async fn refresh(&self) -> Vec<ButtonView> {
         let config = self.config.clone();
         let audio = self.audio.clone();
-        let voice = self.voice.clone();
+        let server_icons = self.discord.icons();
         let launcher = self.launcher.clone();
         let pins = self.pins.clone();
         let views = tokio::task::spawn_blocking(move || {
             compute(
                 &config,
                 audio.as_ref(),
-                voice.as_ref(),
+                &server_icons,
                 launcher.as_ref(),
                 &pins,
             )
@@ -214,12 +214,11 @@ impl AppState {
 fn compute(
     config: &Config,
     audio: &dyn Audio,
-    voice: &dyn Voice,
+    server_icons: &crate::discord::ServerIcons,
     launcher: &dyn Launcher,
     pins: &Pins,
 ) -> Vec<ButtonView> {
     let snapshot = AudioSnapshot::read(audio);
-    let voice = voice.status();
     let processes = launcher.processes();
     let pins = pins.all().unwrap_or_else(|err| {
         warn!(%err, "cannot read the library pins");
@@ -232,7 +231,7 @@ fn compute(
             Ok(snapshot) => {
                 let readings = buttons::Readings {
                     audio: snapshot,
-                    voice: &voice,
+                    server_icons,
                     processes: &processes,
                     pins: &pins,
                 };
@@ -306,17 +305,10 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let config = state.config.clone();
     let audio = state.audio.clone();
-    let voice = state.voice.clone();
     let launcher = state.launcher.clone();
     let pressed_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        buttons::press(
-            &config,
-            &pressed_id,
-            audio.as_ref(),
-            voice.as_ref(),
-            launcher.as_ref(),
-        )
+        buttons::press(&config, &pressed_id, audio.as_ref(), launcher.as_ref())
     })
     .await;
     match result {
@@ -346,10 +338,6 @@ fn press_error(id: &str, failure: PressError, not_found: &str) -> Response {
         PressError::Launch(failure) => {
             warn!(button = %id, %failure, "press failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, "launch", &failure)
-        }
-        PressError::Discord(failure) => {
-            warn!(button = %id, %failure, "press failed");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "discord", &failure)
         }
         PressError::Audio(failure) => {
             warn!(button = %id, %failure, "press failed");
@@ -918,13 +906,14 @@ async fn unpin_item(
 
 /// The button's Windows icon as PNG, read once and then kept.
 async fn button_icon(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    // A picture on the web is the panel's to fetch.
+    // A picture on the web (a Discord server's icon among them) is the panel's to fetch.
+    let server_icons = state.discord.icons();
     let url = state
         .config
         .buttons
         .iter()
         .find(|b| b.id == id)
-        .and_then(buttons::icon_url);
+        .and_then(|button| buttons::icon_url(button, &server_icons));
     if let Some(url) = url {
         return axum::response::Redirect::temporary(&url).into_response();
     }
@@ -1447,6 +1436,35 @@ buttons:
         assert_eq!(body["error"], "not_found");
         let (status, _) = call(state, "GET", "/buttons/nope/library/1/keys").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_discord_servers_icon_is_a_redirect_to_its_picture() {
+        use crate::discord::{ServerIcons, fake::FakeDiscord};
+
+        let picture = "https://cdn.discordapp.com/icons/1533/d08.webp?size=128";
+        let state = AppState::new(
+            config::parse(
+                "buttons:\n  - id: uf4\n    label: UF4\n    type: discord.server\n    guild_id: 1533\n",
+            )
+            .unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        )
+        .with_discord(Arc::new(FakeDiscord(ServerIcons::from([(
+            "1533".to_owned(),
+            picture.to_owned(),
+        )]))));
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/buttons/uf4/icon")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+        assert_eq!(response.headers()["location"], picture);
     }
 
     #[tokio::test]

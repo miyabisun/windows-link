@@ -79,11 +79,11 @@ pub enum ButtonSpec {
     /// (`GET /audio/mixer`) instead of pressing.
     #[serde(rename = "audio.mixer")]
     Mixer {},
-    /// Join one Discord voice channel, or leave it when already there.
-    #[serde(rename = "discord.voice")]
-    DiscordVoice {
+    /// Bring Discord to the front showing one server, with the server's icon.
+    #[serde(rename = "discord.server")]
+    DiscordServer {
         #[serde(deserialize_with = "crate::secrets::id_text")]
-        channel_id: String,
+        guild_id: String,
     },
     /// Open a program, shortcut or URL the way double-clicking it in Explorer does.
     #[serde(rename = "app.launch")]
@@ -144,7 +144,7 @@ impl ButtonSpec {
             Self::AppVolumeToggle { .. } => "audio.app_volume_toggle",
             Self::MuteToggle {} => "audio.mute_toggle",
             Self::Mixer {} => "audio.mixer",
-            Self::DiscordVoice { .. } => "discord.voice",
+            Self::DiscordServer { .. } => "discord.server",
             Self::AppLaunch { .. } => "app.launch",
             Self::SteamGame { .. } => "steam.game",
             Self::SteamLibrary { .. } => "steam.library",
@@ -308,10 +308,10 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             | ButtonSpec::DlsiteLibrary { .. }
             | ButtonSpec::MuteToggle {}
             | ButtonSpec::Mixer {} => {}
-            ButtonSpec::DiscordVoice { channel_id } => {
-                if !channel_id.bytes().all(|b| b.is_ascii_digit()) {
+            ButtonSpec::DiscordServer { guild_id } => {
+                if !guild_id.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(ConfigError(format!(
-                        "button {id:?}: channel_id must be a Discord channel ID (digits; see `windows-link discord-channels`)"
+                        "button {id:?}: guild_id must be a Discord server ID (digits; see `windows-link discord-servers`)"
                     )));
                 }
             }
@@ -392,29 +392,35 @@ buttons:
     }
 
     #[test]
-    fn discord_voice_buttons_take_one_channel_each_quoted_or_not() {
+    fn discord_server_buttons_take_one_server_each_quoted_or_not() {
         let text = format!(
-            "{SAMPLE}  - id: vc-apex
-    label: APEX
-    type: discord.voice
-    channel_id: 1234567890123456789
-  - id: vc-sf6
+            "{SAMPLE}  - id: uf4
+    label: UF4
+    type: discord.server
+    guild_id: 1533091152293789877
+  - id: sf6
     label: SF6
-    type: discord.voice
-    channel_id: \"987\"
+    type: discord.server
+    guild_id: \"987\"
 "
         );
         let config = parse(&text).unwrap();
         assert!(matches!(
             &config.buttons[2].spec,
-            ButtonSpec::DiscordVoice { channel_id } if channel_id == "1234567890123456789"
+            ButtonSpec::DiscordServer { guild_id } if guild_id == "1533091152293789877"
         ));
         assert!(matches!(
             &config.buttons[3].spec,
-            ButtonSpec::DiscordVoice { channel_id } if channel_id == "987"
+            ButtonSpec::DiscordServer { guild_id } if guild_id == "987"
         ));
         let bad = text.replace("\"987\"", "general");
-        assert!(parse(&bad).unwrap_err().0.contains("channel_id"));
+        assert!(parse(&bad).unwrap_err().0.contains("guild_id"));
+        // The voice channel buttons are gone.
+        let voice = text.replace(
+            "discord.server\n    guild_id: 1533091152293789877",
+            "discord.voice\n    channel_id: 1",
+        );
+        assert!(parse(&voice).is_err());
     }
 
     #[test]

@@ -15,9 +15,10 @@ use windows_link::{
         winvd::{WinvdDesktops, watch as desktop_watch},
     },
     discord::{
-        NoVoice, Voice, channel_listing,
+        Discord, NoDiscord,
         client::{Client, ConnectError, sign_in},
-        service::DiscordVoice,
+        server_listing,
+        service::DiscordIcons,
         token,
     },
     dlsite::{self, DlsiteLibrary, DlsiteStore},
@@ -34,12 +35,12 @@ use windows_link::{
     update::{self, Updater, api as update_api, swap},
 };
 
-const USAGE: &str = "usage: windows-link [devices | discord-channels | --version]
+const USAGE: &str = "usage: windows-link [devices | discord-servers | --version]
 
-  (no argument)     run the server (PORT, LOG_LEVEL, WINDOWS_LINK_CONFIG, WINDOWS_LINK_UPDATE_URL)
-  devices           list audio output endpoints and their IDs for config.yaml
-  discord-channels  list the Discord voice channels you can join, with their IDs
-  --version         print the version";
+  (no argument)    run the server (PORT, LOG_LEVEL, WINDOWS_LINK_CONFIG, WINDOWS_LINK_UPDATE_URL)
+  devices          list audio output endpoints and their IDs for config.yaml
+  discord-servers  list your Discord servers with their IDs
+  --version        print the version";
 
 fn main() -> ExitCode {
     // Hook, cursor and monitor coordinates must all be physical pixels.
@@ -53,7 +54,7 @@ fn main() -> ExitCode {
     match args.as_slice() {
         [] => run_server(console),
         [command] if command == "devices" => list_devices(),
-        [command] if command == "discord-channels" => list_discord_channels(),
+        [command] if command == "discord-servers" => list_discord_servers(),
         [command] if command == "--version" => {
             println!("windows-link {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -133,13 +134,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     };
     let desktops: Arc<dyn VirtualDesktops> = Arc::new(WinvdDesktops);
     let defined = Arc::new(config.desktops.clone());
-    let voice = discord_voice(&config, changes.clone());
+    let discord = discord(&config, changes.clone());
     let database = data_dir().join("windows-link.db");
     let (libraries, dlsite_libraries) = libraries(&config, &database)?;
     let pins = Arc::new(Pins::open(&database)?);
     let mut state = AppState::new(config, audio)
         .with_desktops(desktops.clone())
-        .with_voice(voice)
+        .with_discord(discord)
         .with_pins(pins);
     for (button, library) in libraries {
         state = state.with_library(&button, library);
@@ -197,28 +198,28 @@ async fn bind_with_retry(addr: SocketAddr) -> std::io::Result<TcpListener> {
     }
 }
 
-/// Connect to Discord only when a button needs it.
-fn discord_voice(config: &config::Config, changes: Arc<Notify>) -> Arc<dyn Voice> {
+/// Connect to Discord only when a button needs it. Without the Discord app in
+/// `secrets.yaml` the buttons still work, without their servers' icons.
+fn discord(config: &config::Config, changes: Arc<Notify>) -> Arc<dyn Discord> {
     let needed = config
         .buttons
         .iter()
-        .any(|b| matches!(b.spec, ButtonSpec::DiscordVoice { .. }));
+        .any(|b| matches!(b.spec, ButtonSpec::DiscordServer { .. }));
     if !needed {
-        return Arc::new(NoVoice("no Discord buttons are configured".into()));
+        return Arc::new(NoDiscord);
     }
     let path = secrets::default_path();
     match secrets::load(&path) {
         Ok(secrets::Secrets {
             discord: Some(app), ..
-        }) => DiscordVoice::start(app, token::default_path(), changes),
+        }) => DiscordIcons::start(app, token::default_path(), changes),
         Ok(_) => {
-            let reason = format!("{} has no discord section", path.display());
-            warn!(%reason, "Discord buttons cannot work");
-            Arc::new(NoVoice(reason))
+            warn!(path = %path.display(), "no discord section: the server icons cannot be read");
+            Arc::new(NoDiscord)
         }
         Err(reason) => {
-            error!(%reason, "Discord buttons cannot work");
-            Arc::new(NoVoice(reason))
+            error!(%reason, "the Discord server icons cannot be read");
+            Arc::new(NoDiscord)
         }
     }
 }
@@ -304,7 +305,7 @@ fn steam_library() -> Arc<dyn GameLibrary> {
     library
 }
 
-fn list_discord_channels() -> ExitCode {
+fn list_discord_servers() -> ExitCode {
     let path = secrets::default_path();
     let app = match secrets::load(&path) {
         Ok(secrets::Secrets {
@@ -350,18 +351,7 @@ fn list_discord_channels() -> ExitCode {
             .command("GET_GUILDS", serde_json::json!({}))
             .await
             .map_err(|err| err.to_string())?;
-        let mut listing = Vec::new();
-        for guild in guilds["guilds"].as_array().into_iter().flatten() {
-            let channels = client
-                .command(
-                    "GET_CHANNELS",
-                    serde_json::json!({ "guild_id": guild["id"] }),
-                )
-                .await
-                .map_err(|err| err.to_string())?;
-            listing.push((guild.clone(), channels));
-        }
-        Ok::<_, String>(channel_listing(&listing))
+        Ok::<_, String>(server_listing(&guilds))
     });
     match listed {
         Ok(text) => {
