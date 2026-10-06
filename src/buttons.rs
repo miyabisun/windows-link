@@ -148,6 +148,13 @@ pub const DLSITE_ICON: &str = "https://www.dlsite.com/images/web/common/favicon.
 /// The Discord desktop app's executable.
 const DISCORD_EXE: &str = "Discord.exe";
 
+/// Discord's launcher, which starts the installed version (or hands its arguments to the
+/// running one).
+pub fn discord_update_exe() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA").map_or_else(PathBuf::new, PathBuf::from);
+    base.join("Discord").join("Update.exe")
+}
+
 /// The picture on the web the button shows: its `icon` when that is an `http(s)` URL,
 /// else DLsite's favicon for a DLsite library, or a Discord server's icon once read.
 pub fn icon_url(button: &ButtonConfig, server_icons: &ServerIcons) -> Option<String> {
@@ -362,10 +369,15 @@ pub fn press(
             message: "the mixer opens on the panel; use GET /audio/mixer".into(),
         }),
         ButtonSpec::DiscordServer { guild_id } => {
-            // Discord starts if needed and shows the server; it may come up behind the
-            // window that had the focus, so bring it forward too.
+            // Discord starts if needed and shows the server. Not through `discord://`: its
+            // registration names a version folder that Discord removes when it updates.
+            // Discord may come up behind the window that had the focus or on another
+            // virtual desktop, so bring it here too.
+            let args = format!(
+                "--processStart {DISCORD_EXE} --process-start-args \"--url -- discord://-/channels/{guild_id}\""
+            );
             launcher
-                .open(&format!("discord://-/channels/{guild_id}"), None, false)
+                .open(&discord_update_exe().to_string_lossy(), Some(&args), false)
                 .map_err(PressError::Launch)?;
             launcher.focus_when_ready(Program::Exe(DISCORD_EXE.into()));
             Ok(())
@@ -733,11 +745,17 @@ buttons:
             ButtonState::Launch { running: false }
         );
 
+        // Through Discord's own launcher: the `discord://` registration goes stale when
+        // Discord updates itself.
         press(&config, "uf4", &audio, &launcher).unwrap();
         assert_eq!(
             *launcher.opened.lock().unwrap(),
-            ["discord://-/channels/1533"]
+            [format!(
+                "{} --processStart Discord.exe --process-start-args \"--url -- discord://-/channels/1533\"",
+                super::discord_update_exe().display()
+            )]
         );
+        assert!(super::discord_update_exe().ends_with(r"Discord\Update.exe"));
         assert_eq!(
             *launcher.awaited.lock().unwrap(),
             [Program::Exe("Discord.exe".into())]

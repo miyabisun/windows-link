@@ -81,6 +81,20 @@ impl VirtualDesktops for WinvdDesktops {
     }
 }
 
+/// Move a window to the virtual desktop on screen, unless it is already there or shown
+/// on every desktop. Returns whether it moved.
+pub fn bring_to_current_desktop(hwnd: isize) -> Result<bool, String> {
+    let handle = HWND(hwnd as *mut c_void);
+    let here = ::winvd::is_pinned_window(handle).unwrap_or(false)
+        || ::winvd::is_window_on_current_desktop(handle).map_err(|e| failed("window", &e))?;
+    if here {
+        return Ok(false);
+    }
+    let current = ::winvd::get_current_desktop().map_err(|e| failed("current", &e))?;
+    ::winvd::move_window_to_desktop(current, &handle).map_err(|e| failed("move", &e))?;
+    Ok(true)
+}
+
 /// Report desktop list changes to `on_change` (with the event name) until the process
 /// exits. When Explorer restarts the listener stops working; the watcher notices on its
 /// health check, waits for the service to come back, re-subscribes and reports

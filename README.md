@@ -155,10 +155,13 @@ buttons:
   output's volume and mute and the applications with sound on it (one per program, named
   by its file name without `.exe`), and `PUT /audio/master` and `PUT /audio/apps/{process}`
   change them. Moving the volume of a muted output unmutes it, as Windows' own slider does.
-- `discord.server` opens `discord://-/channels/<guild_id>`: Discord starts if needed,
-  shows the server and comes to the front. Its state is `launch` (running while Discord
-  runs). The button shows the server's icon once windows-link has read it from Discord;
-  see [Discord](#discord) for the one-time setup that needs.
+- `discord.server` opens `discord://-/channels/<guild_id>` through Discord's own launcher
+  (`%LOCALAPPDATA%\Discord\Update.exe`; the `discord://` registration names a version
+  folder Discord removes when it updates): Discord starts if needed, shows the server, and
+  its window moves to the virtual desktop on screen and comes to the front. Its state is
+  `launch` (running while Discord runs). The button shows the server's icon once
+  windows-link has read it from Discord; see [Discord](#discord) for the one-time setup
+  that needs.
 - `app.launch` opens `target` (an exe, a shortcut, a document, a URL, or a Store app as
   `shell:AppsFolder\<app ID>`; PowerShell's `Get-StartApps` lists the IDs) the way
   double-clicking it in Explorer does, with optional `args`. A program starts in its own
@@ -166,8 +169,9 @@ buttons:
   brings its window to the front (restoring it when minimized) instead of opening another
   one. `admin: true` opens it as administrator, after Windows asks for consent.
 - `steam.game` starts the game through Steam (`steam://rungameid/<app_id>`) and brings its
-  window to the front as soon as it appears (started this way, a game would otherwise open
-  behind the window that had the focus and may not go full screen). It shows `running`
+  window to the virtual desktop on screen and to the front as soon as it appears (started
+  this way, a game would otherwise open behind the window that had the focus and may not
+  go full screen). It shows `running`
   while `process` runs; pressing it then asks the game's windows to close, like their close
   button (`409 no_window` while it has none yet).
 - `icon` (optional, any button type) is a file whose Windows icon the button shows: an exe,

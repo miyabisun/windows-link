@@ -36,10 +36,11 @@ pub trait Launcher: Send + Sync + 'static {
     /// Bring the program's main window to the front (restoring it when minimized).
     /// `Ok(false)` when it has no window to show.
     fn focus(&self, program: &Program) -> Result<bool, String>;
-    /// In the background, wait for the program's main window to appear and bring it to
-    /// the front once. A program started through another one (a game through Steam)
-    /// otherwise starts behind the window that had the focus, and a game then may not
-    /// go full screen.
+    /// In the background, wait for the program's main window to appear, move it to the
+    /// virtual desktop on screen and bring it to the front once. A program started
+    /// through another one (a game through Steam) otherwise starts behind the window
+    /// that had the focus, and a game then may not go full screen; a window already open
+    /// on another desktop (Discord) would take the screen to that desktop.
     fn focus_when_ready(&self, program: Program);
     /// Ask the process's windows to close, like clicking their close button. Returns
     /// how many windows were asked.
@@ -225,7 +226,18 @@ pub mod windows {
             std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + READY_TIMEOUT;
                 while std::time::Instant::now() < deadline {
-                    if main_window(&pids(&program)).is_some() {
+                    if let Some(hwnd) = main_window(&pids(&program)) {
+                        // Bringing forward a window on another virtual desktop would
+                        // switch to that desktop instead.
+                        match crate::desktops::winvd::bring_to_current_desktop(hwnd.0 as isize) {
+                            Ok(true) => {
+                                tracing::info!(%program, "moved the started program to this virtual desktop");
+                            }
+                            Ok(false) => {}
+                            Err(message) => {
+                                tracing::warn!(%message, "cannot move the started program to this virtual desktop");
+                            }
+                        }
                         match WindowsLauncher.focus(&program) {
                             Ok(_) => {
                                 tracing::info!(%program, "brought the started program to the front");
