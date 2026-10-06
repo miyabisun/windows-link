@@ -8,23 +8,15 @@
 //! found: DLsite Play's download link leads to the archive, or to a page listing the
 //! parts of a split one.
 
-use std::{
-    collections::HashMap,
-    io::{Read, Write},
-    path::Path,
-    time::Duration,
-};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use serde_json::Value;
 
-use crate::secrets::DlsiteAccount;
+pub use crate::shop::Work;
+use crate::{secrets::DlsiteAccount, shop::download};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const LIMIT: u64 = 32 * 1024 * 1024;
-/// How long one file may take to download; a stalled one is cut and continued later.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(6);
-/// How often a download reports its progress.
-const PROGRESS_STEP: u64 = 16 * 1024 * 1024;
 /// How many works DLsite Play describes in one request (its `page_limit`).
 const WORKS_PER_REQUEST: usize = 50;
 
@@ -212,73 +204,7 @@ impl Session {
         path: &Path,
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<(), String> {
-        let failed = |err: &dyn std::fmt::Display| format!("{}: {err}", file.name);
-        let have = std::fs::metadata(path).map_or(0, |meta| meta.len());
-        let request = self.agent.get(&file.url);
-        let request = if have > 0 {
-            request.header("Range", format!("bytes={have}-"))
-        } else {
-            request
-        };
-        let mut response = match request
-            .config()
-            .timeout_global(Some(DOWNLOAD_TIMEOUT))
-            .build()
-            .call()
-        {
-            Ok(response) => response,
-            // Nothing is left after the part already there.
-            Err(ureq::Error::StatusCode(416)) if have > 0 => return Ok(()),
-            Err(err) => return Err(failed(&err)),
-        };
-        let header = |name: &str| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-        };
-        if header("content-type").is_some_and(|kind| kind.contains("html")) {
-            return Err(failed(&"DLsite answered with a page instead of the file"));
-        }
-        let resumed = response.status() == 206;
-        let start = if resumed { have } else { 0 };
-        let total = header("content-range")
-            .and_then(|range| content_total(&range))
-            .or_else(|| {
-                header("content-length")
-                    .and_then(|length| length.parse::<u64>().ok())
-                    .map(|length| start + length)
-            })
-            .ok_or_else(|| failed(&"DLsite did not say how big it is"))?;
-        let mut out = if resumed {
-            std::fs::OpenOptions::new().append(true).open(path)
-        } else {
-            std::fs::File::create(path)
-        }
-        .map_err(|err| failed(&err))?;
-        let mut reader = response.body_mut().with_config().limit(u64::MAX).reader();
-        let mut buffer = vec![0; 1 << 20];
-        let mut written = start;
-        let mut reported = start;
-        loop {
-            let read = reader.read(&mut buffer).map_err(|err| failed(&err))?;
-            if read == 0 {
-                break;
-            }
-            out.write_all(&buffer[..read]).map_err(|err| failed(&err))?;
-            written += read as u64;
-            if written - reported >= PROGRESS_STEP {
-                progress(written, total);
-                reported = written;
-            }
-        }
-        progress(written, total);
-        if written == total {
-            Ok(())
-        } else {
-            Err(failed(&format!("got {written} of {total} bytes")))
-        }
+        download::fetch(&self.agent, &file.url, &file.name, path, progress)
     }
 }
 
@@ -297,24 +223,6 @@ pub fn fetch_public_images(ids: &[String]) -> Result<HashMap<String, String>, St
         )?));
     }
     Ok(found)
-}
-
-/// A purchased work.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Work {
-    /// Such as `RJ01464588`.
-    pub id: String,
-    pub name: String,
-    pub maker: String,
-    /// The main picture's URL.
-    pub image: Option<String>,
-    /// DLsite's work type, such as `RPG` or `SOU` (voice).
-    pub kind: String,
-    /// Whether it runs on Windows.
-    pub windows: bool,
-    /// When its latest version came out (its last update, else its release), as DLsite
-    /// writes it.
-    pub version: String,
 }
 
 /// The license keys on DLsite's page of a work that has them (`/home/serial/…`): the
@@ -394,16 +302,6 @@ pub fn file_name(url: &str) -> Option<String> {
     let plain =
         !name.is_empty() && name.chars().any(|c| c != '.') && !name.contains(['\\', ':', '\0']);
     plain.then(|| name.to_owned())
-}
-
-/// The whole size in a `Content-Range` header, such as `bytes 0-0/478276006`.
-pub fn content_total(range: &str) -> Option<u64> {
-    range
-        .strip_prefix("bytes ")?
-        .rsplit('/')
-        .next()?
-        .parse()
-        .ok()
 }
 
 /// The `_token` hidden field of DLsite's login form.
@@ -490,8 +388,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Work, content_total, file_name, license_keys, login_token, public_images, sales, signed_in,
-        split_parts, works,
+        Work, file_name, license_keys, login_token, public_images, sales, signed_in, split_parts,
+        works,
     };
 
     #[test]
@@ -656,13 +554,5 @@ mod tests {
             file_name("https://www.dlsite.com/home/download/=/product_id/RJ1.html"),
             None
         );
-    }
-
-    #[test]
-    fn reads_the_whole_size_of_a_range() {
-        assert_eq!(content_total("bytes 0-0/478276006"), Some(478_276_006));
-        assert_eq!(content_total("bytes */123"), Some(123));
-        assert_eq!(content_total("bytes 0-9/*"), None);
-        assert_eq!(content_total("nonsense"), None);
     }
 }

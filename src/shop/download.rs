@@ -1,30 +1,18 @@
-//! Downloading purchased DLsite games and their updates into the games folder:
-//! which works to fetch, where they go, and how an update is laid over the folder a
-//! game already has without touching its saves.
+//! Downloading purchased games and their updates into a shop's games folder: which
+//! works to fetch, fetching a file so a stopped download goes on, unpacking it, where
+//! it goes, and how an update is laid over the folder a game already has without
+//! touching its saves.
 
 use std::{
     collections::HashMap,
+    io::{Read, Write},
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 
-use super::play::Work;
-
-/// DLsite's work types of games (action, quiz, adventure, RPG, table, digital novel,
-/// simulation, typing, shooting, puzzle, other games).
-const GAME_KINDS: [&str; 11] = [
-    "ACN", "QIZ", "ADV", "RPG", "TBL", "DNV", "SLN", "TYP", "STG", "PZL", "ETC",
-];
-
-/// Whether a purchase is a game for this PC: a game that runs on Windows, and not the
-/// AI-translated data of a game in another language that comes with some purchases.
-pub fn is_game(work: &Work) -> bool {
-    GAME_KINDS.contains(&work.kind.as_str())
-        && work.windows
-        && !work.name.contains("ゲームデータ（AI翻訳）")
-}
+use super::Work;
 
 /// A folder name for a maker or title, as DLsiteNest names them: characters Windows
 /// does not allow become `_` and dots are left out.
@@ -41,24 +29,6 @@ pub fn folder_name(text: &str) -> String {
         "" => "_".to_owned(),
         name => name.to_owned(),
     }
-}
-
-/// A time DLsite gives, such as `2017-12-09T15:00:00.000000Z` (UTC).
-pub fn parse_date(text: &str) -> Option<SystemTime> {
-    let number = |at: std::ops::Range<usize>| text.get(at)?.parse::<i64>().ok();
-    if text.get(4..5)? != "-" || text.get(10..11)? != "T" {
-        return None;
-    }
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let seconds = number(11..13)? * 3600 + number(14..16)? * 60 + number(17..19)?;
-    // Days since 1970-01-01, by Howard Hinnant's days_from_civil.
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let of_era = year - era * 400;
-    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
-    let since = u64::try_from(days * 86_400 + seconds).ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(since))
 }
 
 /// A game on disk: its folder, the version windows-link put there (if it did), and
@@ -82,13 +52,18 @@ pub struct Plan<'a> {
     pub current: Vec<(&'a Work, String)>,
 }
 
-/// Plan the downloads. A folder windows-link filled is current while its version is
-/// the latest; any other folder is current when it changed after the latest version
-/// came out (DLsiteNest does not update games by itself).
+/// Plan the downloads of the games bought. A folder windows-link filled is current
+/// while its version is the latest; any other folder is current when it changed after
+/// the latest version came out (`released` reads the shop's dates; DLsiteNest does not
+/// update games by itself).
 #[allow(clippy::implicit_hasher, reason = "built by the library")]
-pub fn plan<'a>(purchases: &'a [Work], on_disk: &HashMap<String, OnDisk>) -> Plan<'a> {
+pub fn plan<'a>(
+    purchases: &'a [Work],
+    on_disk: &HashMap<String, OnDisk>,
+    released: &dyn Fn(&str) -> Option<SystemTime>,
+) -> Plan<'a> {
     let mut plan = Plan::default();
-    for work in purchases.iter().filter(|work| is_game(work)) {
+    for work in purchases {
         let Some(disk) = on_disk.get(&work.id) else {
             plan.fresh.push(work);
             continue;
@@ -96,7 +71,7 @@ pub fn plan<'a>(purchases: &'a [Work], on_disk: &HashMap<String, OnDisk>) -> Pla
         let current = if let Some(version) = &disk.version {
             *version >= work.version
         } else {
-            let current = parse_date(&work.version).is_none_or(|latest| disk.modified >= latest);
+            let current = released(&work.version).is_none_or(|latest| disk.modified >= latest);
             if current {
                 plan.current.push((work, work.version.clone()));
             }
@@ -169,19 +144,46 @@ fn merge(from: &Path, to: &Path, at: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Unpack the archive whose first file is `first` into `out`. A RAR (DLsite splits big
-/// works into `.part1.exe`, a self-extracting first part, and `.part<N>.rar`) goes
-/// through `UnRAR`. Anything else goes through Windows' own `tar.exe` (libarchive),
-/// without a console window. Names in a ZIP without the UTF-8 mark are read as UTF-8
-/// (DLsite's own archives write them so), else as CP932 (older Japanese archives).
-/// (`tar.exe` reads only the first part of a split RAR and says nothing.)
+/// The start of a RAR archive (versions 4 and 5).
+const RAR_MARK: &[u8] = b"Rar!\x1a\x07";
+/// How far into a self-extracting program its archive starts, at most.
+const SELF_EXTRACTING_STUB: u64 = 4 << 20;
+
+/// Whether `head` (the start of a file) holds a RAR archive's mark.
+pub fn has_rar_mark(head: &[u8]) -> bool {
+    head.windows(RAR_MARK.len()).any(|bytes| bytes == RAR_MARK)
+}
+
+/// Whether the file is a RAR: a `.rar`, or a self-extracting `.exe` with a RAR inside
+/// (a self-extracting ZIP is not one).
+fn is_rar(first: &Path) -> bool {
+    let extension = first
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase());
+    match extension.as_deref() {
+        Some("rar") => true,
+        Some("exe") => {
+            let mut head = Vec::new();
+            std::fs::File::open(first)
+                .and_then(|file| file.take(SELF_EXTRACTING_STUB).read_to_end(&mut head))
+                .is_ok()
+                && has_rar_mark(&head)
+        }
+        _ => false,
+    }
+}
+
+/// Unpack the archive whose first file is `first` into `out`. A RAR goes through
+/// `UnRAR`, all its parts: DLsite splits big works into `.part1.exe`, a self-extracting
+/// first part, and `.part<N>.rar`; FANZA into `<name>.exe` and `<name>.r00` on. Anything
+/// else (a ZIP, also a self-extracting one) goes through Windows' own `tar.exe`
+/// (libarchive), without a console window. Names in a ZIP without the UTF-8 mark are
+/// read as UTF-8 (DLsite's own archives write them so), else as CP932 (older Japanese
+/// archives). (`tar.exe` reads only the first part of a split RAR and says nothing.)
 pub fn unpack(first: &Path, out: &Path) -> Result<(), String> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::fs::create_dir_all(out).map_err(|err| format!("{}: {err}", out.display()))?;
-    let rar = first.extension().is_some_and(|extension| {
-        extension.eq_ignore_ascii_case("rar") || extension.eq_ignore_ascii_case("exe")
-    });
-    if rar {
+    if is_rar(first) {
         return unpack_rar(first, out);
     }
     let windows =
@@ -240,43 +242,126 @@ fn unpack_rar(first: &Path, out: &Path) -> Result<(), String> {
     unpacked.map_err(|err| format!("cannot unpack {}: {err}", first.display()))
 }
 
+/// How long one file may take to download; a stalled one is cut and continued later.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(6);
+/// How often a download reports its progress.
+const PROGRESS_STEP: u64 = 16 * 1024 * 1024;
+
+/// The whole size from a `Content-Range` header such as `bytes 0-9/1234`.
+pub fn content_total(range: &str) -> Option<u64> {
+    range
+        .strip_prefix("bytes ")?
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Download `url` (the file `name`) to `path`, going on from a part already there.
+/// `progress` hears the bytes on disk and the whole size now and then.
+pub fn fetch(
+    agent: &ureq::Agent,
+    url: &str,
+    name: &str,
+    path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), String> {
+    let failed = |err: &dyn std::fmt::Display| format!("{name}: {err}");
+    let have = std::fs::metadata(path).map_or(0, |meta| meta.len());
+    let request = agent.get(url);
+    let request = if have > 0 {
+        request.header("Range", format!("bytes={have}-"))
+    } else {
+        request
+    };
+    let mut response = match request
+        .config()
+        .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .build()
+        .call()
+    {
+        Ok(response) => response,
+        // Nothing is left after the part already there.
+        Err(ureq::Error::StatusCode(416)) if have > 0 => return Ok(()),
+        Err(err) => return Err(failed(&err)),
+    };
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    if header("content-type").is_some_and(|kind| kind.contains("html")) {
+        return Err(failed(&"the shop answered with a page instead of the file"));
+    }
+    let resumed = response.status() == 206;
+    let start = if resumed { have } else { 0 };
+    let total = header("content-range")
+        .and_then(|range| content_total(&range))
+        .or_else(|| {
+            header("content-length")
+                .and_then(|length| length.parse::<u64>().ok())
+                .map(|length| start + length)
+        })
+        .ok_or_else(|| failed(&"the shop did not say how big it is"))?;
+    let mut out = if resumed {
+        std::fs::OpenOptions::new().append(true).open(path)
+    } else {
+        std::fs::File::create(path)
+    }
+    .map_err(|err| failed(&err))?;
+    let mut reader = response.body_mut().with_config().limit(u64::MAX).reader();
+    let mut buffer = vec![0; 1 << 20];
+    let mut written = start;
+    let mut reported = start;
+    loop {
+        let read = reader.read(&mut buffer).map_err(|err| failed(&err))?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&buffer[..read]).map_err(|err| failed(&err))?;
+        written += read as u64;
+        if written - reported >= PROGRESS_STEP {
+            progress(written, total);
+            reported = written;
+        }
+    }
+    progress(written, total);
+    if written == total {
+        Ok(())
+    } else {
+        Err(failed(&format!("got {written} of {total} bytes")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        path::{Path, PathBuf},
-        time::{Duration, UNIX_EPOCH},
-    };
+    use std::path::{Path, PathBuf};
 
-    use super::{
-        OnDisk, Plan, content_root, folder_name, is_game, is_save, parse_date, place, plan,
-    };
-    use crate::dlsite::play::Work;
+    use super::{content_root, content_total, folder_name, has_rar_mark, is_save, place};
 
-    fn work(id: &str, kind: &str, windows: bool, version: &str) -> Work {
-        Work {
-            id: id.into(),
-            name: format!("{id} name"),
-            maker: "Maker".into(),
-            kind: kind.into(),
-            windows,
-            version: version.into(),
-            ..Work::default()
-        }
+    #[test]
+    fn rar_archives_are_told_by_their_mark_even_behind_a_self_extracting_program() {
+        assert!(has_rar_mark(b"Rar!\x1a\x07\x00\xcf\x90"));
+        let behind = |mark: &[u8]| {
+            let mut file = b"MZ\x90\x00".to_vec();
+            file.extend(vec![0; 4096]);
+            file.extend_from_slice(mark);
+            file
+        };
+        // RAR 5 inside a self-extracting first part, and a self-extracting ZIP.
+        assert!(has_rar_mark(&behind(b"Rar!\x1a\x07\x01\x00")));
+        assert!(!has_rar_mark(&behind(b"PK\x03\x04")));
+        assert!(!has_rar_mark(b"Rar!"));
     }
 
     #[test]
-    fn games_for_windows_are_downloaded_but_not_translations_or_phone_only_ones() {
-        assert!(is_game(&work("RJ1", "RPG", true, "")));
-        assert!(is_game(&work("RJ2", "SLN", true, "")));
-        // A voice work, a game for phones only.
-        assert!(!is_game(&work("RJ3", "SOU", true, "")));
-        assert!(!is_game(&work("RJ4", "ADV", false, "")));
-        let translated = Work {
-            name: "英語版ゲームデータ（AI翻訳） / ENG ver. Game Data (AI-translated).".into(),
-            ..work("RJ5", "RPG", true, "")
-        };
-        assert!(!is_game(&translated));
+    fn reads_the_whole_size_from_a_content_range() {
+        assert_eq!(content_total("bytes 0-0/478276006"), Some(478_276_006));
+        assert_eq!(content_total("bytes */123"), Some(123));
+        assert_eq!(content_total("bytes 0-9/*"), None);
+        assert_eq!(content_total("nonsense"), None);
     }
 
     #[test]
@@ -291,68 +376,6 @@ mod tests {
         assert_eq!(folder_name(r#"a\b*c"d<e>f|g"#), "a_b_c_d_e_f_g");
         assert_eq!(folder_name(" 名前. "), "名前");
         assert_eq!(folder_name("..."), "_");
-    }
-
-    #[test]
-    fn reads_dlsite_dates() {
-        let at = |s: u64| Some(UNIX_EPOCH + Duration::from_secs(s));
-        assert_eq!(parse_date("1970-01-02T00:00:01.000000Z"), at(86_401));
-        assert_eq!(parse_date("2017-12-09T15:00:00.000000Z"), at(1_512_831_600));
-        assert_eq!(parse_date("2017-12-09T15:00:00Z"), at(1_512_831_600));
-        assert_eq!(parse_date(""), None);
-        assert_eq!(parse_date("yesterday"), None);
-    }
-
-    #[test]
-    fn plans_new_games_updates_and_folders_already_current() {
-        let purchases = [
-            work("RJ1", "RPG", true, "2020-01-01T00:00:00.000000Z"),
-            work("RJ2", "RPG", true, "2024-01-01T00:00:00.000000Z"),
-            work("RJ3", "RPG", true, "2024-01-01T00:00:00.000000Z"),
-            work("RJ4", "RPG", true, "2024-01-01T00:00:00.000000Z"),
-            work("RJ5", "RPG", true, "2024-01-01T00:00:00.000000Z"),
-            work("RJ6", "SOU", true, "2024-01-01T00:00:00.000000Z"),
-        ];
-        let at = |date: &str| parse_date(date).unwrap();
-        let disk = |folder: &str, version: Option<&str>, modified: &str| OnDisk {
-            folder: PathBuf::from(folder),
-            version: version.map(str::to_owned),
-            modified: at(modified),
-        };
-        let on_disk = HashMap::from([
-            // Filled by windows-link with an older version, and with the latest.
-            (
-                "RJ2".to_owned(),
-                disk(
-                    "d2",
-                    Some("2023-01-01T00:00:00.000000Z"),
-                    "2023-02-01T00:00:00Z",
-                ),
-            ),
-            (
-                "RJ3".to_owned(),
-                disk(
-                    "d3",
-                    Some("2024-01-01T00:00:00.000000Z"),
-                    "2023-02-01T00:00:00Z",
-                ),
-            ),
-            // Put there by DLsiteNest before and after the latest version came out.
-            ("RJ4".to_owned(), disk("d4", None, "2023-06-01T00:00:00Z")),
-            ("RJ5".to_owned(), disk("d5", None, "2024-06-01T00:00:00Z")),
-        ]);
-        let plan = plan(&purchases, &on_disk);
-        assert_eq!(
-            plan,
-            Plan {
-                fresh: vec![&purchases[0]],
-                updates: vec![
-                    (&purchases[1], PathBuf::from("d2")),
-                    (&purchases[3], PathBuf::from("d4"))
-                ],
-                current: vec![(&purchases[4], "2024-01-01T00:00:00.000000Z".to_owned())],
-            }
-        );
     }
 
     #[test]

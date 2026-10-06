@@ -21,10 +21,11 @@ use windows_link::{
         service::DiscordIcons,
         token,
     },
-    dlsite::{self, DlsiteLibrary, DlsiteStore},
+    dlsite::{self, DlsiteLibrary, DlsiteShop},
     library::{GameLibrary, Pins},
     logging, port, secrets,
     server::{self, AppState},
+    shop::ShopStore,
     steam::{self, SteamLibrary},
     touch::{
         KeepCursor,
@@ -250,8 +251,7 @@ async fn refresh_dlsite(libraries: Vec<Arc<DlsiteLibrary>>, state: AppState) {
         state.forget_pictures();
         for library in &libraries {
             let library = Arc::clone(library);
-            let account = account.clone();
-            let _ = tokio::task::spawn_blocking(move || library.download(account.as_ref())).await;
+            let _ = tokio::task::spawn_blocking(move || library.download()).await;
         }
         tokio::time::sleep(DLSITE_REFRESH).await;
     }
@@ -274,14 +274,14 @@ fn libraries(
                 let store = if let Some(store) = &dlsite_store {
                     Arc::clone(store)
                 } else {
-                    let store = Arc::new(DlsiteStore::open(database)?);
+                    let store = Arc::new(ShopStore::open(database, "dlsite")?);
                     dlsite_store = Some(Arc::clone(&store));
                     store
                 };
                 let root = root
                     .clone()
                     .unwrap_or_else(|| std::path::PathBuf::from(dlsite::DEFAULT_ROOT));
-                let library = Arc::new(DlsiteLibrary::new(root, store));
+                let library = Arc::new(DlsiteLibrary::new(root, store, DlsiteShop::default()));
                 dlsite.push(Arc::clone(&library));
                 library
             }

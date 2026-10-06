@@ -13,6 +13,7 @@ pub mod port;
 pub mod power;
 pub mod secrets;
 pub mod server;
+pub mod shop;
 pub mod steam;
 pub mod touch;
 pub mod update;
