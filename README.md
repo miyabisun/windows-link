@@ -166,8 +166,8 @@ buttons:
   `shell:AppsFolder\<app ID>`; PowerShell's `Get-StartApps` lists the IDs) the way
   double-clicking it in Explorer does, with optional `args`. A program starts in its own
   folder. With `process`, the state shows `running` while that exe runs, and a press then
-  brings its window to the front (restoring it when minimized) instead of opening another
-  one. `admin: true` opens it as administrator, after Windows asks for consent.
+  brings its window to the virtual desktop on screen and to the front (restoring it when
+  minimized) instead of opening another one. `admin: true` opens it as administrator, after Windows asks for consent.
 - `steam.game` starts the game through Steam (`steam://rungameid/<app_id>`) and brings its
   window to the virtual desktop on screen and to the front as soon as it appears (started
   this way, a game would otherwise open behind the window that had the focus and may not
