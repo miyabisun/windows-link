@@ -60,12 +60,14 @@ pub enum ButtonState {
     },
     /// A game library the panel opens (`GET /buttons/{id}/library`) instead of
     /// pressing; `pins` are the games pinned to the button's tab, in order,
-    /// `pictures` says whether the games' pictures are store art or program icons, and
-    /// `license_keys` whether a game's license keys can be read (`GET …/keys`).
+    /// `pictures` says whether the games' pictures are store art or program icons,
+    /// `license_keys` whether a game's license keys can be read (`GET …/keys`), and
+    /// `sign_in` the shop the user has to sign in to through the panel, when so.
     Library {
         pins: Vec<Pin>,
         pictures: Pictures,
         license_keys: bool,
+        sign_in: Option<String>,
     },
     Error {
         message: String,
@@ -145,6 +147,9 @@ impl AudioSnapshot {
 /// DLsite's favicon, which a `dlsite.library` button shows unless it names another icon.
 pub const DLSITE_ICON: &str = "https://www.dlsite.com/images/web/common/favicon.ico";
 
+/// FANZA's favicon, which a `fanza.library` button shows unless it names another icon.
+pub const FANZA_ICON: &str = "https://accounts.dmm.co.jp/images/favicon.ico";
+
 /// The Discord desktop app's executable.
 const DISCORD_EXE: &str = "Discord.exe";
 
@@ -156,7 +161,8 @@ pub fn discord_update_exe() -> PathBuf {
 }
 
 /// The picture on the web the button shows: its `icon` when that is an `http(s)` URL,
-/// else DLsite's favicon for a DLsite library, or a Discord server's icon once read.
+/// else DLsite's or FANZA's favicon for their libraries, or a Discord server's icon once
+/// read.
 pub fn icon_url(button: &ButtonConfig, server_icons: &ServerIcons) -> Option<String> {
     match (&button.icon, &button.spec) {
         (Some(icon), _) => {
@@ -164,6 +170,7 @@ pub fn icon_url(button: &ButtonConfig, server_icons: &ServerIcons) -> Option<Str
             (icon.starts_with("https://") || icon.starts_with("http://")).then(|| icon.into_owned())
         }
         (None, ButtonSpec::DlsiteLibrary { .. }) => Some(DLSITE_ICON.to_owned()),
+        (None, ButtonSpec::FanzaLibrary { .. }) => Some(FANZA_ICON.to_owned()),
         (None, ButtonSpec::DiscordServer { guild_id }) => server_icons.get(guild_id).cloned(),
         (None, _) => None,
     }
@@ -193,6 +200,8 @@ pub struct Readings<'a> {
     pub server_icons: &'a ServerIcons,
     pub processes: &'a Processes,
     pub pins: &'a Pinned,
+    /// The shop each library button needs signing in to, by button ID.
+    pub sign_ins: &'a std::collections::HashMap<String, String>,
 }
 
 pub fn view(
@@ -296,13 +305,14 @@ fn state(
         ButtonSpec::SteamGame { process, .. } => ButtonState::Game {
             running: is_running(readings.processes, process),
         },
-        ButtonSpec::SteamLibrary { .. } | ButtonSpec::DlsiteLibrary { .. } => {
-            ButtonState::Library {
-                pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
-                pictures: spec.pictures().unwrap_or_default(),
-                license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
-            }
-        }
+        ButtonSpec::SteamLibrary { .. }
+        | ButtonSpec::DlsiteLibrary { .. }
+        | ButtonSpec::FanzaLibrary { .. } => ButtonState::Library {
+            pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
+            pictures: spec.pictures().unwrap_or_default(),
+            license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
+            sign_in: readings.sign_ins.get(&button.id).cloned(),
+        },
     }
 }
 
@@ -400,12 +410,12 @@ pub fn press(
                 .open(target, args.as_deref(), *admin)
                 .map_err(PressError::Launch)
         }
-        ButtonSpec::SteamLibrary { .. } | ButtonSpec::DlsiteLibrary { .. } => {
-            Err(PressError::Conflict {
-                code: "not_pressable",
-                message: "a library opens on the panel; use GET /buttons/{id}/library".into(),
-            })
-        }
+        ButtonSpec::SteamLibrary { .. }
+        | ButtonSpec::DlsiteLibrary { .. }
+        | ButtonSpec::FanzaLibrary { .. } => Err(PressError::Conflict {
+            code: "not_pressable",
+            message: "a library opens on the panel; use GET /buttons/{id}/library".into(),
+        }),
         ButtonSpec::SteamGame { app_id, process } => {
             if is_running(&launcher.processes(), process) {
                 match launcher.close(process).map_err(PressError::Launch)? {
@@ -441,6 +451,8 @@ mod tests {
     static NO_PINS: std::sync::LazyLock<Pinned> = std::sync::LazyLock::new(Pinned::new);
     static NO_ICONS: std::sync::LazyLock<crate::discord::ServerIcons> =
         std::sync::LazyLock::new(crate::discord::ServerIcons::new);
+    static NO_SIGN_INS: std::sync::LazyLock<std::collections::HashMap<String, String>> =
+        std::sync::LazyLock::new(std::collections::HashMap::new);
 
     fn readings(audio: &AudioSnapshot) -> super::Readings<'_> {
         super::Readings {
@@ -448,7 +460,57 @@ mod tests {
             server_icons: &NO_ICONS,
             processes: &NO_PROCESSES,
             pins: &NO_PINS,
+            sign_ins: &NO_SIGN_INS,
         }
+    }
+
+    #[test]
+    fn a_fanza_library_shows_its_icon_and_when_it_needs_signing_in() {
+        use super::{FANZA_ICON, icon_url};
+        use crate::library::Pictures;
+
+        let config = config::parse(
+            "buttons:
+  - id: fanza
+    label: FANZA
+    type: fanza.library
+",
+        )
+        .unwrap();
+        assert_eq!(
+            icon_url(&config.buttons[0], &crate::discord::ServerIcons::new()).as_deref(),
+            Some(FANZA_ICON)
+        );
+        let audio = FakeAudio::new(devices(), None);
+        let snapshot = AudioSnapshot::read(&audio).unwrap();
+        let sign_ins = std::collections::HashMap::from([("fanza".to_owned(), "fanza".to_owned())]);
+        let state = |sign_ins| {
+            let readings = super::Readings {
+                sign_ins,
+                ..readings(&snapshot)
+            };
+            view(&config, &config.buttons[0], &readings, &audio).state
+        };
+        assert_eq!(
+            state(&sign_ins),
+            ButtonState::Library {
+                pins: vec![],
+                pictures: Pictures::Whole,
+                license_keys: false,
+                sign_in: Some("fanza".into()),
+            }
+        );
+        assert!(matches!(
+            state(&NO_SIGN_INS),
+            ButtonState::Library { sign_in: None, .. }
+        ));
+        assert!(matches!(
+            press(&config, "fanza", &audio, &FakeLauncher::default()),
+            Err(PressError::Conflict {
+                code: "not_pressable",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -724,6 +786,7 @@ buttons:
             server_icons: &icons,
             processes: &processes,
             pins: &NO_PINS,
+            sign_ins: &NO_SIGN_INS,
         };
         let uf4 = view(&config, &config.buttons[0], &readings, &audio);
         assert_eq!(uf4.state, ButtonState::Launch { running: true });
@@ -806,6 +869,7 @@ buttons:
             server_icons: &NO_ICONS,
             processes: &processes,
             pins: &NO_PINS,
+            sign_ins: &NO_SIGN_INS,
         };
         assert_eq!(
             view(&config, &config.buttons[0], &readings, &audio).state,
@@ -839,6 +903,7 @@ buttons:
                 server_icons: &NO_ICONS,
                 processes: &processes,
                 pins: &NO_PINS,
+                sign_ins: &NO_SIGN_INS,
             };
             view(&config, &config.buttons[0], &readings, &audio).state
         };
@@ -882,13 +947,15 @@ buttons:
             server_icons: &NO_ICONS,
             processes: &NO_PROCESSES,
             pins: &pins,
+            sign_ins: &NO_SIGN_INS,
         };
         assert_eq!(
             view(&config, &config.buttons[0], &readings, &audio).state,
             ButtonState::Library {
                 pins: vec![pinned],
                 pictures: Pictures::Cover,
-                license_keys: false
+                license_keys: false,
+                sign_in: None
             }
         );
         assert_eq!(
@@ -896,7 +963,8 @@ buttons:
             ButtonState::Library {
                 pins: vec![],
                 pictures: Pictures::Whole,
-                license_keys: true
+                license_keys: true,
+                sign_in: None
             }
         );
         assert!(matches!(

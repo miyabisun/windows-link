@@ -234,6 +234,7 @@ impl GameLibrary for SteamLibrary {
         let owned = self.owned.lock().unwrap_or_else(PoisonError::into_inner);
         let mut listing = Listing {
             labels_locked: locked,
+            sign_in: None,
             ..listing(
                 owned.as_deref().map_err(String::as_str),
                 &installed,
@@ -625,6 +626,7 @@ pub fn listing(
         labels,
         partial,
         labels_locked: None,
+        sign_in: None,
     }
 }
 

@@ -57,6 +57,9 @@ pub struct Listing {
     pub partial: Option<String>,
     /// Why labels cannot be changed right now, when they cannot.
     pub labels_locked: Option<String>,
+    /// The shop the user has to sign in to through the panel before the games bought
+    /// are listed and downloaded (`fanza`), when it is so.
+    pub sign_in: Option<String>,
 }
 
 /// A license key (serial number) a game asks for, as its store shows it.
@@ -170,6 +173,10 @@ pub trait GameLibrary: Send + Sync + 'static {
     /// Remember which program starts the item.
     fn choose_program(&self, _id: &str, _program: &str) -> Result<(), LabelError> {
         Err(LabelError::NotFound)
+    }
+    /// The shop the user has to sign in to through the panel (`fanza`), when it is so.
+    fn sign_in(&self) -> Option<&'static str> {
+        None
     }
     /// The license keys the item's store keeps for it (none when it has none).
     fn license_keys(&self, _id: &str) -> Result<Vec<LicenseKey>, KeyError> {
@@ -407,6 +414,7 @@ pub mod fake {
                 labels: labels.iter().map(|(label, _)| label.clone()).collect(),
                 partial: None,
                 labels_locked: None,
+                sign_in: None,
             }
         }
 

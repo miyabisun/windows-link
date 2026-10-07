@@ -15,7 +15,7 @@ use axum::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, broadcast};
 use tower_http::trace::TraceLayer;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     audio::Audio,
@@ -48,6 +48,8 @@ pub struct AppState {
     /// Each library button's library, by button ID.
     libraries: Arc<std::collections::HashMap<String, Arc<dyn GameLibrary>>>,
     pins: Arc<Pins>,
+    /// FANZA's sign-in, and how to start a FANZA round at once, when a button needs it.
+    fanza: Option<(Arc<crate::fanza::Client>, Arc<Notify>)>,
 }
 
 struct Hub {
@@ -72,6 +74,7 @@ impl AppState {
             pictures: Arc::default(),
             libraries: Arc::default(),
             pins: Arc::new(Pins::in_memory().expect("an in-memory database opens")),
+            fanza: None,
         }
     }
 
@@ -107,9 +110,9 @@ impl AppState {
             .iter()
             .find(|b| b.id == id)
             .and_then(|b| match &b.spec {
-                ButtonSpec::SteamLibrary { hide } | ButtonSpec::DlsiteLibrary { hide, .. } => {
-                    Some(hide.clone())
-                }
+                ButtonSpec::SteamLibrary { hide }
+                | ButtonSpec::DlsiteLibrary { hide, .. }
+                | ButtonSpec::FanzaLibrary { hide, .. } => Some(hide.clone()),
                 _ => None,
             })?;
         let library = self.libraries.get(id).cloned().unwrap_or_else(|| {
@@ -118,6 +121,14 @@ impl AppState {
             ))
         });
         Some((hide, library))
+    }
+
+    /// Take FANZA's sign-in from the panel (`PUT /fanza/session`) into `client`, then
+    /// wake the FANZA round through `wake`.
+    #[must_use]
+    pub fn with_fanza(mut self, client: Arc<crate::fanza::Client>, wake: Arc<Notify>) -> Self {
+        self.fanza = Some((client, wake));
+        self
     }
 
     /// Start programs and read running processes through `launcher` (tests use a fake).
@@ -175,11 +186,17 @@ impl AppState {
         let server_icons = self.discord.icons();
         let launcher = self.launcher.clone();
         let pins = self.pins.clone();
+        let sign_ins: std::collections::HashMap<String, String> = self
+            .libraries
+            .iter()
+            .filter_map(|(id, library)| Some((id.clone(), library.sign_in()?.to_owned())))
+            .collect();
         let views = tokio::task::spawn_blocking(move || {
             compute(
                 &config,
                 audio.as_ref(),
                 &server_icons,
+                &sign_ins,
                 launcher.as_ref(),
                 &pins,
             )
@@ -215,6 +232,7 @@ fn compute(
     config: &Config,
     audio: &dyn Audio,
     server_icons: &crate::discord::ServerIcons,
+    sign_ins: &std::collections::HashMap<String, String>,
     launcher: &dyn Launcher,
     pins: &Pins,
 ) -> Vec<ButtonView> {
@@ -232,6 +250,7 @@ fn compute(
                 let readings = buttons::Readings {
                     audio: snapshot,
                     server_icons,
+                    sign_ins,
                     processes: &processes,
                     pins: &pins,
                 };
@@ -284,6 +303,7 @@ pub fn app(state: AppState) -> Router {
             "/buttons/{id}/pins/{item}",
             axum::routing::put(pin_item).delete(unpin_item),
         )
+        .route("/fanza/session", axum::routing::put(fanza_session))
         .route("/power/sleep", post(sleep))
         .route("/events", get(events))
         .layer(TraceLayer::new_for_http())
@@ -292,6 +312,41 @@ pub fn app(state: AppState) -> Router {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+#[derive(serde::Deserialize)]
+struct FanzaSession {
+    cookies: Vec<crate::fanza::session::Cookie>,
+}
+
+/// Keep the cookies of the panel's FANZA login window, then read the purchases and
+/// download what is missing at once.
+async fn fanza_session(
+    State(state): State<AppState>,
+    Json(session): Json<FanzaSession>,
+) -> Response {
+    let Some((client, wake)) = state.fanza.clone() else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no FANZA library is set up",
+        );
+    };
+    let kept = tokio::task::spawn_blocking(move || client.replace(session.cookies)).await;
+    match kept {
+        Ok(Ok(kept)) => {
+            info!(kept, "signed in to FANZA through the panel");
+            wake.notify_one();
+            state.refresh().await;
+            Json(json!({ "kept": kept })).into_response()
+        }
+        Ok(Err(reason)) => error(StatusCode::BAD_REQUEST, "invalid_session", &reason),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
 }
 
 async fn list_buttons(State(state): State<AppState>) -> Json<Vec<ButtonView>> {
@@ -398,6 +453,7 @@ async fn library_listing(State(state): State<AppState>, Path(id): Path<String>) 
         "hide": hidden,
         "partial": listing.partial,
         "labels_locked": listing.labels_locked,
+        "sign_in": listing.sign_in,
     }))
     .into_response()
 }
@@ -1327,6 +1383,68 @@ buttons:
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn the_panels_fanza_sign_in_is_kept_and_starts_a_round() {
+        use serde_json::json;
+
+        let file = std::env::temp_dir().join(format!(
+            "windows-link-fanza-session-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        let client = Arc::new(crate::fanza::Client::open(file.clone()));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (plain, _) = state();
+        let state = plain.clone().with_fanza(client.clone(), wake.clone());
+        let cookie = |name: &str, domain: &str| {
+            json!({ "name": name, "value": "v", "domain": domain, "path": "/",
+                    "expires": 4_102_444_800_i64, "secure": true, "http_only": true })
+        };
+
+        // Without a login cookie nothing changes.
+        let (status, body) = send(
+            state.clone(),
+            "PUT",
+            "/fanza/session",
+            json!({ "cookies": [cookie("guest_id", "dmm.co.jp")] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_session");
+        assert!(!client.signed_in());
+
+        let (status, body) = send(
+            state.clone(),
+            "PUT",
+            "/fanza/session",
+            json!({ "cookies": [
+                cookie("login_secure_id", ".dmm.co.jp"),
+                cookie("laravel_session", "dlsoft.dmm.co.jp"),
+                // Other sites' cookies stay out.
+                cookie("tracker", ".example.com"),
+            ] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // DMM's two and the age check FANZA asks for once.
+        assert_eq!(body["kept"], 3);
+        assert!(client.signed_in());
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("login_secure_id")
+        );
+        // The FANZA round starts now rather than hours later.
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&file);
+
+        // Without a FANZA library there is nothing to sign in to.
+        let (status, _) = send(plain, "PUT", "/fanza/session", json!({ "cookies": [] })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

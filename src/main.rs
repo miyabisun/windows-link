@@ -22,6 +22,7 @@ use windows_link::{
         token,
     },
     dlsite::{self, DlsiteLibrary, DlsiteShop},
+    fanza::{self, FanzaLibrary, FanzaShop},
     library::{GameLibrary, Pins},
     logging, port, secrets,
     server::{self, AppState},
@@ -137,18 +138,25 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let defined = Arc::new(config.desktops.clone());
     let discord = discord(&config, changes.clone());
     let database = data_dir().join("windows-link.db");
-    let (libraries, dlsite_libraries) = libraries(&config, &database)?;
+    let libraries = libraries(&config, &database)?;
     let pins = Arc::new(Pins::open(&database)?);
     let mut state = AppState::new(config, audio)
         .with_desktops(desktops.clone())
         .with_discord(discord)
         .with_pins(pins);
-    for (button, library) in libraries {
+    for (button, library) in libraries.buttons {
         state = state.with_library(&button, library);
     }
+    let fanza_wake = Arc::new(Notify::new());
+    if let Some(client) = libraries.fanza_client {
+        state = state.with_fanza(client, fanza_wake.clone());
+    }
     tokio::spawn(state.clone().run_refresher(changes));
-    if !dlsite_libraries.is_empty() {
-        tokio::spawn(refresh_dlsite(dlsite_libraries, state.clone()));
+    if !libraries.dlsite.is_empty() {
+        tokio::spawn(refresh_dlsite(libraries.dlsite, state.clone()));
+    }
+    if !libraries.fanza.is_empty() {
+        tokio::spawn(refresh_fanza(libraries.fanza, state.clone(), fanza_wake));
     }
     let runtime = tokio::runtime::Handle::current();
     let publisher = state.clone();
@@ -225,13 +233,19 @@ fn discord(config: &config::Config, changes: Arc<Notify>) -> Arc<dyn Discord> {
     }
 }
 
-/// Library buttons by ID with their libraries, and the DLsite libraries among them.
-type Libraries = (Vec<(String, Arc<dyn GameLibrary>)>, Vec<Arc<DlsiteLibrary>>);
+/// Library buttons by ID with their libraries, the shops' libraries among them, and
+/// FANZA's sign-in when a button needs it.
+struct Libraries {
+    buttons: Vec<(String, Arc<dyn GameLibrary>)>,
+    dlsite: Vec<Arc<DlsiteLibrary>>,
+    fanza: Vec<Arc<FanzaLibrary>>,
+    fanza_client: Option<Arc<fanza::Client>>,
+}
 
-/// How often the DLsite games are identified again (new purchases and installs).
-const DLSITE_REFRESH: std::time::Duration = std::time::Duration::from_hours(6);
+/// How often the shops' purchases are read again (new purchases and installs).
+const SHOP_REFRESH: std::time::Duration = std::time::Duration::from_hours(6);
 
-/// Identify the DLsite games now and every `DLSITE_REFRESH`, with the account in
+/// Identify the DLsite games now and every `SHOP_REFRESH`, with the account in
 /// `secrets.yaml` when there is one, let the pictures be read again, then download the
 /// games bought but not there yet and the updates (the next round waits for them).
 async fn refresh_dlsite(libraries: Vec<Arc<DlsiteLibrary>>, state: AppState) {
@@ -253,7 +267,30 @@ async fn refresh_dlsite(libraries: Vec<Arc<DlsiteLibrary>>, state: AppState) {
             let library = Arc::clone(library);
             let _ = tokio::task::spawn_blocking(move || library.download()).await;
         }
-        tokio::time::sleep(DLSITE_REFRESH).await;
+        tokio::time::sleep(SHOP_REFRESH).await;
+    }
+}
+
+/// Read the FANZA purchases now and every `SHOP_REFRESH`, or at once after the user
+/// signs in through the panel, let the pictures be read again, then download the games
+/// bought but not there yet.
+async fn refresh_fanza(libraries: Vec<Arc<FanzaLibrary>>, state: AppState, wake: Arc<Notify>) {
+    loop {
+        for library in &libraries {
+            let library = Arc::clone(library);
+            let _ = tokio::task::spawn_blocking(move || library.refresh()).await;
+        }
+        state.forget_pictures();
+        // A sign-in that ended shows on the button now.
+        state.refresh().await;
+        for library in &libraries {
+            let library = Arc::clone(library);
+            let _ = tokio::task::spawn_blocking(move || library.download()).await;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(SHOP_REFRESH) => {}
+            () = wake.notified() => {}
+        }
     }
 }
 
@@ -266,6 +303,9 @@ fn libraries(
     let mut steam: Option<Arc<dyn GameLibrary>> = None;
     let mut dlsite_store = None;
     let mut dlsite = Vec::new();
+    let mut fanza_store = None;
+    let mut fanza_client: Option<Arc<fanza::Client>> = None;
+    let mut fanza = Vec::new();
     let mut out = Vec::new();
     for button in &config.buttons {
         let library: Arc<dyn GameLibrary> = match &button.spec {
@@ -285,11 +325,34 @@ fn libraries(
                 dlsite.push(Arc::clone(&library));
                 library
             }
+            ButtonSpec::FanzaLibrary { root, .. } => {
+                let store = if let Some(store) = &fanza_store {
+                    Arc::clone(store)
+                } else {
+                    let store = Arc::new(ShopStore::open(database, "fanza")?);
+                    fanza_store = Some(Arc::clone(&store));
+                    store
+                };
+                let client = Arc::clone(fanza_client.get_or_insert_with(|| {
+                    Arc::new(fanza::Client::open(fanza::session::default_path()))
+                }));
+                let root = root
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from(fanza::DEFAULT_ROOT));
+                let library = Arc::new(FanzaLibrary::new(root, store, FanzaShop::new(client)));
+                fanza.push(Arc::clone(&library));
+                library
+            }
             _ => continue,
         };
         out.push((button.id.clone(), library));
     }
-    Ok((out, dlsite))
+    Ok(Libraries {
+        buttons: out,
+        dlsite,
+        fanza,
+        fanza_client,
+    })
 }
 
 fn steam_library() -> Arc<dyn GameLibrary> {

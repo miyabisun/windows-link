@@ -117,6 +117,17 @@ pub enum ButtonSpec {
         #[serde(default)]
         hide: Vec<String>,
     },
+    /// Search the FANZA games bought on the panel, start them, and pin them to the tab;
+    /// the games bought but not here yet are downloaded.
+    #[serde(rename = "fanza.library")]
+    FanzaLibrary {
+        /// `<brand><title>` folders; `D:anza` by default.
+        #[serde(default)]
+        root: Option<PathBuf>,
+        /// Labels whose games are listed only while the label is selected.
+        #[serde(default)]
+        hide: Vec<String>,
+    },
     /// Start a Steam game, or close it while it runs.
     #[serde(rename = "steam.game")]
     SteamGame {
@@ -129,11 +140,11 @@ pub enum ButtonSpec {
 
 impl ButtonSpec {
     /// How a library button's pictures are shown: Steam's wide art fills a tile, DLsite's
-    /// pictures and icons are shown whole.
+    /// and FANZA's pictures and icons are shown whole.
     pub fn pictures(&self) -> Option<Pictures> {
         match self {
             Self::SteamLibrary { .. } => Some(Pictures::Cover),
-            Self::DlsiteLibrary { .. } => Some(Pictures::Whole),
+            Self::DlsiteLibrary { .. } | Self::FanzaLibrary { .. } => Some(Pictures::Whole),
             _ => None,
         }
     }
@@ -149,6 +160,7 @@ impl ButtonSpec {
             Self::SteamGame { .. } => "steam.game",
             Self::SteamLibrary { .. } => "steam.library",
             Self::DlsiteLibrary { .. } => "dlsite.library",
+            Self::FanzaLibrary { .. } => "fanza.library",
         }
     }
 }
@@ -306,6 +318,7 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             }
             ButtonSpec::SteamLibrary { .. }
             | ButtonSpec::DlsiteLibrary { .. }
+            | ButtonSpec::FanzaLibrary { .. }
             | ButtonSpec::MuteToggle {}
             | ButtonSpec::Mixer {} => {}
             ButtonSpec::DiscordServer { guild_id } => {
@@ -523,6 +536,38 @@ buttons:
             ButtonSpec::DlsiteLibrary { root: Some(root), .. } if root == std::path::Path::new("E:/Games")
         ));
         assert_eq!(config.buttons[0].spec.type_name(), "dlsite.library");
+    }
+
+    #[test]
+    fn fanza_library_buttons_take_an_optional_folder() {
+        let files = vec![(
+            "コミック".to_owned(),
+            "buttons:
+  - id: fanza
+    label: FANZA
+    type: fanza.library
+    hide: [非表示]
+  - id: other
+    label: Other
+    type: fanza.library
+    root: E:/fanza
+"
+            .to_owned(),
+        )];
+        let config = super::parse_all("", &files).unwrap();
+        assert!(matches!(
+            &config.buttons[0].spec,
+            ButtonSpec::FanzaLibrary { root: None, hide } if hide == &["非表示"]
+        ));
+        assert!(matches!(
+            &config.buttons[1].spec,
+            ButtonSpec::FanzaLibrary { root: Some(root), .. } if root == std::path::Path::new("E:/fanza")
+        ));
+        assert_eq!(config.buttons[0].spec.type_name(), "fanza.library");
+        assert_eq!(
+            config.buttons[0].spec.pictures(),
+            Some(crate::library::Pictures::Whole)
+        );
     }
 
     #[test]

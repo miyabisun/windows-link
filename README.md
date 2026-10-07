@@ -17,6 +17,7 @@ Each button does one thing:
 | `steam.game` | starts a Steam game, or closes it while it runs | whether it runs |
 | `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
 | `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
+| `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -177,7 +178,8 @@ buttons:
 - `icon` (optional, any button type) is a file whose Windows icon the button shows: an exe,
   a shortcut, an image or a `shell:AppsFolder\…` app; or a picture's `https://` URL, which
   the panel loads itself (`GET …/icon` redirects there). `app.launch` buttons show their
-  target's icon without it, and `dlsite.library` buttons DLsite's favicon.
+  target's icon without it, and `dlsite.library` and `fanza.library` buttons their shop's
+  favicon.
 - `device_icons` (optional, `audio.output_toggle`) says what each of the two devices is,
   `speaker` or `headphones`, in the same order: each option in the state carries it as
   `icon`, so the panel can show the current one. Windows calls Bluetooth earbuds
@@ -344,6 +346,43 @@ up; the panel's list and the log show how it goes.
 - **Failures** (DLsite refusing, a full disk, an archive that does not unpack) are logged,
   shown as the game's `status`, and tried again 6 hours later.
 
+## FANZA library
+
+A `fanza.library` button gives a panel the PC games bought on FANZA (DMM's adult shop; its
+library also lists games from DMM's all-ages shop), run the same way as the [DLsite
+library](#dlsite-library): windows-link reads the purchases at start, every 6 hours and
+right after signing in, downloads the games not there yet into `<brand>\<title>` under
+`D:\fanza`, and lists them with their package pictures. For example in
+`desktops/コミック.yaml`:
+
+```yaml
+buttons:
+  - id: fanza
+    label: FANZA
+    type: fanza.library
+    root: D:\fanza   # optional; this is the default
+    hide: [非表示]
+```
+
+- **Signing in**: DMM checks its login page for bots, so windows-link never signs in with a
+  password. While it has no sign-in, or DMM no longer takes it, the button's state and the
+  listing say `sign_in: "fanza"`, and the panel offers a login window where you sign in
+  yourself (it shows on the primary monitor). The panel hands that window's DMM cookies to
+  windows-link (`PUT /fanza/session`), which keeps them in
+  `%LOCALAPPDATA%\windows-link\fanza-session.json` and from then on renews DMM's session
+  itself, saving every cookie DMM replaces. The window is a private one of its own, so
+  signing in there does not touch a browser's sign-in, and a browser's sign-in is never
+  read.
+- **Downloads**: one game at a time from FANZA's library (`/ajax/v1/library`), going on
+  where a stopped download left off. A ZIP, a self-extracting ZIP or RAR, and a split RAR
+  (`<name>setup.exe` with `<name>setup_.r00` on, or `.part1.exe` with `.part<N>.rar`) are
+  unpacked. Many games need FANZA's `ソフト電池` runtime, which asks you to sign in when
+  such a game first starts. Sets of several works are not read yet.
+- **Serial codes**: FANZA sends a game's serial code by e-mail, so `GET …/keys` has none.
+- **Labels, programs and pins** work as in the DLsite library, kept in `fanza_*` tables of
+  `windows-link.db`; a game's ID is its FANZA product ID (such as `alice_0024`). A folder
+  without a record is matched to the purchase of the same brand and title.
+
 ## Discord
 
 A `discord.server` button opens its server without any setup. To show the server's icon,
@@ -387,7 +426,7 @@ Discord's CDN.
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, or a redirect to it on the web, when `icon` is true |
-| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now) |
+| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null, "sign_in": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now, `sign_in` the shop to sign in to through the panel) |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
 | `GET /audio/mixer` | the default output's volume and mute and the applications with sound on it: `{"master": {volume, muted}, "apps": [{process, name, volume}]}` (volumes 0–1) |
@@ -406,6 +445,7 @@ Discord's CDN.
 | `POST /desktops/{id}/switch` | switch to a virtual desktop; returns the new `GET /desktops` body |
 | `POST /windows/{hwnd}/pin` | show a window on every virtual desktop (`hwnd` in decimal or `0x` hex) |
 | `GET /touch-monitors`, `PUT /touch-monitors/{id}` | see [Touch and the mouse cursor](#touch-and-the-mouse-cursor) |
+| `PUT /fanza/session` | `{"cookies": [{name, value, domain, path, expires, secure, http_only}]}` from the panel's FANZA login window: keep DMM's cookies and read the purchases at once; returns `{"kept": n}` (`400 invalid_session` without a login cookie, `404` without a FANZA library) |
 | `POST /power/sleep` | put the PC to sleep (answers `202` first) |
 | `GET /version` | `{"version": "0.1.0"}` |
 | `POST /update/check` | check for an update now (see [Updates](#updates)) |

@@ -623,6 +623,7 @@ pub fn listing(
         labels: labels.iter().map(|(label, _)| label.clone()).collect(),
         partial: None,
         labels_locked: None,
+        sign_in: None,
     }
 }
 
@@ -680,6 +681,10 @@ pub trait Shop: Send + Sync + 'static {
     ) -> Result<Vec<PathBuf>, String>;
     /// A work's license keys, read from the shop each time.
     fn license_keys(&self, work: &str) -> Result<Vec<LicenseKey>, KeyError>;
+    /// The shop the user has to sign in to through the panel, when it is so.
+    fn sign_in(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A shop's games under one folder, `<root>\<maker>\<title>`.
@@ -924,6 +929,7 @@ impl<S: Shop> GameLibrary for ShopLibrary<S> {
                         .into_iter()
                         .map(|(l, _)| l)
                         .collect(),
+                    sign_in: self.shop.sign_in().map(str::to_owned),
                     ..Listing::default()
                 };
             }
@@ -949,6 +955,7 @@ impl<S: Shop> GameLibrary for ShopLibrary<S> {
         let purchases = self.purchases();
         let coming = waiting(&purchases, &here, &labels, &progress);
         listing.items.splice(0..0, coming);
+        listing.sign_in = self.shop.sign_in().map(str::to_owned);
         listing
     }
 
@@ -1032,6 +1039,10 @@ impl<S: Shop> GameLibrary for ShopLibrary<S> {
             return Err(KeyError::NotFound);
         }
         self.shop.license_keys(id)
+    }
+
+    fn sign_in(&self) -> Option<&'static str> {
+        self.shop.sign_in()
     }
 
     fn choose_program(&self, id: &str, program: &str) -> Result<(), LabelError> {
