@@ -608,6 +608,31 @@ mod tests {
     }
 
     #[test]
+    fn updating_wakes_the_round_of_downloads_once_it_can_download() {
+        use futures_util::FutureExt;
+
+        use crate::library::{Update, UpdateError};
+
+        let root = games("update");
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let library = library(&root).with_wake(wake.clone());
+        // Without the account nothing can be downloaded.
+        assert!(matches!(
+            library.update(&[]),
+            Err(UpdateError::Unavailable(_))
+        ));
+        assert!(wake.notified().now_or_never().is_none());
+
+        *library.shop().account.lock().unwrap() = Some(crate::secrets::DlsiteAccount {
+            login_id: "id".into(),
+            password: "password".into(),
+        });
+        assert_eq!(library.update(&[]), Ok(Update::Round));
+        assert!(wake.notified().now_or_never().is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_games_folder_lists_its_games_and_starts_them() {
         let root = games("start");
         let library = library(&root);

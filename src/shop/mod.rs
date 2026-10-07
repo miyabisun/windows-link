@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::library::{
     GameLibrary, Item, KeyError, Label, LabelError, LicenseKey, Listing, Picture, Programs, Start,
-    StartError,
+    StartError, Update, UpdateError,
 };
 
 pub mod download;
@@ -696,6 +696,8 @@ pub struct ShopLibrary<S> {
     pub(crate) purchases: Mutex<Vec<Work>>,
     /// How each download or update planned this round is going, by work ID.
     pub(crate) progress: Mutex<HashMap<String, String>>,
+    /// Wakes the round of downloads and updates before its time.
+    wake: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl<S: Shop> ShopLibrary<S> {
@@ -706,7 +708,15 @@ impl<S: Shop> ShopLibrary<S> {
             shop,
             purchases: Mutex::default(),
             progress: Mutex::default(),
+            wake: std::sync::Arc::default(),
         }
+    }
+
+    /// Share `wake` with the round of downloads and updates, which `update` wakes.
+    #[must_use]
+    pub fn with_wake(mut self, wake: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        self.wake = wake;
+        self
     }
 
     pub fn shop(&self) -> &S {
@@ -1043,6 +1053,22 @@ impl<S: Shop> GameLibrary for ShopLibrary<S> {
 
     fn sign_in(&self) -> Option<&'static str> {
         self.shop.sign_in()
+    }
+
+    /// Start the round of downloads and updates now rather than at its time, or right
+    /// after the one under way. Every game bought is downloaded, as in each round.
+    fn update(&self, _hide: &[String]) -> Result<Update, UpdateError> {
+        if self.shop.sign_in().is_some() {
+            return Err(UpdateError::SignIn);
+        }
+        if !self.shop.ready() {
+            return Err(UpdateError::Unavailable(format!(
+                "{} cannot download games now",
+                self.shop.name()
+            )));
+        }
+        self.wake.notify_one();
+        Ok(Update::Round)
     }
 
     fn choose_program(&self, id: &str, program: &str) -> Result<(), LabelError> {

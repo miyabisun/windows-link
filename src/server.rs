@@ -25,7 +25,9 @@ use crate::{
     discord::{Discord, NoDiscord},
     icons,
     launch::{Launcher, windows::WindowsLauncher},
-    library::{self, GameLibrary, KeyError, LabelError, NoLibrary, Picture, Pin, Pins},
+    library::{
+        self, GameLibrary, KeyError, LabelError, NoLibrary, Picture, Pin, Pins, Update, UpdateError,
+    },
     power,
 };
 
@@ -278,6 +280,7 @@ pub fn app(state: AppState) -> Router {
         .route("/buttons/{id}/press", post(press_button))
         .route("/buttons/{id}/icon", get(button_icon))
         .route("/buttons/{id}/library", get(library_listing))
+        .route("/buttons/{id}/library/update", post(update_library))
         .route("/buttons/{id}/library/{item}/start", post(start_item))
         .route("/buttons/{id}/library/{item}/image", get(item_picture))
         .route("/buttons/{id}/library/{item}/folder", post(open_folder))
@@ -650,6 +653,40 @@ async fn license_keys(
         ),
         Ok(Err(KeyError::Unavailable(reason))) => {
             error(StatusCode::CONFLICT, "keys_unavailable", &reason)
+        }
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// Bring a library button's games up to date, leaving out the labels it hides: Steam
+/// answers how many games it updates and shows to install
+/// (`{"updates", "installs"}`); a shop starts its round of downloads (`202`).
+async fn update_library(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some((hide, library)) = state.library_button(&id) else {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    };
+    match tokio::task::spawn_blocking(move || library.update(&hide)).await {
+        Ok(Ok(Update::Steam { updates, installs })) => {
+            Json(json!({ "updates": updates, "installs": installs })).into_response()
+        }
+        Ok(Ok(Update::Round)) => {
+            (StatusCode::ACCEPTED, Json(json!({ "round": true }))).into_response()
+        }
+        Ok(Err(UpdateError::SignIn)) => error(
+            StatusCode::CONFLICT,
+            "sign_in",
+            "sign in to the shop through the panel first",
+        ),
+        Ok(Err(UpdateError::Unavailable(reason))) => {
+            error(StatusCode::CONFLICT, "update_unavailable", &reason)
+        }
+        Ok(Err(UpdateError::Failed(message))) => {
+            warn!(button = %id, %message, "library update failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "update", &message)
         }
         Err(join) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1735,6 +1772,49 @@ buttons:
                 .unwrap()
                 .contains("no game library")
         );
+    }
+
+    #[tokio::test]
+    async fn updating_a_library_says_what_it_started_or_why_not() {
+        use crate::library::{Update, UpdateError, fake::FakeLibrary};
+
+        let library = Arc::new(FakeLibrary::new());
+        *library.updates.lock().unwrap() = vec![
+            Ok(Update::Steam {
+                updates: 0,
+                installs: 2,
+            }),
+            Ok(Update::Round),
+            Err(UpdateError::SignIn),
+            Err(UpdateError::Unavailable("Steam is not running".into())),
+            Err(UpdateError::Failed("TypeError: boom".into())),
+        ];
+        let (state, _) = library_state();
+        let state = state.with_library("games", library.clone());
+        let update = || call(state.clone(), "POST", "/buttons/games/library/update");
+
+        let (status, body) = update().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"updates": 0, "installs": 2}));
+        // The labels the button hides are left out.
+        assert_eq!(*library.hidden.lock().unwrap(), [["非表示"]]);
+        let (status, body) = update().await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body, serde_json::json!({"round": true}));
+        let (status, body) = update().await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "sign_in");
+        let (status, body) = update().await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "update_unavailable");
+        assert_eq!(body["message"], "Steam is not running");
+        let (status, body) = update().await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "update");
+
+        let (status, body) = call(state.clone(), "POST", "/buttons/other/library/update").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
     }
 
     #[tokio::test]

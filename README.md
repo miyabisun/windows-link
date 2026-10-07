@@ -196,7 +196,7 @@ you made (dynamic collections are left out). For example in `desktops/ゲーム.
 ```yaml
 buttons:
   - id: steam-library
-    label: Game search
+    label: Steam
     type: steam.library
     hide: [非表示]         # collections whose games are listed only while selected
     icon: C:\Program Files (x86)\Steam\steam.exe
@@ -243,7 +243,8 @@ New-Item -ItemType File -Force "${env:ProgramFiles(x86)}\Steam\.cef-enable-remot
 ```
 
 then restart Steam. Steam then serves the Chrome DevTools protocol on `127.0.0.1:8080`,
-where windows-link calls the collection store of Steam's library page. Accepted risk: any
+where windows-link calls the collection store of Steam's library page, and its downloads
+and installs for [updating the library](#updating-the-library). Accepted risk: any
 program on this PC can control the Steam client through that port; remove the file and
 restart Steam to close it.
 
@@ -251,6 +252,17 @@ While Steam answers there, the labels come from it, so changes show at once. Whe
 not running or does not accept remote control, the labels are read from Steam's
 collection file and `labels_locked` says why they cannot be changed. Names must be new
 (ignoring case): Steam would replace a collection with the same name.
+
+### Updating the library
+
+`POST /buttons/{id}/library/update` asks the Steam client, through the same remote
+control, for every game the account has and how each is on this PC (with or without the
+Web API key). Leaving out the games in the button's `hide` collections and apps that are
+not games (dedicated servers, SDKs, soundtracks), it goes on with each update or
+download Steam has not run (queued, required, paused or failed), as Steam's own library
+does, and opens Steam's install screen for the games that are not installed. That screen
+shows on Steam's window: pick the folder there and accept any EULA to start the installs.
+The answer counts both: `{"updates": 3, "installs": 24}`.
 
 ## DLsite library
 
@@ -318,8 +330,8 @@ nowhere on this PC and never logged; the panel shows them with a copy button.
 
 ### Downloads and updates
 
-After working out the games (at start and every 6 hours), windows-link downloads, one at a
-time, the purchased games that are not in the folder yet, then the updates. Nothing pops
+After working out the games (at start, every 6 hours and when the panel asks for a
+[library update](#api)), windows-link downloads, one at a time, the purchased games that are not in the folder yet, then the updates. Nothing pops
 up; the panel's list and the log show how it goes.
 
 - **Which games**: games (DLsite's game work types) that run on Windows. The AI-translated
@@ -344,14 +356,14 @@ up; the panel's list and the log show how it goes.
   are added, files are replaced except saves (anything under a folder or named with
   `save` in it), and files the update lacks stay.
 - **Failures** (DLsite refusing, a full disk, an archive that does not unpack) are logged,
-  shown as the game's `status`, and tried again 6 hours later.
+  shown as the game's `status`, and tried again in the next round.
 
 ## FANZA library
 
 A `fanza.library` button gives a panel the PC games bought on FANZA (DMM's adult shop; its
 library also lists games from DMM's all-ages shop), run the same way as the [DLsite
-library](#dlsite-library): windows-link reads the purchases at start, every 6 hours and
-right after signing in, downloads the games not there yet into `<brand>\<title>` under
+library](#dlsite-library): windows-link reads the purchases at start, every 6 hours,
+right after signing in and when the panel asks for a library update, downloads the games not there yet into `<brand>\<title>` under
 `D:\fanza`, and lists them with their package pictures. For example in
 `desktops/コミック.yaml`:
 
@@ -427,6 +439,7 @@ Discord's CDN.
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, or a redirect to it on the web, when `icon` is true |
 | `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null, "sign_in": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now, `sign_in` the shop to sign in to through the panel) |
+| `POST /buttons/{id}/library/update` | bring a library button's games up to date, leaving out its `hide` labels: Steam updates its games and shows its install screen for those not installed, answering `{"updates": n, "installs": n}` ([Updating the library](#updating-the-library)); DLsite and FANZA start their round of downloads and updates now, or right after the one under way (`202 {"round": true}`; the listing shows how each game goes). `409 sign_in` while FANZA needs signing in, `409 update_unavailable` with the reason (Steam not running or not accepting remote control, no DLsite account) |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
 | `GET /audio/mixer` | the default output's volume and mute and the applications with sound on it: `{"master": {volume, muted}, "apps": [{process, name, volume}]}` (volumes 0–1) |

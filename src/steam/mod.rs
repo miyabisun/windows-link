@@ -15,7 +15,10 @@ use std::{
 use tracing::{info, warn};
 
 use crate::{
-    library::{GameLibrary, Item, Label, LabelError, Listing, Picture, Start, StartError},
+    library::{
+        GameLibrary, Item, Label, LabelError, Listing, Picture, Start, StartError, Update,
+        UpdateError,
+    },
     secrets::SteamKey,
 };
 
@@ -326,6 +329,42 @@ impl GameLibrary for SteamLibrary {
             app_id,
         ))
     }
+
+    /// Ask Steam itself, which knows every game the account has and how each is on this
+    /// PC (with or without the Web API key), leaving out the games in the `hide` labels.
+    fn update(&self, hide: &[String]) -> Result<Update, UpdateError> {
+        let ask = |script: &str| {
+            self.client.evaluate(script).map_err(|err| match err {
+                client::ClientError::Unavailable(reason) => UpdateError::Unavailable(reason),
+                client::ClientError::Script(message) if message.contains("STORE_NOT_READY") => {
+                    UpdateError::Unavailable("Steam's library is not ready yet".into())
+                }
+                client::ClientError::Script(message) => UpdateError::Failed(message),
+            })
+        };
+        let collections = client::parse_collections(&ask(&client::scripts::collections())?)
+            .map_err(UpdateError::Failed)?;
+        let skip: HashSet<u32> = collections
+            .iter()
+            .filter(|c| hide.contains(&c.name))
+            .flat_map(|c| c.apps.iter().copied())
+            .collect();
+        let apps =
+            client::parse_apps(&ask(&client::scripts::apps())?).map_err(UpdateError::Failed)?;
+        let plan = update_plan(&apps, &skip);
+        if !(plan.resume.is_empty() && plan.install.is_empty()) {
+            ask(&client::scripts::update(&plan.resume, &plan.install))?;
+        }
+        info!(
+            updates = plan.resume.len(),
+            installs = plan.install.len(),
+            "Steam library update started"
+        );
+        Ok(Update::Steam {
+            updates: plan.resume.len(),
+            installs: plan.install.len(),
+        })
+    }
 }
 
 /// A game's header picture (460×215): the newest `library_header*.jpg` Steam keeps in
@@ -417,6 +456,44 @@ pub struct Collection {
     pub id: String,
     pub name: String,
     pub apps: HashSet<u32>,
+}
+
+/// An app Steam knows, and its state on this PC (Steam's `display_status`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppStatus {
+    pub app_id: u32,
+    /// Whether it is a game, not a tool such as a dedicated server or a soundtrack.
+    pub game: bool,
+    pub status: u32,
+}
+
+/// The `display_status` of a game Steam has to install (`ReadyToInstall`).
+const READY_TO_INSTALL: u32 = 9;
+/// The `display_status` values Steam's own library goes on from with `ResumeAppUpdate`:
+/// an update (18 paused, 19 queued, 20 required, 39 failed) or a download (22 paused,
+/// 23 queued, 24 required, 38 failed) that has not run.
+const RESUMABLE: [u32; 8] = [18, 19, 20, 22, 23, 24, 38, 39];
+
+/// The games an update goes on with and those it installs.
+#[derive(Debug, Default, PartialEq)]
+pub struct UpdatePlan {
+    pub resume: Vec<u32>,
+    pub install: Vec<u32>,
+}
+
+/// What updating the library does: the games (not tools) outside `skip` whose update
+/// or download has not run are resumed, and those not installed are installed.
+#[allow(clippy::implicit_hasher, reason = "built from the collections")]
+pub fn update_plan(apps: &[AppStatus], skip: &HashSet<u32>) -> UpdatePlan {
+    let mut plan = UpdatePlan::default();
+    for app in apps.iter().filter(|a| a.game && !skip.contains(&a.app_id)) {
+        if RESUMABLE.contains(&app.status) {
+            plan.resume.push(app.app_id);
+        } else if app.status == READY_TO_INSTALL {
+            plan.install.push(app.app_id);
+        }
+    }
+    plan
 }
 
 /// Steam's own collections, which hold games but cannot be renamed or deleted.
@@ -1018,6 +1095,135 @@ mod tests {
         assert!(scripts[3].contains("NewUnsavedCollection(\"RPG\""));
         assert!(scripts[4].contains("AddOrRemoveApp([105600], true, \"uc-7\")"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_update_goes_on_with_the_games_steam_would_and_installs_the_missing_ones() {
+        use super::{AppStatus, UpdatePlan, update_plan};
+
+        let app = |app_id, game, status| AppStatus {
+            app_id,
+            game,
+            status,
+        };
+        let apps = [
+            app(1, true, 19),   // update queued
+            app(2, true, 20),   // update required
+            app(3, true, 18),   // update paused
+            app(4, true, 39),   // update failed
+            app(5, true, 22),   // download paused
+            app(6, true, 24),   // download required
+            app(7, true, 9),    // not installed
+            app(8, true, 11),   // ready to play
+            app(9, true, 9),    // hidden, not installed
+            app(10, true, 19),  // hidden, update queued
+            app(11, false, 9),  // a dedicated server, not a game
+            app(12, false, 19), // a tool with an update
+            app(13, true, 14),  // not for this platform
+            app(14, true, 6),   // updating already
+        ];
+        assert_eq!(
+            update_plan(&apps, &[9, 10].into()),
+            UpdatePlan {
+                resume: vec![1, 2, 3, 4, 5, 6],
+                install: vec![7],
+            }
+        );
+    }
+
+    #[test]
+    fn updating_asks_steam_for_its_games_and_leaves_out_the_hidden_labels() {
+        use super::client::{ClientError, NOT_RUNNING, fake::FakeClient};
+        use crate::library::{GameLibrary, Update, UpdateError};
+
+        let client = std::sync::Arc::new(FakeClient::default());
+        *client.answers.lock().unwrap() = vec![
+            Ok(serde_json::json!([
+                {"id": "hidden", "name": "非表示", "apps": [30]},
+                {"id": "uc-1", "name": "RPG", "apps": [10]}
+            ])),
+            Ok(serde_json::json!([
+                {"id": 10, "type": 1, "status": 19},
+                {"id": 20, "type": 1, "status": 9},
+                {"id": 30, "type": 1, "status": 9},
+                {"id": 40, "type": 4, "status": 9}
+            ])),
+            Ok(serde_json::json!(true)),
+            // Nothing to do: nothing is asked of Steam.
+            Ok(serde_json::json!([])),
+            Ok(serde_json::json!([{"id": 10, "type": 1, "status": 11}])),
+            Err(ClientError::Unavailable(NOT_RUNNING.into())),
+            Ok(serde_json::json!([])),
+            Err(ClientError::Script("Error: STORE_NOT_READY".into())),
+        ];
+        let library =
+            super::SteamLibrary::new(std::env::temp_dir(), None).with_client(client.clone());
+
+        assert_eq!(
+            library.update(&["非表示".to_owned()]),
+            Ok(Update::Steam {
+                updates: 1,
+                installs: 1
+            })
+        );
+        assert_eq!(
+            library.update(&["非表示".to_owned()]),
+            Ok(Update::Steam {
+                updates: 0,
+                installs: 0
+            })
+        );
+        assert_eq!(
+            library.update(&[]),
+            Err(UpdateError::Unavailable(NOT_RUNNING.into()))
+        );
+        assert_eq!(
+            library.update(&[]),
+            Err(UpdateError::Unavailable(
+                "Steam's library is not ready yet".into()
+            ))
+        );
+        let scripts = client.scripts.lock().unwrap();
+        assert_eq!(scripts.len(), 8);
+        assert!(scripts[1].contains("allApps"));
+        assert!(scripts[2].contains("const resume = [10];"));
+        assert!(scripts[2].contains("const install = [20];"));
+        assert!(scripts[2].contains("ResumeAppUpdate"));
+        assert!(scripts[2].contains("OpenInstallWizard"));
+    }
+
+    #[test]
+    fn reads_each_app_state_steam_gives() {
+        use super::{AppStatus, client::parse_apps};
+
+        let apps = parse_apps(&serde_json::json!([
+            {"id": 105_600, "type": 1, "status": 11},
+            {"id": 294_420, "type": 4, "status": 9},
+            {"id": 7, "type": 1}
+        ]))
+        .unwrap();
+        assert_eq!(
+            apps,
+            [
+                AppStatus {
+                    app_id: 105_600,
+                    game: true,
+                    status: 11
+                },
+                AppStatus {
+                    app_id: 294_420,
+                    game: false,
+                    status: 9
+                },
+                // A game Steam has no state for on this PC.
+                AppStatus {
+                    app_id: 7,
+                    game: true,
+                    status: 0
+                },
+            ]
+        );
+        assert!(parse_apps(&serde_json::json!({"oops": 1})).is_err());
     }
 
     #[test]

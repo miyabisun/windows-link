@@ -8,12 +8,15 @@ use std::{collections::HashSet, time::Duration};
 
 use serde_json::{Value, json};
 
-use super::Collection;
+use super::{AppStatus, Collection};
 
 pub const DEBUG_URL: &str = "http://127.0.0.1:8080";
 pub const NOT_RUNNING: &str = "Steam is not running";
 pub const NO_REMOTE: &str = "Steam does not accept remote control: create .cef-enable-remote-debugging in the Steam folder and restart Steam";
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Steam's `app_type` of a game (tools such as dedicated servers, soundtracks and others
+/// have their own).
+const GAME: u32 = 1;
 
 #[derive(Debug, PartialEq)]
 pub enum ClientError {
@@ -129,6 +132,33 @@ pub mod scripts {
         )
     }
 
+    /// Every app Steam knows, with its type and its state on this PC (`display_status`).
+    pub fn apps() -> String {
+        "(() => { const s = globalThis.appStore; \
+         if (!s) throw new Error(\"STORE_NOT_READY\"); \
+         return s.allApps.map((a) => ({ id: a.appid, type: a.app_type, \
+           status: a.local_per_client_data?.display_status })); })()"
+            .to_owned()
+    }
+
+    /// Go on with the updates and downloads of `resume`, and show Steam's install screen
+    /// for `install` (where the user picks the folder and accepts any EULA), as Steam's
+    /// own library does for the games selected in it.
+    pub fn update(resume: &[u32], install: &[u32]) -> String {
+        format!(
+            "(() => {{ const s = globalThis.appStore; \
+             if (!s) throw new Error(\"STORE_NOT_READY\"); \
+             const resume = {}; \
+             const install = {}; \
+             for (const id of resume) SteamClient.Downloads.ResumeAppUpdate(id, \
+               s.GetAppOverviewByAppID(id)?.local_per_client_data?.clientid ?? \"0\"); \
+             if (install.length > 0) SteamClient.Installs.OpenInstallWizard(install); \
+             return true; }})()",
+            json!(resume),
+            json!(install)
+        )
+    }
+
     /// `AddOrRemoveApp` takes app IDs and works for Steam's own collections too, which
     /// save themselves; the user's are saved after it.
     pub fn set(id: &str, app_id: u32, on: bool) -> String {
@@ -160,6 +190,27 @@ pub fn parse_collections(value: &Value) -> Result<Vec<Collection>, String> {
             id: c.id,
             name: c.name,
             apps: c.apps.into_iter().collect::<HashSet<u32>>(),
+        })
+        .collect())
+}
+
+/// The apps a `scripts::apps` run returned. An app without a state on this PC has 0.
+pub fn parse_apps(value: &Value) -> Result<Vec<AppStatus>, String> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        id: u32,
+        #[serde(rename = "type")]
+        kind: u32,
+        status: Option<u32>,
+    }
+    let raw: Vec<Raw> = serde_json::from_value(value.clone())
+        .map_err(|err| format!("unexpected apps from Steam: {err}"))?;
+    Ok(raw
+        .into_iter()
+        .map(|app| AppStatus {
+            app_id: app.id,
+            game: app.kind == GAME,
+            status: app.status.unwrap_or(0),
         })
         .collect())
 }

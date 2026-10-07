@@ -98,6 +98,26 @@ pub enum StartError {
     NotDownloaded(String),
 }
 
+/// What bringing a library up to date started.
+#[derive(Debug, PartialEq)]
+pub enum Update {
+    /// Steam goes on with `updates` games and shows its install screen for `installs`.
+    Steam { updates: usize, installs: usize },
+    /// The shop's round of downloads and updates is on its way; the listing shows how
+    /// each game is going.
+    Round,
+}
+
+/// Why a library cannot be brought up to date.
+#[derive(Debug, PartialEq)]
+pub enum UpdateError {
+    /// The user has to sign in to the shop through the panel first.
+    SignIn,
+    /// It cannot be done now, and why.
+    Unavailable(String),
+    Failed(String),
+}
+
 /// The programs an item can be started with (paths relative to its folder), and the
 /// one in use.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -181,6 +201,13 @@ pub trait GameLibrary: Send + Sync + 'static {
     /// The license keys the item's store keeps for it (none when it has none).
     fn license_keys(&self, _id: &str) -> Result<Vec<LicenseKey>, KeyError> {
         Err(KeyError::NotFound)
+    }
+    /// Update the games that have an update and install those not here yet, leaving out
+    /// the games in the labels named in `hide` where the library says so.
+    fn update(&self, _hide: &[String]) -> Result<Update, UpdateError> {
+        Err(UpdateError::Unavailable(
+            "this library cannot be updated".into(),
+        ))
     }
 }
 
@@ -357,7 +384,7 @@ pub mod fake {
 
     use super::{
         GameLibrary, Item, KeyError, Label, LabelError, LicenseKey, Listing, Picture, Programs,
-        Start, StartError,
+        Start, StartError, Update, UpdateError,
     };
 
     /// Items `"1"` (installed in `C:\Games\One`, a picture on the web) and `"2"` (not
@@ -367,6 +394,10 @@ pub mod fake {
         labels: Mutex<Vec<(Label, BTreeSet<String>)>>,
         /// The program chosen for item "9", which has `a.exe` and `b.exe`.
         chosen: Mutex<Option<String>>,
+        /// What the next updates answer (by default Steam with 3 updates and 24 installs),
+        /// and the labels each update was asked to leave out.
+        pub updates: Mutex<Vec<Result<Update, UpdateError>>>,
+        pub hidden: Mutex<Vec<Vec<String>>>,
     }
 
     impl Default for FakeLibrary {
@@ -388,6 +419,8 @@ pub mod fake {
                     (label("uc-1", "outdate", true), BTreeSet::new()),
                 ]),
                 chosen: Mutex::new(None),
+                updates: Mutex::default(),
+                hidden: Mutex::default(),
             }
         }
     }
@@ -502,6 +535,19 @@ pub mod fake {
             }
             *self.chosen.lock().unwrap() = Some(program.to_owned());
             Ok(())
+        }
+
+        fn update(&self, hide: &[String]) -> Result<Update, UpdateError> {
+            self.hidden.lock().unwrap().push(hide.to_vec());
+            let mut updates = self.updates.lock().unwrap();
+            if updates.is_empty() {
+                Ok(Update::Steam {
+                    updates: 3,
+                    installs: 24,
+                })
+            } else {
+                updates.remove(0)
+            }
         }
 
         /// "1" has a key, "2" none, "5" cannot be asked now.

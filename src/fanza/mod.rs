@@ -231,6 +231,25 @@ mod tests {
     }
 
     #[test]
+    fn updating_needs_signing_in_first() {
+        use std::sync::Arc;
+
+        use crate::library::{GameLibrary, UpdateError};
+        use crate::shop::ShopStore;
+
+        let session = std::env::temp_dir().join(format!(
+            "windows-link-fanza-none-{}.json",
+            std::process::id()
+        ));
+        let library = super::FanzaLibrary::new(
+            std::env::temp_dir(),
+            Arc::new(ShopStore::in_memory("fanza").unwrap()),
+            super::FanzaShop::new(Arc::new(super::Client::open(session))),
+        );
+        assert_eq!(library.update(&[]), Err(UpdateError::SignIn));
+    }
+
+    #[test]
     fn folders_are_found_by_brand_and_title_as_downloads_name_them() {
         let titles = [
             title("アリスソフト", "ランス9 ヘルマン革命"),
