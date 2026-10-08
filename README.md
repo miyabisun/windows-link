@@ -10,6 +10,7 @@ Each button does one thing:
 | --- | --- | --- |
 | `audio.output_toggle` | switches the Windows default output between two devices | the current default and whether each device is connected |
 | `audio.app_volume_toggle` | toggles one application's volume between two levels | the application's current volume, or not running |
+| `audio.app_mute_toggle` | mutes one application, or unmutes it, as its speaker in Windows' volume mixer does | whether it is muted, or not running |
 | `audio.mute_toggle` | mutes the default output, or unmutes it | whether it is muted, and its volume |
 | `audio.mixer` | nothing: a panel opens the mixer (`GET /audio/mixer`) | the default output's volume and whether it is muted |
 | `discord.server` | brings Discord to the front showing one server, starting Discord if needed | whether Discord runs; the button shows the server's icon |
@@ -110,6 +111,10 @@ buttons:
     type: audio.app_volume_toggle
     process: StreetFighter6.exe   # executable file name, case-insensitive
     levels: [0.2, 1.0]
+  - id: game-mute
+    label: Game sound
+    type: audio.app_mute_toggle
+    process: StreetFighter6.exe
   - id: sf6
     label: Street Fighter 6
     type: steam.game
@@ -152,10 +157,15 @@ buttons:
   session of the process. Windows remembers per-application volume, so the state shows
   the remembered value; nothing is restored automatically. Pressing while the process has
   no audio session fails with `409 not_running`.
+- `audio.app_mute_toggle` mutes every audio session of the process, or unmutes them,
+  keeping its volume (the same mute as `PUT /audio/apps/{process}` with `muted`). A session
+  the process starts later, such as on another output device, may begin unmuted; the state
+  shows it. Pressing while the process has no audio session fails with `409 not_running`.
 - `audio.mixer` is opened by the panel, not pressed: `GET /audio/mixer` gives the default
   output's volume and mute and the applications with sound on it (one per program, named
   by its file name without `.exe`), and `PUT /audio/master` and `PUT /audio/apps/{process}`
-  change them. Moving the volume of a muted output unmutes it, as Windows' own slider does.
+  change them. Moving the volume of a muted output or application unmutes it, as Windows'
+  own slider does.
 - `discord.server` opens `discord://-/channels/<guild_id>` through Discord's own launcher
   (`%LOCALAPPDATA%\Discord\Update.exe`; the `discord://` registration names a version
   folder Discord removes when it updates): Discord starts if needed, shows the server, and
@@ -442,9 +452,9 @@ Discord's CDN.
 | `POST /buttons/{id}/library/update` | bring a library button's games up to date, leaving out its `hide` labels: Steam updates its games and shows its install screen for those not installed, answering `{"updates": n, "installs": n}` ([Updating the library](#updating-the-library)); DLsite and FANZA start their round of downloads and updates now, or right after the one under way (`202 {"round": true}`; the listing shows how each game goes). `409 sign_in` while FANZA needs signing in, `409 update_unavailable` with the reason (Steam not running or not accepting remote control, no DLsite account) |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
-| `GET /audio/mixer` | the default output's volume and mute and the applications with sound on it: `{"master": {volume, muted}, "apps": [{process, name, volume}]}` (volumes 0–1) |
+| `GET /audio/mixer` | the default output's volume and mute and the applications with sound on it: `{"master": {volume, muted}, "apps": [{process, name, volume, muted}]}` (volumes 0–1) |
 | `PUT /audio/master` | `{"volume": …}` and/or `{"muted": …}` (a volume alone also unmutes); returns the mixer (`400 invalid_volume` outside 0–1) |
-| `PUT /audio/apps/{process}` | `{"volume": …}` for every session of the program; returns the mixer (`404` when it has no sound now) |
+| `PUT /audio/apps/{process}` | `{"volume": …}`, `{"muted": …}` or both for every session of the program (a volume alone unmutes); returns the mixer (`404` when it has no sound now, `400 invalid_change` with neither) |
 | `PUT /buttons/{id}/pins/{item}`, `DELETE …` | pin a game to the button, or take it off; returns `{"button": …}` |
 | `POST /buttons/{id}/library/{item}/folder` | show an installed game's folder in Explorer (`204`; `404` when not installed) |
 | `GET /buttons/{id}/library/{item}/programs` | a game's programs to choose from: `{"candidates": ["Game.exe", …], "chosen": null}` (`404` when it has no choice) |

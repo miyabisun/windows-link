@@ -72,6 +72,10 @@ pub enum ButtonSpec {
     /// Toggle one process's session volume between two levels (0.0-1.0).
     #[serde(rename = "audio.app_volume_toggle")]
     AppVolumeToggle { process: String, levels: [f32; 2] },
+    /// Mute one process's sessions, or unmute them, as the speaker of its row in
+    /// Windows' volume mixer does.
+    #[serde(rename = "audio.app_mute_toggle")]
+    AppMuteToggle { process: String },
     /// Mute the default output, or unmute it.
     #[serde(rename = "audio.mute_toggle")]
     MuteToggle {},
@@ -153,6 +157,7 @@ impl ButtonSpec {
         match self {
             Self::OutputToggle { .. } => "audio.output_toggle",
             Self::AppVolumeToggle { .. } => "audio.app_volume_toggle",
+            Self::AppMuteToggle { .. } => "audio.app_mute_toggle",
             Self::MuteToggle {} => "audio.mute_toggle",
             Self::Mixer {} => "audio.mixer",
             Self::DiscordServer { .. } => "discord.server",
@@ -289,6 +294,11 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                     }
                 }
             }
+            ButtonSpec::AppMuteToggle { process } => {
+                if process.trim().is_empty() {
+                    return Err(ConfigError(format!("button {id:?}: process is empty")));
+                }
+            }
             ButtonSpec::AppVolumeToggle { process, levels } => {
                 if process.trim().is_empty() {
                     return Err(ConfigError(format!("button {id:?}: process is empty")));
@@ -388,6 +398,26 @@ buttons:
         assert!(parse(&dup).unwrap_err().0.contains("duplicate"));
         let bad = SAMPLE.replace("id: output", "id: out put");
         assert!(parse(&bad).unwrap_err().0.contains("button id"));
+    }
+
+    #[test]
+    fn an_apps_mute_names_its_program() {
+        let button = |process: &str| {
+            format!(
+                "buttons:\n  - id: ba\n    label: BA\n    type: audio.app_mute_toggle\n    process: \"{process}\"\n"
+            )
+        };
+        let config = parse(&button("BlueArchive.exe")).unwrap();
+        assert!(
+            matches!(&config.buttons[0].spec, ButtonSpec::AppMuteToggle { process } if process == "BlueArchive.exe")
+        );
+        assert_eq!(config.buttons[0].spec.type_name(), "audio.app_mute_toggle");
+        assert!(
+            parse(&button(" "))
+                .unwrap_err()
+                .0
+                .contains("process is empty")
+        );
     }
 
     #[test]

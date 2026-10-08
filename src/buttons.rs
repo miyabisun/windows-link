@@ -37,6 +37,11 @@ pub enum ButtonState {
         volume: Option<f64>,
         levels: [f64; 2],
     },
+    /// A program's own mute; `running` while it has an audio session.
+    AppMute {
+        running: bool,
+        muted: bool,
+    },
     /// The default output's mute; `volume` is its volume (0-1).
     Mute {
         muted: bool,
@@ -281,6 +286,15 @@ fn state(
                 message: error.to_string(),
             },
         },
+        ButtonSpec::AppMuteToggle { process } => match audio.app_muted(process) {
+            Ok(muted) => ButtonState::AppMute {
+                running: muted.is_some(),
+                muted: muted.unwrap_or(false),
+            },
+            Err(error) => ButtonState::Error {
+                message: error.to_string(),
+            },
+        },
         ButtonSpec::MuteToggle {} | ButtonSpec::Mixer {} => match audio.master() {
             Ok(master) => {
                 let (muted, volume) = (master.muted, round2(master.volume));
@@ -365,6 +379,18 @@ pub fn press(
             };
             audio
                 .set_app_volume(process, next_volume(current, *levels))
+                .map_err(PressError::Audio)?;
+            Ok(())
+        }
+        ButtonSpec::AppMuteToggle { process } => {
+            let Some(muted) = audio.app_muted(process).map_err(PressError::Audio)? else {
+                return Err(PressError::Conflict {
+                    code: "not_running",
+                    message: format!("{process} has no audio session"),
+                });
+            };
+            audio
+                .set_app_mute(process, !muted)
                 .map_err(PressError::Audio)?;
             Ok(())
         }
@@ -580,6 +606,56 @@ mod tests {
             .icon
         };
         assert!(shows(0) && shows(1) && !shows(2));
+    }
+
+    #[test]
+    fn an_apps_mute_toggles_its_sound_as_the_mixer_does_and_keeps_its_volume() {
+        let config = config::parse(
+            "buttons:\n  - id: ba\n    label: BA\n    type: audio.app_mute_toggle\n    process: BlueArchive.exe\n",
+        )
+        .unwrap();
+        let audio = FakeAudio::new(devices(), Some("id-motu"));
+        let launcher = FakeLauncher::default();
+        let state = || {
+            let snapshot = AudioSnapshot::read(&audio).unwrap();
+            view(&config, &config.buttons[0], &readings(&snapshot), &audio).state
+        };
+        // Without its sound there is nothing to mute.
+        assert_eq!(
+            state(),
+            ButtonState::AppMute {
+                running: false,
+                muted: false
+            }
+        );
+        assert!(matches!(
+            press(&config, "ba", &audio, &launcher),
+            Err(PressError::Conflict {
+                code: "not_running",
+                ..
+            })
+        ));
+
+        audio.set_volume("BlueArchive.exe", 0.7);
+        assert_eq!(
+            state(),
+            ButtonState::AppMute {
+                running: true,
+                muted: false
+            }
+        );
+        press(&config, "ba", &audio, &launcher).unwrap();
+        assert_eq!(audio.app_muted("bluearchive.exe").unwrap(), Some(true));
+        assert_eq!(
+            state(),
+            ButtonState::AppMute {
+                running: true,
+                muted: true
+            }
+        );
+        assert_eq!(audio.app_volume("BlueArchive.exe").unwrap(), Some(0.7));
+        press(&config, "ba", &audio, &launcher).unwrap();
+        assert_eq!(audio.app_muted("BlueArchive.exe").unwrap(), Some(false));
     }
 
     #[test]

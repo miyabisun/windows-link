@@ -93,6 +93,8 @@ enum Command {
     SetDefaultOutput(String, Reply<()>),
     AppVolume(String, Reply<Option<f32>>),
     SetAppVolume(String, f32, Reply<usize>),
+    AppMuted(String, Reply<Option<bool>>),
+    SetAppMute(String, bool, Reply<usize>),
     Master(Reply<Master>),
     SetMaster(Option<f32>, Option<bool>, Reply<()>),
     Apps(Reply<Vec<AppSound>>),
@@ -147,6 +149,14 @@ impl Audio for WindowsAudio {
 
     fn set_app_volume(&self, process: &str, level: f32) -> AudioResult<usize> {
         self.call(|reply| Command::SetAppVolume(process.to_owned(), level, reply))
+    }
+
+    fn app_muted(&self, process: &str) -> AudioResult<Option<bool>> {
+        self.call(|reply| Command::AppMuted(process.to_owned(), reply))
+    }
+
+    fn set_app_mute(&self, process: &str, muted: bool) -> AudioResult<usize> {
+        self.call(|reply| Command::SetAppMute(process.to_owned(), muted, reply))
     }
 
     fn master(&self) -> AudioResult<Master> {
@@ -249,6 +259,10 @@ fn worker(
             Command::AppVolume(process, reply) => drop(reply.send(state.app_volume(&process))),
             Command::SetAppVolume(process, level, reply) => {
                 drop(reply.send(state.set_app_volume(&process, level)));
+            }
+            Command::AppMuted(process, reply) => drop(reply.send(state.app_muted(&process))),
+            Command::SetAppMute(process, muted, reply) => {
+                drop(reply.send(state.set_app_mute(&process, muted)));
             }
             Command::Master(reply) => drop(reply.send(state.master())),
             Command::SetMaster(volume, muted, reply) => {
@@ -374,7 +388,8 @@ impl ComState {
     }
 
     /// The apps with a live session on the default output, one per program (the first
-    /// session's volume), by name. A program's name is its file name without `.exe`.
+    /// session's volume, muted while all its sessions are), by name. A program's name is
+    /// its file name without `.exe`.
     fn apps(&self) -> AudioResult<Vec<AppSound>> {
         let mut apps: Vec<AppSound> = Vec::new();
         unsafe {
@@ -407,16 +422,19 @@ impl ComState {
                 let Some(process) = (pid != 0).then(|| process_file_name(pid)).flatten() else {
                     continue;
                 };
-                if apps
-                    .iter()
-                    .any(|a| a.process.eq_ignore_ascii_case(&process))
+                let Ok(simple) = control.cast::<ISimpleAudioVolume>() else {
+                    continue;
+                };
+                let muted = simple.GetMute().is_ok_and(windows::core::BOOL::as_bool);
+                // A program is muted only while every one of its sessions is.
+                if let Some(app) = apps
+                    .iter_mut()
+                    .find(|a| a.process.eq_ignore_ascii_case(&process))
                 {
+                    app.muted &= muted;
                     continue;
                 }
-                let Ok(volume) = control
-                    .cast::<ISimpleAudioVolume>()
-                    .and_then(|v| v.GetMasterVolume())
-                else {
+                let Ok(volume) = simple.GetMasterVolume() else {
                     continue;
                 };
                 let name = Path::new(&process)
@@ -426,6 +444,7 @@ impl ComState {
                     process,
                     name,
                     volume,
+                    muted,
                 });
             }
         }
@@ -497,6 +516,30 @@ impl ComState {
                 volume
                     .SetMasterVolume(level, std::ptr::null())
                     .map_err(|e| err("SetMasterVolume", &e))?;
+            }
+        }
+        Ok(sessions.len())
+    }
+
+    /// Muted while every live session of `process` is, so a session it started later
+    /// unmuted (such as on another output) shows as sound.
+    fn app_muted(&self, process: &str) -> AudioResult<Option<bool>> {
+        let sessions = self.sessions(process)?;
+        if sessions.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(sessions.iter().all(|volume| unsafe {
+            volume.GetMute().is_ok_and(windows::core::BOOL::as_bool)
+        })))
+    }
+
+    fn set_app_mute(&self, process: &str, muted: bool) -> AudioResult<usize> {
+        let sessions = self.sessions(process)?;
+        for volume in &sessions {
+            unsafe {
+                volume
+                    .SetMute(muted, std::ptr::null())
+                    .map_err(|e| err("SetMute", &e))?;
             }
         }
         Ok(sessions.len())

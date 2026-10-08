@@ -517,7 +517,7 @@ async fn item_programs(
 }
 
 /// The default output's volume and mute, and the apps with sound on it:
-/// `{"master": {volume, muted}, "apps": [{process, name, volume}]}`.
+/// `{"master": {volume, muted}, "apps": [{process, name, volume, muted}]}`.
 async fn mixer(State(state): State<AppState>) -> Response {
     mixer_response(&state).await
 }
@@ -533,7 +533,7 @@ async fn mixer_response(state: &AppState) -> Response {
             // Volumes to two places, as the buttons give them.
             let apps: Vec<Value> = apps
                 .iter()
-                .map(|app| json!({ "process": app.process, "name": app.name, "volume": buttons::round2(app.volume) }))
+                .map(|app| json!({ "process": app.process, "name": app.name, "volume": buttons::round2(app.volume), "muted": app.muted }))
                 .collect();
             let master = json!({ "volume": buttons::round2(master.volume), "muted": master.muted });
             Json(json!({ "master": master, "apps": apps })).into_response()
@@ -558,8 +558,9 @@ struct MasterChange {
 }
 
 #[derive(serde::Deserialize)]
-struct VolumeChange {
-    volume: f32,
+struct AppChange {
+    volume: Option<f32>,
+    muted: Option<bool>,
 }
 
 fn valid_volume(volume: f32) -> bool {
@@ -597,22 +598,36 @@ async fn set_master(State(state): State<AppState>, Json(change): Json<MasterChan
     }
 }
 
-/// `{"volume"}` for every session of a program. Answers the mixer.
+/// `{"volume"}`, `{"muted"}` or both for every session of a program; a volume alone
+/// unmutes, as Windows' own slider does. Answers the mixer.
 async fn set_app_volume(
     State(state): State<AppState>,
     Path(process): Path<String>,
-    Json(change): Json<VolumeChange>,
+    Json(change): Json<AppChange>,
 ) -> Response {
-    if !valid_volume(change.volume) {
+    if change.volume.is_some_and(|v| !valid_volume(v)) {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_volume",
             "volume must be between 0 and 1",
         );
     }
+    let muted = change.muted.or(change.volume.map(|_| false));
+    let Some(muted) = muted else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_change",
+            "give the volume, muted or both",
+        );
+    };
     let audio = state.audio.clone();
-    let set =
-        tokio::task::spawn_blocking(move || audio.set_app_volume(&process, change.volume)).await;
+    let set = tokio::task::spawn_blocking(move || {
+        if let Some(volume) = change.volume {
+            audio.set_app_volume(&process, volume)?;
+        }
+        audio.set_app_mute(&process, muted)
+    })
+    .await;
     match set {
         Ok(Ok(0)) => error(
             StatusCode::NOT_FOUND,
@@ -1657,8 +1672,8 @@ buttons:
             json!({
                 "master": {"volume": 0.5, "muted": false},
                 "apps": [
-                    {"process": "discord.exe", "name": "discord", "volume": 0.8},
-                    {"process": "streetfighter6.exe", "name": "streetfighter6", "volume": 1.0}
+                    {"process": "discord.exe", "name": "discord", "volume": 0.8, "muted": false},
+                    {"process": "streetfighter6.exe", "name": "streetfighter6", "volume": 1.0, "muted": false}
                 ]
             })
         );
@@ -1700,10 +1715,50 @@ buttons:
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["apps"][0]["volume"], json!(0.4));
-        let (status, body) =
-            send(state, "PUT", "/audio/apps/gone.exe", json!({"volume": 0.4})).await;
+        let (status, body) = send(
+            state.clone(),
+            "PUT",
+            "/audio/apps/gone.exe",
+            json!({"volume": 0.4}),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_found");
+
+        // An app is muted by itself, keeping its volume, and its volume unmutes it.
+        let (status, body) = send(
+            state.clone(),
+            "PUT",
+            "/audio/apps/Discord.exe",
+            json!({"muted": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["apps"][0],
+            json!({"process": "discord.exe", "name": "discord", "volume": 0.4, "muted": true})
+        );
+        assert_eq!(body["apps"][1]["muted"], false);
+        let (_, body) = send(
+            state.clone(),
+            "PUT",
+            "/audio/apps/Discord.exe",
+            json!({"volume": 0.5}),
+        )
+        .await;
+        assert_eq!(body["apps"][0]["muted"], false);
+        let (status, body) = send(
+            state.clone(),
+            "PUT",
+            "/audio/apps/gone.exe",
+            json!({"muted": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+        let (status, body) = send(state, "PUT", "/audio/apps/Discord.exe", json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_change");
     }
 
     #[tokio::test]

@@ -26,12 +26,13 @@ pub struct Master {
 }
 
 /// An app with sound on the default output: its program's file name, a name to show,
-/// and its volume (0.0-1.0).
+/// its volume (0.0-1.0) and whether it is muted by itself.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AppSound {
     pub process: String,
     pub name: String,
     pub volume: f32,
+    pub muted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -72,6 +73,14 @@ impl Audio for UnavailableAudio {
         Err(AudioError(self.0.clone()))
     }
 
+    fn app_muted(&self, _: &str) -> AudioResult<Option<bool>> {
+        Err(AudioError(self.0.clone()))
+    }
+
+    fn set_app_mute(&self, _: &str, _: bool) -> AudioResult<usize> {
+        Err(AudioError(self.0.clone()))
+    }
+
     fn master(&self) -> AudioResult<Master> {
         Err(AudioError(self.0.clone()))
     }
@@ -97,6 +106,11 @@ pub trait Audio: Send + Sync + 'static {
     fn app_volume(&self, process: &str) -> AudioResult<Option<f32>>;
     /// Set the volume of every live session owned by `process`; returns the count.
     fn set_app_volume(&self, process: &str, level: f32) -> AudioResult<usize>;
+    /// Whether every live session owned by `process` is muted, if it has one.
+    fn app_muted(&self, process: &str) -> AudioResult<Option<bool>>;
+    /// Mute or unmute every live session owned by `process`, as the speaker in
+    /// Windows' volume mixer does; returns the count.
+    fn set_app_mute(&self, process: &str, muted: bool) -> AudioResult<usize>;
     /// The default output's volume and mute.
     fn master(&self) -> AudioResult<Master>;
     /// Change the default output's volume, its mute, or both.

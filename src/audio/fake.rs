@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 use super::{AppSound, Audio, AudioError, AudioResult, Device, Master};
 
@@ -14,6 +17,8 @@ pub struct FakeState {
     pub default_output: Option<String>,
     /// process file name (lowercase) -> volume
     pub volumes: HashMap<String, f32>,
+    /// process file names (lowercase) muted by themselves
+    pub muted: HashSet<String>,
     pub master: Master,
 }
 
@@ -24,6 +29,7 @@ impl FakeAudio {
                 devices,
                 default_output: default_output.map(str::to_owned),
                 volumes: HashMap::new(),
+                muted: HashSet::new(),
                 master: Master {
                     volume: 0.5,
                     muted: false,
@@ -103,10 +109,34 @@ impl Audio for FakeAudio {
                 process: process.clone(),
                 name: process.trim_end_matches(".exe").to_owned(),
                 volume: *volume,
+                muted: state.muted.contains(process),
             })
             .collect();
         apps.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(apps)
+    }
+
+    fn app_muted(&self, process: &str) -> AudioResult<Option<bool>> {
+        let state = self.state.lock().unwrap();
+        let process = process.to_lowercase();
+        Ok(state
+            .volumes
+            .contains_key(&process)
+            .then(|| state.muted.contains(&process)))
+    }
+
+    fn set_app_mute(&self, process: &str, muted: bool) -> AudioResult<usize> {
+        let mut state = self.state.lock().unwrap();
+        let process = process.to_lowercase();
+        if !state.volumes.contains_key(&process) {
+            return Ok(0);
+        }
+        if muted {
+            state.muted.insert(process);
+        } else {
+            state.muted.remove(&process);
+        }
+        Ok(1)
     }
 
     fn set_app_volume(&self, process: &str, level: f32) -> AudioResult<usize> {
