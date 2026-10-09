@@ -292,8 +292,11 @@ buttons:
     hide: [非表示]
 ```
 
-The folder is read on every listing (a few hundred games take tens of milliseconds), so
-added and removed games show up at once. Each game lists its maker as `detail` and comes
+The listing answers from `windows-link.db` at once, even while the disk is slow. It holds
+the games found when the folder was last read. The folder is read again in the
+background after each listing and each download. A game added or removed by hand shows
+the second time the list is opened. Starting a game reads its own folder again, so a
+renamed program still starts. Each game lists its maker as `detail` and comes
 recently started first, then recently added. Its picture is the work's art on DLsite
 (`image` in the listing), or its program's icon until the work is known; the button's
 state says `"pictures": "whole"`, as both are shown whole.

@@ -177,6 +177,9 @@ pub enum Picture {
 
 pub trait GameLibrary: Send + Sync + 'static {
     fn listing(&self) -> Listing;
+    /// Read the items again for the next listing, when the listing comes from what was
+    /// read before.
+    fn reread(&self) {}
     fn start(&self, id: &str) -> Result<Start, StartError>;
     fn picture(&self, id: &str) -> Option<Picture>;
     /// The folder an installed item lives in, to show in Explorer.
@@ -380,7 +383,14 @@ impl Pins {
 
 #[cfg(test)]
 pub mod fake {
-    use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
+    use std::{
+        collections::BTreeSet,
+        path::PathBuf,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::{
         GameLibrary, Item, KeyError, Label, LabelError, LicenseKey, Listing, Picture, Programs,
@@ -398,6 +408,8 @@ pub mod fake {
         /// and the labels each update was asked to leave out.
         pub updates: Mutex<Vec<Result<Update, UpdateError>>>,
         pub hidden: Mutex<Vec<Vec<String>>>,
+        /// How many times the library was asked to read its items again.
+        pub rereads: AtomicUsize,
     }
 
     impl Default for FakeLibrary {
@@ -421,6 +433,7 @@ pub mod fake {
                 chosen: Mutex::new(None),
                 updates: Mutex::default(),
                 hidden: Mutex::default(),
+                rereads: AtomicUsize::new(0),
             }
         }
     }
@@ -449,6 +462,10 @@ pub mod fake {
                 labels_locked: None,
                 sign_in: None,
             }
+        }
+
+        fn reread(&self) {
+            self.rereads.fetch_add(1, Ordering::SeqCst);
         }
 
         fn folder(&self, id: &str) -> Option<PathBuf> {

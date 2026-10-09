@@ -168,7 +168,7 @@ impl ShopLibrary<FanzaShop> {
             Ok(works) => {
                 tracing::info!(works = works.len(), "FANZA purchases read");
                 self.set_purchases(&works);
-                let Ok(games) = crate::shop::scan(&self.root) else {
+                let Ok(games) = self.rescan() else {
                     return;
                 };
                 let titles: Vec<Title> = games.into_iter().map(|(title, _)| title).collect();

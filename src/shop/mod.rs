@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, MutexGuard, PoisonError, TryLockError},
     time::SystemTime,
 };
 
@@ -192,6 +192,16 @@ impl ShopStore {
                  path    TEXT NOT NULL UNIQUE,
                  image   TEXT,
                  version TEXT
+             );
+             CREATE TABLE IF NOT EXISTS shop_titles (
+                 root     TEXT NOT NULL,
+                 id       TEXT NOT NULL,
+                 maker    TEXT NOT NULL,
+                 name     TEXT NOT NULL,
+                 folder   TEXT NOT NULL,
+                 modified INTEGER NOT NULL,
+                 programs TEXT NOT NULL,
+                 PRIMARY KEY (root, id)
              );",
         ))?;
         // The previous version's table has no version yet.
@@ -409,6 +419,69 @@ impl ShopStore {
         saving.commit()
     }
 
+    /// Keep `games` as the games last read from the folders under `root`, in place of
+    /// those before.
+    pub fn keep_scan(&self, root: &Path, games: &[(Title, Vec<String>)]) -> rusqlite::Result<()> {
+        let root = folder_key(root);
+        let mut conn = self.conn();
+        let saving = conn.transaction()?;
+        saving.execute(
+            &self.sql("DELETE FROM shop_titles WHERE root = ?1"),
+            params![root],
+        )?;
+        for (title, programs) in games {
+            let modified = title
+                .modified
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+            saving.execute(
+                &self.sql(
+                    "INSERT INTO shop_titles (root, id, maker, name, folder, modified, programs)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                ),
+                params![
+                    root,
+                    title.id,
+                    title.maker,
+                    title.name,
+                    title.folder.to_string_lossy(),
+                    modified,
+                    programs.join("\n"),
+                ],
+            )?;
+        }
+        saving.commit()
+    }
+
+    /// The games last read from the folders under `root`, in the order they were read.
+    pub fn scanned(&self, root: &Path) -> rusqlite::Result<Vec<(Title, Vec<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&self.sql(
+            "SELECT id, maker, name, folder, modified, programs FROM shop_titles
+             WHERE root = ?1 ORDER BY rowid",
+        ))?;
+        let rows = stmt.query_map(params![folder_key(root)], |row| {
+            let modified: i64 = row.get(4)?;
+            let programs: String = row.get(5)?;
+            Ok((
+                Title {
+                    id: row.get(0)?,
+                    maker: row.get(1)?,
+                    name: row.get(2)?,
+                    folder: PathBuf::from(row.get::<_, String>(3)?),
+                    modified: SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_nanos(modified.try_into().unwrap_or(0)),
+                },
+                programs
+                    .split('\n')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// The version of each game windows-link downloaded or found current, by work ID.
     pub fn versions(&self) -> rusqlite::Result<HashMap<String, String>> {
         let conn = self.conn();
@@ -486,6 +559,24 @@ fn file_names(dir: &Path) -> (Vec<String>, Vec<String>) {
     (files, folders)
 }
 
+/// The programs that may start the game in `folder` (`candidates`).
+fn programs(folder: &Path) -> Vec<String> {
+    let (top, below) = file_names(folder);
+    let below: Vec<(String, Vec<String>)> =
+        if top.iter().any(|f| f.to_lowercase().ends_with(".exe")) {
+            Vec::new()
+        } else {
+            below
+                .into_iter()
+                .map(|sub| {
+                    let files = file_names(&folder.join(&sub)).0;
+                    (sub, files)
+                })
+                .collect()
+        };
+    candidates(&top, &below)
+}
+
 /// The games under `root` with their program candidates.
 pub fn scan(root: &Path) -> Result<Vec<(Title, Vec<String>)>, String> {
     if !root.is_dir() {
@@ -502,20 +593,7 @@ pub fn scan(root: &Path) -> Result<Vec<(Title, Vec<String>)>, String> {
                 continue;
             }
             let folder = root.join(&maker).join(&name);
-            let (top, below) = file_names(&folder);
-            let below: Vec<(String, Vec<String>)> =
-                if top.iter().any(|f| f.to_lowercase().ends_with(".exe")) {
-                    Vec::new()
-                } else {
-                    below
-                        .into_iter()
-                        .map(|sub| {
-                            let files = file_names(&folder.join(&sub)).0;
-                            (sub, files)
-                        })
-                        .collect()
-                };
-            let programs = candidates(&top, &below);
+            let programs = programs(&folder);
             let modified = std::fs::metadata(&folder)
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -698,6 +776,8 @@ pub struct ShopLibrary<S> {
     pub(crate) progress: Mutex<HashMap<String, String>>,
     /// Wakes the round of downloads and updates before its time.
     wake: std::sync::Arc<tokio::sync::Notify>,
+    /// Held while the folders are read, one reading at a time.
+    reading: Mutex<()>,
 }
 
 impl<S: Shop> ShopLibrary<S> {
@@ -709,7 +789,30 @@ impl<S: Shop> ShopLibrary<S> {
             purchases: Mutex::default(),
             progress: Mutex::default(),
             wake: std::sync::Arc::default(),
+            reading: Mutex::new(()),
         }
+    }
+
+    /// Read the games from the folders and keep them for the listing (none when the
+    /// folders cannot be read), after any reading under way, so an older reading never
+    /// replaces a newer one.
+    pub fn rescan(&self) -> Result<Vec<(Title, Vec<String>)>, String> {
+        let reading = self.reading.lock().unwrap_or_else(PoisonError::into_inner);
+        self.read_folders(reading)
+    }
+
+    fn read_folders(
+        &self,
+        _reading: MutexGuard<'_, ()>,
+    ) -> Result<Vec<(Title, Vec<String>)>, String> {
+        let games = scan(&self.root);
+        if let Err(err) = self
+            .store
+            .keep_scan(&self.root, games.as_deref().unwrap_or_default())
+        {
+            tracing::warn!(shop = self.shop.name(), %err, "cannot keep the games read from the folders");
+        }
+        games
     }
 
     /// Share `wake` with the round of downloads and updates, which `update` wakes.
@@ -757,7 +860,7 @@ impl<S: Shop> ShopLibrary<S> {
             return;
         }
         let purchases = self.purchases();
-        let Ok(games) = scan(&self.root) else {
+        let Ok(games) = self.rescan() else {
             return;
         };
         let records = self.store.games().unwrap_or_default();
@@ -805,6 +908,8 @@ impl<S: Shop> ShopLibrary<S> {
             match self.download_one(work, folder) {
                 Ok(folder) => {
                     done += 1;
+                    // Listed as here before it stops showing as coming.
+                    let _ = self.rescan();
                     self.progress().remove(&work.id);
                     tracing::info!(shop, work = %work.id, folder = %folder.display(), "game downloaded");
                 }
@@ -896,9 +1001,15 @@ impl<S: Shop> ShopLibrary<S> {
         })
     }
 
-    /// The games, each by its work ID when known.
+    /// The games as last read from the folders (read now when none are kept), each by
+    /// its work ID when known.
     pub(crate) fn games(&self) -> Result<Vec<(Title, Vec<String>)>, String> {
-        let mut games = scan(&self.root)?;
+        let kept = self.store.scanned(&self.root).unwrap_or_default();
+        let mut games = if kept.is_empty() {
+            self.rescan()?
+        } else {
+            kept
+        };
         let records = self.store.games().unwrap_or_default();
         for (title, _) in &mut games {
             if let Some(known) = records.get(&folder_key(&title.folder)) {
@@ -908,8 +1019,11 @@ impl<S: Shop> ShopLibrary<S> {
         Ok(games)
     }
 
+    /// A game with its programs read from its folder now, while the folder is there.
     fn find(&self, id: &str) -> Option<(Title, Vec<String>)> {
-        self.games().ok()?.into_iter().find(|(t, _)| t.id == id)
+        let (title, _) = self.games().ok()?.into_iter().find(|(t, _)| t.id == id)?;
+        let programs = programs(&title.folder);
+        title.folder.is_dir().then_some((title, programs))
     }
 
     /// The program in use: the user's choice while it is still there, or the default.
@@ -967,6 +1081,16 @@ impl<S: Shop> GameLibrary for ShopLibrary<S> {
         listing.items.splice(0..0, coming);
         listing.sign_in = self.shop.sign_in().map(str::to_owned);
         listing
+    }
+
+    /// Left out while a reading is under way, which brings the listing up to date.
+    fn reread(&self) {
+        let reading = match self.reading.try_lock() {
+            Ok(reading) => reading,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        let _ = self.read_folders(reading);
     }
 
     fn start(&self, id: &str) -> Result<Start, StartError> {

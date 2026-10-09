@@ -410,13 +410,16 @@ fn press_error(id: &str, failure: PressError, not_found: &str) -> Response {
 
 const NOT_A_LIBRARY: &str = "no library button has this id";
 
-/// The games a library button opens, each with whether it is pinned to the button.
+/// The games a library button opens, each with whether it is pinned to the button. The
+/// library is read again afterwards, for the next listing.
 async fn library_listing(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let Some((hide, library)) = state.library_button(&id) else {
         return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
     };
     let pins = state.pins.clone();
-    let read = tokio::task::spawn_blocking(move || (library.listing(), pins.all())).await;
+    let reading = Arc::clone(&library);
+    let read = tokio::task::spawn_blocking(move || (reading.listing(), pins.all())).await;
+    tokio::task::spawn_blocking(move || library.reread());
     let (listing, pins) = match read {
         Ok((listing, Ok(pins))) => (listing, pins),
         Ok((_, Err(err))) => {
@@ -1377,6 +1380,26 @@ buttons:
 
         let (status, _) = call(state, "GET", "/buttons/other/library").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn listing_a_library_reads_it_again_for_the_next_listing() {
+        let library = Arc::new(crate::library::fake::FakeLibrary::new());
+        let state = AppState::new(
+            config::parse(LIBRARY).unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        )
+        .with_library("games", library.clone());
+        let (status, _) = call(state, "GET", "/buttons/games/library").await;
+        assert_eq!(status, StatusCode::OK);
+        // In the background, after the answer.
+        for _ in 0..200 {
+            if library.rereads.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the library was not read again");
     }
 
     #[tokio::test]

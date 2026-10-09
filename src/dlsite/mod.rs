@@ -15,7 +15,7 @@ use std::{
 use crate::{
     library::{KeyError, LicenseKey},
     secrets::DlsiteAccount,
-    shop::{Known, Shop, ShopLibrary, Title, Work, folder_key, scan},
+    shop::{Known, Shop, ShopLibrary, Title, Work, folder_key},
 };
 
 pub mod nest;
@@ -118,7 +118,7 @@ impl ShopLibrary<DlsiteShop> {
                     .conn()
                     .execute_batch("DROP TABLE IF EXISTS dlsite_works");
             }
-            let Ok(games) = scan(&self.root) else {
+            let Ok(games) = self.rescan() else {
                 return Ok(());
             };
             let titles: Vec<Title> = games.into_iter().map(|(title, _)| title).collect();
@@ -143,7 +143,7 @@ impl ShopLibrary<DlsiteShop> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = account.cloned();
         self.adopt_legacy_works();
-        let Ok(games) = scan(&self.root) else {
+        let Ok(games) = self.rescan() else {
             return;
         };
         let titles: Vec<Title> = games.into_iter().map(|(title, _)| title).collect();
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn a_known_game_goes_by_its_work_id_and_keeps_its_labels_when_its_folder_moves() {
         use super::{identify, play::Work};
-        use crate::shop::{Known, scan};
+        use crate::shop::Known;
 
         let root = games("known");
         let library = library(&root);
@@ -716,7 +716,8 @@ mod tests {
             .unwrap();
 
         let identified = |library: &super::DlsiteLibrary, name: &str| {
-            let titles: Vec<Title> = scan(&root).unwrap().into_iter().map(|(t, _)| t).collect();
+            let games = library.rescan().unwrap();
+            let titles: Vec<Title> = games.into_iter().map(|(t, _)| t).collect();
             let remembered = library.store.games().unwrap();
             let purchases = [Work {
                 id: "RJ9".into(),
@@ -833,6 +834,77 @@ mod tests {
             .unwrap();
         assert_eq!(left, 0);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_games_read_from_the_folders_are_kept_in_their_order() {
+        let store = ShopStore::in_memory("dlsite").unwrap();
+        let title = |maker: &str, name: &str, secs| Title {
+            id: title_id(maker, name),
+            maker: maker.into(),
+            name: name.into(),
+            folder: PathBuf::from(format!(r"D:\Game\{maker}\{name}")),
+            modified: UNIX_EPOCH + Duration::new(secs, 7),
+        };
+        let first = vec![
+            (title("B", "Two", 2), names(&["a.exe", "sub/b.exe"])),
+            (title("A", "One", 1), Vec::new()),
+        ];
+        let (game, other) = (
+            std::path::Path::new(r"D:\Game"),
+            std::path::Path::new(r"E:\Game"),
+        );
+        store.keep_scan(game, &first).unwrap();
+        assert_eq!(store.scanned(game).unwrap(), first);
+        let second = vec![(title("C", "Three", 3), names(&["c.exe"]))];
+        store.keep_scan(game, &second).unwrap();
+        assert_eq!(store.scanned(game).unwrap(), second);
+        // Libraries on other folders share the database but not their games.
+        store.keep_scan(other, &first).unwrap();
+        assert_eq!(store.scanned(game).unwrap(), second);
+        assert_eq!(store.scanned(other).unwrap(), first);
+    }
+
+    #[test]
+    fn the_listing_comes_from_the_games_kept_until_the_folders_are_read_again() {
+        let root = games("kept");
+        let library = library(&root);
+        assert_eq!(library.listing().items.len(), 3);
+        let three = root.join(r"Maker\Three");
+        std::fs::create_dir_all(&three).unwrap();
+        std::fs::write(three.join("Three.exe"), "").unwrap();
+        assert_eq!(library.listing().items.len(), 3);
+        library.reread();
+        let listing = library.listing();
+        assert_eq!(listing.items.len(), 4);
+        let id = |name: &str| {
+            listing
+                .items
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap()
+                .id
+                .clone()
+        };
+
+        // Starting reads the game's own folder again.
+        std::fs::rename(three.join("Three.exe"), three.join("Three2.exe")).unwrap();
+        assert_eq!(
+            PathBuf::from(library.start(&id("Three")).unwrap().open),
+            three.join("Three2.exe")
+        );
+        std::fs::remove_dir_all(root.join(r"Maker\One")).unwrap();
+        assert_eq!(library.start(&id("One")), Err(StartError::NotFound));
+
+        std::fs::remove_dir_all(&root).unwrap();
+        library.reread();
+        assert!(
+            library
+                .listing()
+                .partial
+                .unwrap()
+                .contains("does not exist")
+        );
     }
 
     #[test]
