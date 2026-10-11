@@ -1995,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "windows-link"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "axum",
  "futures-util",
