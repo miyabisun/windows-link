@@ -132,6 +132,14 @@ pub enum ButtonSpec {
         #[serde(default)]
         hide: Vec<String>,
     },
+    /// The user is using the PC: while it is on, automation (the mouse wheel API)
+    /// waits. Turning it on presses the `app.launch` button `focus`, when given, to
+    /// bring that app forward.
+    #[serde(rename = "automation.hold")]
+    AutomationHold {
+        #[serde(default)]
+        focus: Option<String>,
+    },
     /// Start a Steam game, or close it while it runs.
     #[serde(rename = "steam.game")]
     SteamGame {
@@ -163,6 +171,7 @@ impl ButtonSpec {
             Self::DiscordServer { .. } => "discord.server",
             Self::AppLaunch { .. } => "app.launch",
             Self::SteamGame { .. } => "steam.game",
+            Self::AutomationHold { .. } => "automation.hold",
             Self::SteamLibrary { .. } => "steam.library",
             Self::DlsiteLibrary { .. } => "dlsite.library",
             Self::FanzaLibrary { .. } => "fanza.library",
@@ -335,6 +344,21 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                 if !guild_id.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(ConfigError(format!(
                         "button {id:?}: guild_id must be a Discord server ID (digits; see `windows-link discord-servers`)"
+                    )));
+                }
+            }
+            ButtonSpec::AutomationHold { focus } => {
+                let launches = |focus: &String| {
+                    config
+                        .buttons
+                        .iter()
+                        .any(|b| &b.id == focus && matches!(b.spec, ButtonSpec::AppLaunch { .. }))
+                };
+                if let Some(focus) = focus
+                    && !launches(focus)
+                {
+                    return Err(ConfigError(format!(
+                        "button {id:?}: focus {focus:?} is not an app.launch button"
                     )));
                 }
             }
@@ -604,5 +628,41 @@ buttons:
     fn rejects_unknown_button_type() {
         let text = SAMPLE.replace("audio.app_volume_toggle", "audio.unknown");
         assert!(parse(&text).unwrap_err().0.contains("invalid YAML"));
+    }
+
+    #[test]
+    fn a_hold_button_may_bring_an_app_launch_button_forward() {
+        let text = "buttons:
+  - id: ba
+    label: BA
+    type: app.launch
+    target: launcher.exe
+    process: BlueArchive.exe
+  - id: hands
+    label: Hands
+    type: automation.hold
+    focus: ba
+";
+        let config = parse(text).unwrap();
+        assert!(
+            matches!(&config.buttons[1].spec, ButtonSpec::AutomationHold { focus: Some(f) } if f == "ba")
+        );
+        assert_eq!(config.buttons[1].spec.type_name(), "automation.hold");
+        assert!(
+            parse(&text.replace("focus: ba", "focus: nope"))
+                .unwrap_err()
+                .0
+                .contains("focus")
+        );
+        assert!(
+            parse(
+                "buttons:
+  - id: hands
+    label: H
+    type: automation.hold
+"
+            )
+            .is_ok()
+        );
     }
 }

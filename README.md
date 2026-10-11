@@ -19,6 +19,7 @@ Each button does one thing:
 | `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
 | `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
 | `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
+| `automation.hold` | turns "the user is using the PC" on or off; turning it on also presses its `focus` button ([Mouse board](#mouse-board)) | `held` while on; automation then waits |
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -196,6 +197,47 @@ buttons:
   speakers too, so it is not read from Windows.
 
 Restart the server after editing the file.
+
+## Mouse board
+
+Programs that run as administrator (Blue Archive does) ignore mouse and keyboard input
+that a normal program such as windows-link injects; Windows only lets real devices
+through. For automation that has to scroll such a program, windows-link drives a small
+board that is a real USB mouse: a Raspberry Pi RP2350 board such as Waveshare's
+RP2350-One (plugs straight into a USB-A port) or RP2350-Zero, running the CircuitPython
+program in [`firmware/mouse`](firmware/mouse). The board is also a serial port, on
+which windows-link finds it by asking (only ports of Raspberry Pi and Adafruit boards
+are asked) and tells it how many notches to turn.
+
+To set a board up:
+
+1. Hold the board's BOOT button while plugging it in; it shows up as a drive.
+2. Copy the board's CircuitPython `.uf2` from <https://circuitpython.org> (for example
+   `waveshare_rp2350_one`) onto that drive. The board restarts as `CIRCUITPY`.
+3. Copy `firmware/mouse/boot.py` and `firmware/mouse/code.py` onto `CIRCUITPY`, then
+   unplug the board and plug it in again (USB is set up in `boot.py`).
+
+`POST /buttons/{id}/wheel` then brings the button's program forward, moves the cursor to
+the point, checks that the program's window is under it, turns the wheel and puts the
+cursor back. It only scrolls the windows of configured `app.launch` buttons.
+
+An `automation.hold` button stops it: press it before using the PC yourself and again
+when done. Its state is kept in `windows-link.db`, so a restart keeps the hold. With
+`focus`, turning it on also presses that `app.launch` button, bringing the program forward
+for you. For example in `desktops/ブルアカ.yaml`:
+
+```yaml
+buttons:
+  - id: blue-archive
+    label: ブルーアーカイブ
+    type: app.launch
+    target: C:\YostarGames\BlueArchive_JP_Gamelauncher\BlueArchive_JP_Gamelauncher.exe
+    process: BlueArchive.exe
+  - id: blue-archive-hold
+    label: ユーザー操作中にする
+    type: automation.hold
+    focus: blue-archive
+```
 
 ## Steam library
 
@@ -450,6 +492,7 @@ Discord's CDN.
 | `GET /healthz` | `ok` |
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
+| `POST /buttons/{id}/wheel` | `{"x": …, "y": …, "notches": …}`: turn the [mouse board](#mouse-board)'s wheel over an `app.launch` button's running `process` (`x`, `y` are fractions of its window, `notches` 1–20 either way, negative scrolls down); `204`. `409 user_operating` while an `automation.hold` button is on, `409 not_scrollable` for other buttons, `400 invalid_wheel`, `409 no_mouse`, `409 no_window`, `409 covered` (another window is over that point), `500 mouse` |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, or a redirect to it on the web, when `icon` is true |
 | `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null, "sign_in": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now, `sign_in` the shop to sign in to through the panel) |
 | `POST /buttons/{id}/library/update` | bring a library button's games up to date, leaving out its `hide` labels: Steam updates its games and shows its install screen for those not installed, answering `{"updates": n, "installs": n}` ([Updating the library](#updating-the-library)); DLsite and FANZA start their round of downloads and updates now, or right after the one under way (`202 {"round": true}`; the listing shows how each game goes). `409 sign_in` while FANZA needs signing in, `409 update_unavailable` with the reason (Steam not running or not accepting remote control, no DLsite account) |
@@ -482,8 +525,8 @@ Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_
 `409 choose_program`, `409 no_program`,
 `400 invalid_label` (an empty or taken name, or Steam's own label), `409 labels_unavailable`
 (Steam cannot be asked now, with the reason), `500 labels`,
-`500 storage`, `400 invalid_hwnd`, `400 invalid_name`, `409 exists`, `503 desktops`, or
-`502 update`.
+`500 storage`, `400 invalid_hwnd`, `400 invalid_name`, `409 exists`, `503 desktops`,
+`502 update`, or the wheel's errors above.
 
 `/events` messages:
 

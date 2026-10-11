@@ -23,8 +23,12 @@ use windows_link::{
     },
     dlsite::{self, DlsiteLibrary, DlsiteShop},
     fanza::{self, FanzaLibrary, FanzaShop},
+    hold::Holds,
+    launch::windows::WindowsLauncher,
     library::{GameLibrary, Pins},
-    logging, port, secrets,
+    logging,
+    mouse::windows::WindowsPointer,
+    port, secrets,
     server::{self, AppState},
     shop::ShopStore,
     steam::{self, SteamLibrary},
@@ -143,7 +147,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = AppState::new(config, audio)
         .with_desktops(desktops.clone())
         .with_discord(discord)
-        .with_pins(pins);
+        .with_pins(pins)
+        .with_holds(Arc::new(Holds::open(&database)?))
+        .with_pointer(Arc::new(WindowsPointer::new(Arc::new(WindowsLauncher))));
     for (button, library) in libraries.buttons {
         state = state.with_library(&button, library);
     }

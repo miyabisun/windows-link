@@ -23,11 +23,13 @@ use crate::{
     config::{ButtonSpec, Config},
     desktops::{self, VirtualDesktops},
     discord::{Discord, NoDiscord},
+    hold::Holds,
     icons,
     launch::{Launcher, windows::WindowsLauncher},
     library::{
         self, GameLibrary, KeyError, LabelError, NoLibrary, Picture, Pin, Pins, Update, UpdateError,
     },
+    mouse::{self, NoMouse, Pointer, ScrollError, WheelError, WheelRequest},
     power,
 };
 
@@ -52,6 +54,10 @@ pub struct AppState {
     pins: Arc<Pins>,
     /// FANZA's sign-in, and how to start a FANZA round at once, when a button needs it.
     fanza: Option<(Arc<crate::fanza::Client>, Arc<Notify>)>,
+    /// The `automation.hold` buttons that are on.
+    holds: Arc<Holds>,
+    /// Turns the wheel of the mouse board for `POST /buttons/{id}/wheel`.
+    pointer: Arc<dyn Pointer>,
 }
 
 struct Hub {
@@ -77,6 +83,8 @@ impl AppState {
             libraries: Arc::default(),
             pins: Arc::new(Pins::in_memory().expect("an in-memory database opens")),
             fanza: None,
+            holds: Arc::new(Holds::in_memory().expect("an in-memory database opens")),
+            pointer: Arc::new(NoMouse),
         }
     }
 
@@ -130,6 +138,21 @@ impl AppState {
     #[must_use]
     pub fn with_fanza(mut self, client: Arc<crate::fanza::Client>, wake: Arc<Notify>) -> Self {
         self.fanza = Some((client, wake));
+        self
+    }
+
+    /// Keep the `automation.hold` buttons in `holds` (by default they last until the
+    /// server stops).
+    #[must_use]
+    pub fn with_holds(mut self, holds: Arc<Holds>) -> Self {
+        self.holds = holds;
+        self
+    }
+
+    /// Turn the wheel through `pointer` (tests use a fake; without one there is no mouse).
+    #[must_use]
+    pub fn with_pointer(mut self, pointer: Arc<dyn Pointer>) -> Self {
+        self.pointer = pointer;
         self
     }
 
@@ -187,6 +210,7 @@ impl AppState {
         let audio = self.audio.clone();
         let server_icons = self.discord.icons();
         let launcher = self.launcher.clone();
+        let holds = self.holds.clone();
         let pins = self.pins.clone();
         let sign_ins: std::collections::HashMap<String, String> = self
             .libraries
@@ -201,6 +225,7 @@ impl AppState {
                 &sign_ins,
                 launcher.as_ref(),
                 &pins,
+                &holds,
             )
         })
         .await
@@ -237,7 +262,12 @@ fn compute(
     sign_ins: &std::collections::HashMap<String, String>,
     launcher: &dyn Launcher,
     pins: &Pins,
+    holds: &Holds,
 ) -> Vec<ButtonView> {
+    let holds = holds.held().unwrap_or_else(|err| {
+        warn!(%err, "cannot read the holds");
+        std::collections::HashSet::new()
+    });
     let snapshot = AudioSnapshot::read(audio);
     let processes = launcher.processes();
     let pins = pins.all().unwrap_or_else(|err| {
@@ -255,6 +285,7 @@ fn compute(
                     sign_ins,
                     processes: &processes,
                     pins: &pins,
+                    holds: &holds,
                 };
                 buttons::view(config, button, &readings, audio)
             }
@@ -278,6 +309,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/buttons", get(list_buttons))
         .route("/buttons/{id}/press", post(press_button))
+        .route("/buttons/{id}/wheel", post(turn_wheel))
         .route("/buttons/{id}/icon", get(button_icon))
         .route("/buttons/{id}/library", get(library_listing))
         .route("/buttons/{id}/library/update", post(update_library))
@@ -364,14 +396,90 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
     let config = state.config.clone();
     let audio = state.audio.clone();
     let launcher = state.launcher.clone();
+    let holds = state.holds.clone();
     let pressed_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        buttons::press(&config, &pressed_id, audio.as_ref(), launcher.as_ref())
+        buttons::press_with_holds(
+            &config,
+            &pressed_id,
+            &holds,
+            audio.as_ref(),
+            launcher.as_ref(),
+        )
     })
     .await;
     match result {
         Ok(Ok(())) => button_response(&state, &id).await,
         Ok(Err(failure)) => press_error(&id, failure, "unknown button"),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// Turn the mouse board's wheel over an app's window, unless the user holds the PC.
+async fn turn_wheel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<WheelRequest>,
+) -> Response {
+    let held = match state.holds.held() {
+        Ok(holds) => !holds.is_empty(),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage",
+                &err.to_string(),
+            );
+        }
+    };
+    let wheel = match mouse::plan(&state.config, &id, request, held) {
+        Ok(wheel) => wheel,
+        Err(WheelError::NotFound) => {
+            return error(StatusCode::NOT_FOUND, "not_found", "unknown button");
+        }
+        Err(WheelError::NotScrollable) => {
+            return error(
+                StatusCode::CONFLICT,
+                "not_scrollable",
+                "only an app.launch button with a process can be scrolled",
+            );
+        }
+        Err(WheelError::Held) => {
+            return error(
+                StatusCode::CONFLICT,
+                "user_operating",
+                "the user is using the PC (an automation.hold button is on)",
+            );
+        }
+        Err(WheelError::Invalid(message)) => {
+            return error(StatusCode::BAD_REQUEST, "invalid_wheel", &message);
+        }
+    };
+    let pointer = state.pointer.clone();
+    match tokio::task::spawn_blocking(move || pointer.scroll(&wheel)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(ScrollError::NoMouse)) => error(
+            StatusCode::CONFLICT,
+            "no_mouse",
+            "no mouse board answers on a serial port",
+        ),
+        Ok(Err(ScrollError::NoWindow)) => error(
+            StatusCode::CONFLICT,
+            "no_window",
+            "the app has no window to bring forward",
+        ),
+        Ok(Err(ScrollError::Covered)) => error(
+            StatusCode::CONFLICT,
+            "covered",
+            "another window covers that point of the app",
+        ),
+        Ok(Err(ScrollError::Failed(message))) => {
+            warn!(button = %id, %message, "wheel failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "mouse", &message)
+        }
         Err(join) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
@@ -393,6 +501,10 @@ fn press_error(id: &str, failure: PressError, not_found: &str) -> Response {
     match failure {
         PressError::NotFound => error(StatusCode::NOT_FOUND, "not_found", not_found),
         PressError::Conflict { code, message } => error(StatusCode::CONFLICT, code, &message),
+        PressError::Storage(failure) => {
+            warn!(button = %id, %failure, "press failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "storage", &failure)
+        }
         PressError::Launch(failure) => {
             warn!(button = %id, %failure, "press failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, "launch", &failure)
@@ -1928,5 +2040,115 @@ buttons:
         assert_eq!(body[0]["except"], serde_json::json!(["dev"]));
         assert_eq!(body[1]["desktop"], "SF6");
         assert_eq!(body[1]["icon"], false);
+    }
+
+    const HOLD: &str = "buttons:
+  - id: ba
+    label: BA
+    type: app.launch
+    target: launcher.exe
+    process: BlueArchive.exe
+  - id: hands
+    label: Hands
+    type: automation.hold
+    focus: ba
+  - id: web
+    label: Web
+    type: app.launch
+    target: https://example.com
+";
+
+    fn hold_state() -> (
+        AppState,
+        Arc<crate::launch::fake::FakeLauncher>,
+        Arc<crate::mouse::fake::FakePointer>,
+    ) {
+        let launcher = Arc::new(crate::launch::fake::FakeLauncher::default());
+        launcher
+            .running
+            .lock()
+            .unwrap()
+            .insert("bluearchive.exe".into());
+        let pointer = Arc::new(crate::mouse::fake::FakePointer::default());
+        let state = AppState::new(
+            config::parse(HOLD).unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        )
+        .with_launcher(launcher.clone())
+        .with_pointer(pointer.clone());
+        (state, launcher, pointer)
+    }
+
+    fn wheel(notches: i32) -> Value {
+        serde_json::json!({ "x": 0.75, "y": 0.55, "notches": notches })
+    }
+
+    #[tokio::test]
+    async fn holding_brings_the_app_forward_and_stops_the_wheel() {
+        let (state, launcher, pointer) = hold_state();
+        let (status, body) = call(state.clone(), "POST", "/buttons/hands/press").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["button"]["state"]["kind"], "hold");
+        assert_eq!(body["button"]["state"]["held"], true);
+        assert_eq!(launcher.focused.lock().unwrap().len(), 1);
+
+        let (status, body) = send(state.clone(), "POST", "/buttons/ba/wheel", wheel(-3)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "user_operating");
+        assert!(pointer.scrolled.lock().unwrap().is_empty());
+
+        let (_, body) = call(state.clone(), "POST", "/buttons/hands/press").await;
+        assert_eq!(body["button"]["state"]["held"], false);
+        assert_eq!(
+            launcher.focused.lock().unwrap().len(),
+            1,
+            "letting go brings nothing forward"
+        );
+
+        let (status, _) = send(state, "POST", "/buttons/ba/wheel", wheel(-3)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let scrolled = pointer.scrolled.lock().unwrap();
+        assert_eq!(scrolled.len(), 1);
+        assert_eq!(scrolled[0].process, "BlueArchive.exe");
+        assert_eq!(scrolled[0].notches, -3);
+    }
+
+    #[tokio::test]
+    async fn the_wheel_turns_only_for_app_buttons_within_limits() {
+        let (state, _, pointer) = hold_state();
+        let (status, _) = send(state.clone(), "POST", "/buttons/nope/wheel", wheel(1)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = send(state.clone(), "POST", "/buttons/web/wheel", wheel(1)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_scrollable");
+        let (status, body) = send(state.clone(), "POST", "/buttons/ba/wheel", wheel(21)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_wheel");
+        let far = serde_json::json!({ "x": 1.5, "y": 0.5, "notches": 1 });
+        let (status, _) = send(state.clone(), "POST", "/buttons/ba/wheel", far).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(pointer.scrolled.lock().unwrap().is_empty());
+
+        for (failure, code) in [
+            (crate::mouse::ScrollError::NoMouse, "no_mouse"),
+            (crate::mouse::ScrollError::NoWindow, "no_window"),
+            (crate::mouse::ScrollError::Covered, "covered"),
+        ] {
+            *pointer.error.lock().unwrap() = Some(failure);
+            let (status, body) = send(state.clone(), "POST", "/buttons/ba/wheel", wheel(1)).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["error"], code);
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_board_the_wheel_answers_that_there_is_no_mouse() {
+        let state = AppState::new(
+            config::parse(HOLD).unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        );
+        let (status, body) = send(state, "POST", "/buttons/ba/wheel", wheel(1)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "no_mouse");
     }
 }

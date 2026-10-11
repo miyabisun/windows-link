@@ -74,6 +74,10 @@ pub enum ButtonState {
         license_keys: bool,
         sign_in: Option<String>,
     },
+    /// `automation.hold`: `held` while the user is using the PC and automation waits.
+    Hold {
+        held: bool,
+    },
     Error {
         message: String,
     },
@@ -104,6 +108,8 @@ pub enum PressError {
     },
     Audio(AudioError),
     Launch(String),
+    /// The hold state could not be read or kept.
+    Storage(String),
 }
 
 /// Default-output target after a press: the second device when the first is the
@@ -207,6 +213,8 @@ pub struct Readings<'a> {
     pub pins: &'a Pinned,
     /// The shop each library button needs signing in to, by button ID.
     pub sign_ins: &'a std::collections::HashMap<String, String>,
+    /// The `automation.hold` buttons that are on.
+    pub holds: &'a std::collections::HashSet<String>,
 }
 
 pub fn view(
@@ -327,6 +335,9 @@ fn state(
             license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
             sign_in: readings.sign_ins.get(&button.id).cloned(),
         },
+        ButtonSpec::AutomationHold { .. } => ButtonState::Hold {
+            held: readings.holds.contains(&button.id),
+        },
     }
 }
 
@@ -355,6 +366,33 @@ fn press_output(
         });
     }
     audio.set_default_output(target).map_err(PressError::Audio)
+}
+
+/// Press a button, keeping holds in `holds`: an `automation.hold` button turns on
+/// or off, and turning it on also presses its `focus` button, bringing that app
+/// forward for the user.
+pub fn press_with_holds(
+    config: &Config,
+    id: &str,
+    holds: &crate::hold::Holds,
+    audio: &dyn Audio,
+    launcher: &dyn Launcher,
+) -> Result<(), PressError> {
+    let button = config
+        .buttons
+        .iter()
+        .find(|b| b.id == id)
+        .ok_or(PressError::NotFound)?;
+    let ButtonSpec::AutomationHold { focus } = &button.spec else {
+        return press(config, id, audio, launcher);
+    };
+    let storage = |err: rusqlite::Error| PressError::Storage(err.to_string());
+    let on = !holds.held().map_err(storage)?.contains(id);
+    holds.set(id, on).map_err(storage)?;
+    match focus {
+        Some(focus) if on => press(config, focus, audio, launcher),
+        _ => Ok(()),
+    }
 }
 
 pub fn press(
@@ -442,6 +480,10 @@ pub fn press(
             code: "not_pressable",
             message: "a library opens on the panel; use GET /buttons/{id}/library".into(),
         }),
+        ButtonSpec::AutomationHold { .. } => Err(PressError::Conflict {
+            code: "not_pressable",
+            message: "a hold button is pressed through press_with_holds".into(),
+        }),
         ButtonSpec::SteamGame { app_id, process } => {
             if is_running(&launcher.processes(), process) {
                 match launcher.close(process).map_err(PressError::Launch)? {
@@ -479,6 +521,8 @@ mod tests {
         std::sync::LazyLock::new(crate::discord::ServerIcons::new);
     static NO_SIGN_INS: std::sync::LazyLock<std::collections::HashMap<String, String>> =
         std::sync::LazyLock::new(std::collections::HashMap::new);
+    static NO_HOLDS: std::sync::LazyLock<std::collections::HashSet<String>> =
+        std::sync::LazyLock::new(std::collections::HashSet::new);
 
     fn readings(audio: &AudioSnapshot) -> super::Readings<'_> {
         super::Readings {
@@ -487,6 +531,7 @@ mod tests {
             processes: &NO_PROCESSES,
             pins: &NO_PINS,
             sign_ins: &NO_SIGN_INS,
+            holds: &NO_HOLDS,
         }
     }
 
@@ -863,6 +908,7 @@ buttons:
             processes: &processes,
             pins: &NO_PINS,
             sign_ins: &NO_SIGN_INS,
+            holds: &NO_HOLDS,
         };
         let uf4 = view(&config, &config.buttons[0], &readings, &audio);
         assert_eq!(uf4.state, ButtonState::Launch { running: true });
@@ -946,6 +992,7 @@ buttons:
             processes: &processes,
             pins: &NO_PINS,
             sign_ins: &NO_SIGN_INS,
+            holds: &NO_HOLDS,
         };
         assert_eq!(
             view(&config, &config.buttons[0], &readings, &audio).state,
@@ -980,6 +1027,7 @@ buttons:
                 processes: &processes,
                 pins: &NO_PINS,
                 sign_ins: &NO_SIGN_INS,
+                holds: &NO_HOLDS,
             };
             view(&config, &config.buttons[0], &readings, &audio).state
         };
@@ -1024,6 +1072,7 @@ buttons:
             processes: &NO_PROCESSES,
             pins: &pins,
             sign_ins: &NO_SIGN_INS,
+            holds: &NO_HOLDS,
         };
         assert_eq!(
             view(&config, &config.buttons[0], &readings, &audio).state,

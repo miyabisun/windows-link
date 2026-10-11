@@ -215,6 +215,11 @@ pub mod windows {
         search.found
     }
 
+    /// The main window of a running program, the one `focus` brings forward.
+    pub fn main_window_of(process: &str) -> Option<HWND> {
+        main_window(&pids_of(process))
+    }
+
     /// How long a started program may take to show its window.
     const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
