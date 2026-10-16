@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 use windows_link::{
     audio::{Audio, UnavailableAudio, windows::WindowsAudio},
     config::{self, ButtonSpec},
-    cors,
+    cors, cursor,
     desktops::{
         VirtualDesktops,
         api::{self as desktop_api, DesktopState},
@@ -23,7 +23,7 @@ use windows_link::{
     },
     dlsite::{self, DlsiteLibrary, DlsiteShop},
     fanza::{self, FanzaLibrary, FanzaShop},
-    hold::Holds,
+    hold::{HIGHLIGHTS, HOLDS, Holds},
     launch::windows::WindowsLauncher,
     library::{GameLibrary, Pins},
     logging,
@@ -144,11 +144,19 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let database = data_dir().join("windows-link.db");
     let libraries = libraries(&config, &database)?;
     let pins = Arc::new(Pins::open(&database)?);
+    let highlights = Arc::new(Holds::open(&database, HIGHLIGHTS)?);
+    let targets = cursor::windows::targets(&config);
+    let highlighting = !targets.is_empty();
+    if highlighting {
+        let (kept, dir) = (highlights.clone(), data_dir());
+        std::thread::spawn(move || cursor::windows::run(&targets, &kept, &dir));
+    }
     let mut state = AppState::new(config, audio)
         .with_desktops(desktops.clone())
         .with_discord(discord)
         .with_pins(pins)
-        .with_holds(Arc::new(Holds::open(&database)?))
+        .with_holds(Arc::new(Holds::open(&database, HOLDS)?))
+        .with_highlights(highlights)
         .with_pointer(Arc::new(WindowsPointer::new(Arc::new(WindowsLauncher))));
     for (button, library) in libraries.buttons {
         state = state.with_library(&button, library);
@@ -201,6 +209,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             info!("shutdown signal received");
         })
         .await?;
+    if highlighting {
+        cursor::windows::restore();
+    }
     info!("server stopped");
     Ok(())
 }

@@ -78,6 +78,10 @@ pub enum ButtonState {
     Hold {
         held: bool,
     },
+    /// `cursor.highlight`: `on` while the cursor stands out over its program.
+    Highlight {
+        on: bool,
+    },
     Error {
         message: String,
     },
@@ -215,6 +219,8 @@ pub struct Readings<'a> {
     pub sign_ins: &'a std::collections::HashMap<String, String>,
     /// The `automation.hold` buttons that are on.
     pub holds: &'a std::collections::HashSet<String>,
+    /// The `cursor.highlight` buttons that are on.
+    pub highlights: &'a std::collections::HashSet<String>,
 }
 
 pub fn view(
@@ -338,6 +344,9 @@ fn state(
         ButtonSpec::AutomationHold { .. } => ButtonState::Hold {
             held: readings.holds.contains(&button.id),
         },
+        ButtonSpec::CursorHighlight { .. } => ButtonState::Highlight {
+            on: readings.highlights.contains(&button.id),
+        },
     }
 }
 
@@ -368,13 +377,19 @@ fn press_output(
     audio.set_default_output(target).map_err(PressError::Audio)
 }
 
-/// Press a button, keeping holds in `holds`: an `automation.hold` button turns on
-/// or off, and turning it on also presses its `focus` button, bringing that app
-/// forward for the user.
-pub fn press_with_holds(
+/// The toggle buttons that are on, by kind (see `crate::hold`).
+pub struct Toggles<'a> {
+    pub holds: &'a crate::hold::Holds,
+    pub highlights: &'a crate::hold::Holds,
+}
+
+/// Press a button, keeping the toggles in `toggles`: an `automation.hold` or a
+/// `cursor.highlight` button turns on or off, and turning a hold on also presses its
+/// `focus` button, bringing that app forward for the user.
+pub fn press_with_toggles(
     config: &Config,
     id: &str,
-    holds: &crate::hold::Holds,
+    toggles: &Toggles<'_>,
     audio: &dyn Audio,
     launcher: &dyn Launcher,
 ) -> Result<(), PressError> {
@@ -383,12 +398,14 @@ pub fn press_with_holds(
         .iter()
         .find(|b| b.id == id)
         .ok_or(PressError::NotFound)?;
-    let ButtonSpec::AutomationHold { focus } = &button.spec else {
-        return press(config, id, audio, launcher);
+    let (kept, focus) = match &button.spec {
+        ButtonSpec::AutomationHold { focus } => (toggles.holds, focus.as_ref()),
+        ButtonSpec::CursorHighlight { .. } => (toggles.highlights, None),
+        _ => return press(config, id, audio, launcher),
     };
     let storage = |err: rusqlite::Error| PressError::Storage(err.to_string());
-    let on = !holds.held().map_err(storage)?.contains(id);
-    holds.set(id, on).map_err(storage)?;
+    let on = !kept.held().map_err(storage)?.contains(id);
+    kept.set(id, on).map_err(storage)?;
     match focus {
         Some(focus) if on => press(config, focus, audio, launcher),
         _ => Ok(()),
@@ -480,10 +497,12 @@ pub fn press(
             code: "not_pressable",
             message: "a library opens on the panel; use GET /buttons/{id}/library".into(),
         }),
-        ButtonSpec::AutomationHold { .. } => Err(PressError::Conflict {
-            code: "not_pressable",
-            message: "a hold button is pressed through press_with_holds".into(),
-        }),
+        ButtonSpec::AutomationHold { .. } | ButtonSpec::CursorHighlight { .. } => {
+            Err(PressError::Conflict {
+                code: "not_pressable",
+                message: "a toggle button is pressed through press_with_toggles".into(),
+            })
+        }
         ButtonSpec::SteamGame { app_id, process } => {
             if is_running(&launcher.processes(), process) {
                 match launcher.close(process).map_err(PressError::Launch)? {
@@ -532,6 +551,7 @@ mod tests {
             pins: &NO_PINS,
             sign_ins: &NO_SIGN_INS,
             holds: &NO_HOLDS,
+            highlights: &NO_HOLDS,
         }
     }
 
@@ -909,6 +929,7 @@ buttons:
             pins: &NO_PINS,
             sign_ins: &NO_SIGN_INS,
             holds: &NO_HOLDS,
+            highlights: &NO_HOLDS,
         };
         let uf4 = view(&config, &config.buttons[0], &readings, &audio);
         assert_eq!(uf4.state, ButtonState::Launch { running: true });
@@ -993,6 +1014,7 @@ buttons:
             pins: &NO_PINS,
             sign_ins: &NO_SIGN_INS,
             holds: &NO_HOLDS,
+            highlights: &NO_HOLDS,
         };
         assert_eq!(
             view(&config, &config.buttons[0], &readings, &audio).state,
@@ -1028,6 +1050,7 @@ buttons:
                 pins: &NO_PINS,
                 sign_ins: &NO_SIGN_INS,
                 holds: &NO_HOLDS,
+                highlights: &NO_HOLDS,
             };
             view(&config, &config.buttons[0], &readings, &audio).state
         };
@@ -1073,6 +1096,7 @@ buttons:
             pins: &pins,
             sign_ins: &NO_SIGN_INS,
             holds: &NO_HOLDS,
+            highlights: &NO_HOLDS,
         };
         assert_eq!(
             view(&config, &config.buttons[0], &readings, &audio).state,

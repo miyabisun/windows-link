@@ -2,6 +2,7 @@ pub mod audio;
 pub mod buttons;
 pub mod config;
 pub mod cors;
+pub mod cursor;
 pub mod desktops;
 pub mod discord;
 pub mod dlsite;

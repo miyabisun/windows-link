@@ -23,7 +23,7 @@ use crate::{
     config::{ButtonSpec, Config},
     desktops::{self, VirtualDesktops},
     discord::{Discord, NoDiscord},
-    hold::Holds,
+    hold::{HIGHLIGHTS, HOLDS, Holds},
     icons,
     launch::{Launcher, windows::WindowsLauncher},
     library::{
@@ -56,6 +56,8 @@ pub struct AppState {
     fanza: Option<(Arc<crate::fanza::Client>, Arc<Notify>)>,
     /// The `automation.hold` buttons that are on.
     holds: Arc<Holds>,
+    /// The `cursor.highlight` buttons that are on.
+    highlights: Arc<Holds>,
     /// Turns the wheel of the mouse board for `POST /buttons/{id}/wheel`.
     pointer: Arc<dyn Pointer>,
 }
@@ -83,7 +85,10 @@ impl AppState {
             libraries: Arc::default(),
             pins: Arc::new(Pins::in_memory().expect("an in-memory database opens")),
             fanza: None,
-            holds: Arc::new(Holds::in_memory().expect("an in-memory database opens")),
+            holds: Arc::new(Holds::in_memory(HOLDS).expect("an in-memory database opens")),
+            highlights: Arc::new(
+                Holds::in_memory(HIGHLIGHTS).expect("an in-memory database opens"),
+            ),
             pointer: Arc::new(NoMouse),
         }
     }
@@ -149,6 +154,14 @@ impl AppState {
         self
     }
 
+    /// Keep the `cursor.highlight` buttons in `highlights` (by default they last until
+    /// the server stops).
+    #[must_use]
+    pub fn with_highlights(mut self, highlights: Arc<Holds>) -> Self {
+        self.highlights = highlights;
+        self
+    }
+
     /// Turn the wheel through `pointer` (tests use a fake; without one there is no mouse).
     #[must_use]
     pub fn with_pointer(mut self, pointer: Arc<dyn Pointer>) -> Self {
@@ -211,6 +224,7 @@ impl AppState {
         let server_icons = self.discord.icons();
         let launcher = self.launcher.clone();
         let holds = self.holds.clone();
+        let highlights = self.highlights.clone();
         let pins = self.pins.clone();
         let sign_ins: std::collections::HashMap<String, String> = self
             .libraries
@@ -225,7 +239,10 @@ impl AppState {
                 &sign_ins,
                 launcher.as_ref(),
                 &pins,
-                &holds,
+                &buttons::Toggles {
+                    holds: &holds,
+                    highlights: &highlights,
+                },
             )
         })
         .await
@@ -262,10 +279,14 @@ fn compute(
     sign_ins: &std::collections::HashMap<String, String>,
     launcher: &dyn Launcher,
     pins: &Pins,
-    holds: &Holds,
+    toggles: &buttons::Toggles<'_>,
 ) -> Vec<ButtonView> {
-    let holds = holds.held().unwrap_or_else(|err| {
+    let holds = toggles.holds.held().unwrap_or_else(|err| {
         warn!(%err, "cannot read the holds");
+        std::collections::HashSet::new()
+    });
+    let highlights = toggles.highlights.held().unwrap_or_else(|err| {
+        warn!(%err, "cannot read the cursor highlights");
         std::collections::HashSet::new()
     });
     let snapshot = AudioSnapshot::read(audio);
@@ -286,6 +307,7 @@ fn compute(
                     processes: &processes,
                     pins: &pins,
                     holds: &holds,
+                    highlights: &highlights,
                 };
                 buttons::view(config, button, &readings, audio)
             }
@@ -397,12 +419,17 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
     let audio = state.audio.clone();
     let launcher = state.launcher.clone();
     let holds = state.holds.clone();
+    let highlights = state.highlights.clone();
     let pressed_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        buttons::press_with_holds(
+        let toggles = buttons::Toggles {
+            holds: &holds,
+            highlights: &highlights,
+        };
+        buttons::press_with_toggles(
             &config,
             &pressed_id,
-            &holds,
+            &toggles,
             audio.as_ref(),
             launcher.as_ref(),
         )
@@ -2081,6 +2108,42 @@ buttons:
 
     fn wheel(notches: i32) -> Value {
         serde_json::json!({ "x": 0.75, "y": 0.55, "notches": notches })
+    }
+
+    /// A highlight button turns on and off with each press; it is no hold, so the
+    /// wheel still turns while it is on.
+    #[tokio::test]
+    async fn a_highlight_button_toggles_and_leaves_automation_alone() {
+        let text = format!(
+            "{HOLD}  - id: cursor
+    label: Cursor
+    type: cursor.highlight
+    process: BlueArchive.exe
+"
+        );
+        let launcher = Arc::new(crate::launch::fake::FakeLauncher::default());
+        launcher
+            .running
+            .lock()
+            .unwrap()
+            .insert("bluearchive.exe".into());
+        let pointer = Arc::new(crate::mouse::fake::FakePointer::default());
+        let state = AppState::new(
+            config::parse(&text).unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        )
+        .with_launcher(launcher)
+        .with_pointer(pointer.clone());
+        let (status, body) = call(state.clone(), "POST", "/buttons/cursor/press").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["button"]["state"]["kind"], "highlight");
+        assert_eq!(body["button"]["state"]["on"], true);
+        let (status, _) = send(state.clone(), "POST", "/buttons/ba/wheel", wheel(-3)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.highlights.held().unwrap().contains("cursor"));
+        let (_, body) = call(state.clone(), "POST", "/buttons/cursor/press").await;
+        assert_eq!(body["button"]["state"]["on"], false);
+        assert!(state.highlights.held().unwrap().is_empty());
     }
 
     #[tokio::test]
