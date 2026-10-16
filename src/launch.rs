@@ -102,10 +102,10 @@ pub mod windows {
                 },
                 Shell::ShellExecuteW,
                 WindowsAndMessaging::{
-                    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetForegroundWindow, GetWindow,
-                    GetWindowLongW, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic,
-                    IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow,
-                    ShowWindow, WM_CLOSE, WS_EX_TOOLWINDOW,
+                    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW,
+                    GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+                    PostMessageW, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow, ShowWindow,
+                    WM_CLOSE, WS_EX_TOOLWINDOW,
                 },
             },
         },
@@ -218,17 +218,6 @@ pub mod windows {
     /// The main window of a running program, the one `focus` brings forward.
     pub fn main_window_of(process: &str) -> Option<HWND> {
         main_window(&pids_of(process))
-    }
-
-    /// The window in front, when it is a window of `process`.
-    pub fn front_window_of(process: &str) -> Option<HWND> {
-        let window = unsafe { GetForegroundWindow() };
-        if window.is_invalid() {
-            return None;
-        }
-        let mut pid = 0u32;
-        unsafe { GetWindowThreadProcessId(window, Some(&raw mut pid)) };
-        pids_of(process).contains(&pid).then_some(window)
     }
 
     /// How long a started program may take to show its window.

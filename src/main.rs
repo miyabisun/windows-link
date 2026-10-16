@@ -145,11 +145,11 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let libraries = libraries(&config, &database)?;
     let pins = Arc::new(Pins::open(&database)?);
     let highlights = Arc::new(Holds::open(&database, HIGHLIGHTS)?);
-    let targets = cursor::windows::targets(&config);
-    let highlighting = !targets.is_empty();
+    let highlighters = cursor::windows::buttons(&config);
+    let highlighting = !highlighters.is_empty();
     if highlighting {
         let (kept, dir) = (highlights.clone(), data_dir());
-        std::thread::spawn(move || cursor::windows::run(&targets, &kept, &dir));
+        std::thread::spawn(move || cursor::windows::run(&highlighters, &kept, &dir));
     }
     let mut state = AppState::new(config, audio)
         .with_desktops(desktops.clone())

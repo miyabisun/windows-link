@@ -140,13 +140,10 @@ pub enum ButtonSpec {
         #[serde(default)]
         focus: Option<String>,
     },
-    /// Make the mouse cursor stand out while `process` is in front: while it is on, a
-    /// rainbow arrow half again as big stands in for Windows' arrow there.
+    /// Make the mouse cursor stand out: while it is on, a rainbow arrow half again as
+    /// big stands in for Windows' arrow.
     #[serde(rename = "cursor.highlight")]
-    CursorHighlight {
-        /// Executable file name of the program, case-insensitive.
-        process: String,
-    },
+    CursorHighlight {},
     /// Start a Steam game, or close it while it runs.
     #[serde(rename = "steam.game")]
     SteamGame {
@@ -179,7 +176,7 @@ impl ButtonSpec {
             Self::AppLaunch { .. } => "app.launch",
             Self::SteamGame { .. } => "steam.game",
             Self::AutomationHold { .. } => "automation.hold",
-            Self::CursorHighlight { .. } => "cursor.highlight",
+            Self::CursorHighlight {} => "cursor.highlight",
             Self::SteamLibrary { .. } => "steam.library",
             Self::DlsiteLibrary { .. } => "dlsite.library",
             Self::FanzaLibrary { .. } => "fanza.library",
@@ -347,7 +344,7 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             | ButtonSpec::DlsiteLibrary { .. }
             | ButtonSpec::FanzaLibrary { .. }
             | ButtonSpec::MuteToggle {}
-            | ButtonSpec::CursorHighlight { .. }
+            | ButtonSpec::CursorHighlight {}
             | ButtonSpec::Mixer {} => {}
             ButtonSpec::DiscordServer { guild_id } => {
                 if !guild_id.bytes().all(|b| b.is_ascii_digit()) {
@@ -676,25 +673,25 @@ buttons:
     }
 
     #[test]
-    fn a_highlight_button_names_the_program_it_highlights_the_cursor_over() {
+    fn a_highlight_button_needs_no_more_than_its_type() {
         let text = "buttons:
   - id: cursor
     label: Cursor
     type: cursor.highlight
-    process: BlueArchive.exe
 ";
         let config = parse(text).unwrap();
-        assert!(
-            matches!(&config.buttons[0].spec, ButtonSpec::CursorHighlight { process } if process == "BlueArchive.exe")
-        );
+        assert!(matches!(
+            &config.buttons[0].spec,
+            ButtonSpec::CursorHighlight {}
+        ));
         assert_eq!(config.buttons[0].spec.type_name(), "cursor.highlight");
+        // v0.1.25 took the program it highlighted over; such a file still loads.
         assert!(
-            parse(&text.replace(
-                "    process: BlueArchive.exe
-",
-                ""
+            parse(&format!(
+                "{text}    process: BlueArchive.exe
+"
             ))
-            .is_err()
+            .is_ok()
         );
     }
 }

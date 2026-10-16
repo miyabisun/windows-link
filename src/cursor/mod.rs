@@ -1,7 +1,7 @@
-//! The `cursor.highlight` buttons: while one is on and its program is in front, a
-//! rainbow arrow half again as big as Windows' stands in for the arrow cursor, so the
-//! cursor is easy to find over a busy game. The picture is drawn here and handed to
-//! Windows as an animated cursor file (`.ani`).
+//! The `cursor.highlight` buttons: while one is on, a rainbow arrow half again as big as
+//! Windows' stands in for the arrow cursor, so the cursor is easy to find over a busy
+//! screen. The picture is drawn here and handed to Windows as an animated cursor file
+//! (`.ani`).
 
 #![allow(
     clippy::cast_precision_loss,
@@ -14,20 +14,20 @@ pub mod windows;
 pub const FRAMES: usize = 12;
 pub const JIFFIES: u32 = 5;
 
-/// The arrow's corners on a 32 by 32 cursor, its tip first; room around it for the
-/// dark edge and the glow.
+/// The arrow's corners on a 32 by 32 cursor, its tip first: the shape and size of the
+/// arrow Windows draws on a cursor that size, with room for the dark edge.
 const ARROW: [(f32, f32); 7] = [
-    (4.0, 4.0),
-    (4.0, 25.0),
-    (9.0, 20.0),
-    (13.0, 29.0),
-    (16.0, 28.0),
-    (12.0, 19.0),
-    (19.0, 19.0),
+    (2.0, 2.0),
+    (2.0, 20.0),
+    (6.0, 16.0),
+    (9.0, 23.0),
+    (11.5, 22.0),
+    (8.6, 15.4),
+    (14.0, 15.4),
 ];
-/// How wide the dark edge and the glow outside it are, on a 32 by 32 cursor.
+/// How wide the dark edge outside the rainbow is, on a 32 by 32 cursor. Nothing is
+/// drawn beyond it (a glow around the arrow got in the way, 2026-10-17).
 const EDGE: f32 = 1.2;
-const GLOW: f32 = 3.0;
 
 /// The point of the arrow, where the cursor points, on a cursor `size` pixels wide.
 pub fn hotspot(size: u32) -> (u16, u16) {
@@ -65,7 +65,7 @@ pub fn frames(size: u32) -> Vec<Vec<[u8; 4]>> {
         .collect()
 }
 
-/// One pixel: the glow, then the dark edge, then the rainbow fill over them.
+/// One pixel: the dark edge, then the rainbow fill over it.
 fn pixel(size: u32, (column, row): (u32, u32), phase: f32) -> [u8; 4] {
     let unit = 32.0 / size as f32;
     let across = (column as f32 + 0.5) * unit;
@@ -76,8 +76,6 @@ fn pixel(size: u32, (column, row): (u32, u32), phase: f32) -> [u8; 4] {
     let hue = (phase + (across + down) / 64.0).fract();
     let rainbow = hsv(hue, 0.8, 1.0);
     let mut out = [0.0f32; 4];
-    let glow = (1.0 - (outside - pixels(EDGE)) / pixels(GLOW)).clamp(0.0, 1.0) * 0.6;
-    over(&mut out, rainbow, glow);
     let edge = (pixels(EDGE) + 0.5 - outside).clamp(0.0, 1.0);
     over(&mut out, [0.12, 0.12, 0.12], edge);
     over(&mut out, rainbow, (0.5 - outside).clamp(0.0, 1.0));
@@ -225,6 +223,20 @@ mod tests {
             u32::from(hy) + 8,
         );
         assert_ne!(inside[..3], later[..3]);
+    }
+
+    /// Nothing is drawn around the arrow's dark edge: no glow spills over what is
+    /// under the cursor.
+    #[test]
+    fn nothing_shows_beyond_the_arrows_edge() {
+        let size = 64;
+        let frames = frames(size);
+        let unit = size / 32;
+        // Two units below the tip, the arrow's right side is under two units right of
+        // it: five units right lies three units outside, where a glow would show.
+        let (hx, hy) = hotspot(size);
+        let (column, row) = (u32::from(hx) + 5 * unit, u32::from(hy) + 2 * unit);
+        assert_eq!(at(&frames[0], size, column, row)[3], 0);
     }
 
     /// Windows takes the file for a cursor of the size asked.

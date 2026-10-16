@@ -2118,7 +2118,6 @@ buttons:
             "{HOLD}  - id: cursor
     label: Cursor
     type: cursor.highlight
-    process: BlueArchive.exe
 "
         );
         let launcher = Arc::new(crate::launch::fake::FakeLauncher::default());

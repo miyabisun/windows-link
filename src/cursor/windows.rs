@@ -5,79 +5,58 @@ use std::{ffi::c_void, os::windows::ffi::OsStrExt, path::Path, time::Duration};
 use tracing::warn;
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::POINT,
+        Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint},
         System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
         UI::{
-            HiDpi::GetDpiForWindow,
+            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             WindowsAndMessaging::{
-                HCURSOR, IMAGE_CURSOR, LR_LOADFROMFILE, LoadImageW, OCR_NORMAL, SPI_SETCURSORS,
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetSystemCursor, SystemParametersInfoW,
+                GetCursorPos, HCURSOR, IMAGE_CURSOR, LR_LOADFROMFILE, LoadImageW, OCR_NORMAL,
+                SPI_SETCURSORS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetSystemCursor,
+                SystemParametersInfoW,
             },
         },
     },
     core::{PCWSTR, w},
 };
 
-use crate::{config::ButtonSpec, config::Config, hold::Holds, launch::windows::front_window_of};
+use crate::{config::ButtonSpec, config::Config, hold::Holds};
 
-/// How often the window in front is looked at.
+/// How often the buttons, and the monitor the cursor is on, are looked at.
 const POLL: Duration = Duration::from_millis(150);
 /// How many times Windows' own arrow the rainbow one is.
 const SCALE: f32 = 1.5;
 
-/// A `cursor.highlight` button: its ID and the program it highlights over.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Target {
-    pub button: String,
-    pub process: String,
-}
-
-/// The `cursor.highlight` buttons of `config`.
-pub fn targets(config: &Config) -> Vec<Target> {
+/// The IDs of the `cursor.highlight` buttons of `config`.
+pub fn buttons(config: &Config) -> Vec<String> {
     config
         .buttons
         .iter()
-        .filter_map(|b| match &b.spec {
-            ButtonSpec::CursorHighlight { process } => Some(Target {
-                button: b.id.clone(),
-                process: process.clone(),
-            }),
-            _ => None,
-        })
+        .filter(|b| matches!(b.spec, ButtonSpec::CursorHighlight {}))
+        .map(|b| b.id.clone())
         .collect()
 }
 
-/// Keep the cursor highlighted while a button in `highlights` is on and its program is
-/// in front, writing the cursor files into `dir`. Runs for good on its own thread.
-pub fn run(targets: &[Target], highlights: &Holds, dir: &Path) {
+/// Keep the cursor highlighted while one of `buttons` is on in `highlights`, at the
+/// size for the monitor the cursor is on, writing the cursor files into `dir`. Runs
+/// for good on its own thread.
+pub fn run(buttons: &[String], highlights: &Holds, dir: &Path) {
     // A run stopped while it showed the rainbow leaves it until Windows' arrow is put back.
     restore();
     let mut shown: Option<u32> = None;
     loop {
         std::thread::sleep(POLL);
         let on = highlights.held().unwrap_or_default();
-        let front = targets
-            .iter()
-            .filter(|t| on.contains(&t.button))
-            .find_map(|t| front_window_of(&t.process));
-        match front {
-            Some(window) => {
-                let size = size_for(window);
-                if shown != Some(size) {
-                    match apply(dir, size) {
-                        Ok(()) => shown = Some(size),
-                        Err(err) => {
-                            warn!(%err, "cannot highlight the cursor");
-                            shown = Some(size);
-                        }
-                    }
+        if buttons.iter().any(|b| on.contains(b)) {
+            let size = size_here();
+            if shown != Some(size) {
+                if let Err(err) = apply(dir, size) {
+                    warn!(%err, "cannot highlight the cursor");
                 }
+                shown = Some(size);
             }
-            None if shown.is_some() => {
-                restore();
-                shown = None;
-            }
-            None => {}
+        } else if shown.take().is_some() {
+            restore();
         }
     }
 }
@@ -124,15 +103,15 @@ fn load(path: &Path, size: u32) -> Result<HCURSOR, String> {
     Ok(HCURSOR(handle.0))
 }
 
-/// Half again as big as Windows draws its arrow over `window`: the pointer size the
-/// user chose (`CursorBaseSize`, 32 by default) at the window's DPI.
-fn size_for(window: HWND) -> u32 {
+/// Half again as big as Windows draws its arrow on the monitor the cursor is on: the
+/// pointer size the user chose (`CursorBaseSize`, 32 by default) at that monitor's DPI.
+fn size_here() -> u32 {
     let mut base = 0u32;
     let mut len = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(4);
     let read = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
-            w!("Control Panel\\Cursors"),
+            w!(r"Control Panel\Cursors"),
             w!("CursorBaseSize"),
             RRF_RT_REG_DWORD,
             None,
@@ -143,12 +122,22 @@ fn size_for(window: HWND) -> u32 {
     if read.is_err() || base == 0 {
         base = 32;
     }
-    let dpi = match unsafe { GetDpiForWindow(window) } {
-        0 => 96,
-        dpi => dpi,
-    };
-    let size = base.min(256) as f32 * dpi.min(960) as f32 / 96.0 * SCALE;
+    let size = base.min(256) as f32 * dpi_here().min(960) as f32 / 96.0 * SCALE;
     super::to_byte_range(size, 255.0).max(32)
+}
+
+/// The DPI of the monitor the cursor is on (96 when it cannot be read).
+fn dpi_here() -> u32 {
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&raw mut point) }.is_err() {
+        return 96;
+    }
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+    let (mut x, mut y) = (0u32, 0u32);
+    match unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut x, &raw mut y) } {
+        Ok(()) if x > 0 => x,
+        _ => 96,
+    }
 }
 
 /// The size Windows loads the cursor file at `path` in, asked for `size` (for tests).

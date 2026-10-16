@@ -78,7 +78,7 @@ pub enum ButtonState {
     Hold {
         held: bool,
     },
-    /// `cursor.highlight`: `on` while the cursor stands out over its program.
+    /// `cursor.highlight`: `on` while the cursor stands out.
     Highlight {
         on: bool,
     },
@@ -344,7 +344,7 @@ fn state(
         ButtonSpec::AutomationHold { .. } => ButtonState::Hold {
             held: readings.holds.contains(&button.id),
         },
-        ButtonSpec::CursorHighlight { .. } => ButtonState::Highlight {
+        ButtonSpec::CursorHighlight {} => ButtonState::Highlight {
             on: readings.highlights.contains(&button.id),
         },
     }
@@ -400,7 +400,7 @@ pub fn press_with_toggles(
         .ok_or(PressError::NotFound)?;
     let (kept, focus) = match &button.spec {
         ButtonSpec::AutomationHold { focus } => (toggles.holds, focus.as_ref()),
-        ButtonSpec::CursorHighlight { .. } => (toggles.highlights, None),
+        ButtonSpec::CursorHighlight {} => (toggles.highlights, None),
         _ => return press(config, id, audio, launcher),
     };
     let storage = |err: rusqlite::Error| PressError::Storage(err.to_string());
@@ -497,7 +497,7 @@ pub fn press(
             code: "not_pressable",
             message: "a library opens on the panel; use GET /buttons/{id}/library".into(),
         }),
-        ButtonSpec::AutomationHold { .. } | ButtonSpec::CursorHighlight { .. } => {
+        ButtonSpec::AutomationHold { .. } | ButtonSpec::CursorHighlight {} => {
             Err(PressError::Conflict {
                 code: "not_pressable",
                 message: "a toggle button is pressed through press_with_toggles".into(),
