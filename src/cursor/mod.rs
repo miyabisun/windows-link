@@ -3,11 +3,11 @@
 //! is drawn after Blue Archive's own cursor, in the colour chosen for the button on the
 //! panel, and handed to Windows as a cursor file (`.cur`).
 //!
-//! The game's cursor (read off Windows on 2026-10-18, 32 by 32) is lit from the top
-//! left: a dark navy edge, a white rim inside it and a fill whose hue turns from cyan
-//! at the left to violet at the right point, with an opaque shadow a little below and
-//! right of it. Every pixel is opaque or clear; the edges are smoothed in colour, not
-//! in alpha. The shape, the shadow and the colours here were fitted to it.
+//! The game's cursor (read off Windows on 2026-10-18, 32 by 32, with its alpha) is a
+//! dot-wide navy edge, a white rim inside it and a fill whose hue turns from cyan at the
+//! left to violet at the right point, its tip cut short by a three-dot top, and a pale
+//! see-through shadow under it. Its edges are smoothed in alpha. The shape, the shadow
+//! and the colours here were fitted to it.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -60,17 +60,19 @@ impl Palette {
     }
 }
 
-/// The arrow's corners on a 32 by 32 cursor, its point (the hotspot's corner) first:
-/// a triangle cut short at its top, with a notch under its right point.
-const ARROW: [(f32, f32); 8] = [
-    (0.0, 0.0),
-    (4.86, 0.0),
-    (17.62, 12.3),
-    (22.75, 16.57),
-    (22.75, 21.05),
-    (12.49, 23.1),
-    (3.67, 29.27),
-    (0.12, 29.22),
+/// The arrow's outline on a 32 by 32 cursor, from its tip: a three-dot top cutting
+/// the point short, the slanting side, the right point, the notch under it, and the
+/// left side.
+const ARROW: [(f32, f32); 9] = [
+    (0.15, 1.5),
+    (1.2, 0.0),
+    (4.0, 0.0),
+    (17.45, 12.3),
+    (22.55, 16.9),
+    (23.45, 20.6),
+    (11.7, 23.1),
+    (3.5, 29.3),
+    (0.15, 28.6),
 ];
 /// Where the fill is, inside the white rim: the rim is wider along the slanting top
 /// and under the right point than along the left edge.
@@ -83,95 +85,37 @@ const FILL: [(f32, f32); 7] = [
     (7.0, 21.2),
     (4.0, 24.8),
 ];
-/// How far the shadow falls right and down of the arrow.
-const SHADOW: (f32, f32) = (0.5, 1.8);
-/// How wide the dark edge is.
-const EDGE: f32 = 1.42;
-/// The dark edge's, the shadow's and the rim's colours.
-const NAVY: [f32; 3] = [49.0, 61.0, 83.0];
-const SHADE: [f32; 3] = [26.0, 29.0, 38.0];
+/// How far the shadow falls right and down of the arrow, and how much of what is
+/// under it shows through it.
+const SHADOW: (f32, f32) = (0.2, 1.8);
+const SHADOW_ALPHA: f32 = 0.33;
+/// How wide the navy edge is.
+const EDGE: f32 = 1.2;
+/// The edge's, the shadow's and the rim's colours.
+const NAVY: [f32; 3] = [47.0, 62.0, 89.0];
+const SHADE: [f32; 3] = [55.0, 70.0, 95.0];
 const WHITE: [f32; 3] = [248.0, 251.0, 255.0];
 /// Samples a pixel is drawn from, across and down.
 const SAMPLES: u32 = 4;
 
-/// How round the tip is: the radius its two corners are rounded off at, and how many
-/// points draw each rounded corner.
-const TIP: f32 = 2.0;
-const ARC: usize = 8;
-
-/// The arrow's outline: `ARROW` with the tip's two corners rounded off at `TIP`.
-fn outline() -> Vec<(f32, f32)> {
-    let mut points = Vec::new();
-    for (i, &corner) in ARROW.iter().enumerate() {
-        if i > 1 {
-            points.push(corner);
-            continue;
-        }
-        let toward = |to: (f32, f32)| {
-            let (run, rise) = (to.0 - corner.0, to.1 - corner.1);
-            let length = run.hypot(rise);
-            (run / length, rise / length)
-        };
-        let (back, ahead) = (
-            toward(ARROW[(i + ARROW.len() - 1) % ARROW.len()]),
-            toward(ARROW[i + 1]),
-        );
-        // Half the corner's angle, and the circle touching both its sides.
-        let half = back
-            .0
-            .mul_add(ahead.0, back.1 * ahead.1)
-            .clamp(-1.0, 1.0)
-            .acos()
-            / 2.0;
-        let middle = (back.0 + ahead.0, back.1 + ahead.1);
-        let reach = TIP / half.sin() / middle.0.hypot(middle.1);
-        let centre = (
-            middle.0.mul_add(reach, corner.0),
-            middle.1.mul_add(reach, corner.1),
-        );
-        let along = TIP / half.tan();
-        let angle = |at: (f32, f32)| {
-            let point = (
-                back.0.mul_add(at.0, corner.0),
-                back.1.mul_add(at.0, corner.1),
-            );
-            let point = (
-                ahead.0.mul_add(at.1, point.0),
-                ahead.1.mul_add(at.1, point.1),
-            );
-            (point.1 - centre.1).atan2(point.0 - centre.0)
-        };
-        let (from, to) = (angle((along, 0.0)), angle((0.0, along)));
-        // The short way round, from the side behind to the side ahead.
-        let mut sweep = to - from;
-        if sweep > std::f32::consts::PI {
-            sweep -= std::f32::consts::TAU;
-        } else if sweep < -std::f32::consts::PI {
-            sweep += std::f32::consts::TAU;
-        }
-        for k in 0..=ARC {
-            let at = (k as f32 / ARC as f32).mul_add(sweep, from);
-            points.push((
-                TIP.mul_add(at.cos(), centre.0),
-                TIP.mul_add(at.sin(), centre.1),
-            ));
+/// The point of the arrow, where the cursor points, on a cursor `size` pixels wide:
+/// the point of the outline nearest the corner its short top cuts off, a dot inside
+/// the corner (the game's cursor points at that corner, a dot off its tip; this one
+/// points at the tip).
+pub fn hotspot(size: u32) -> (u16, u16) {
+    let mut tip = ARROW[0];
+    let mut nearest = f32::INFINITY;
+    for corner in 0..ARROW.len() {
+        let (from, to) = (ARROW[corner], ARROW[(corner + 1) % ARROW.len()]);
+        let (run, rise) = (to.0 - from.0, to.1 - from.1);
+        let along =
+            ((-from.0 * run - from.1 * rise) / run.mul_add(run, rise * rise)).clamp(0.0, 1.0);
+        let point = (along.mul_add(run, from.0), along.mul_add(rise, from.1));
+        let far = point.0.hypot(point.1);
+        if far < nearest {
+            (tip, nearest) = (point, far);
         }
     }
-    points
-}
-
-/// The point of the arrow, where the cursor points, on a cursor `size` pixels wide:
-/// the round tip's point nearest the corner it rounds off, a dot or so inside it (the
-/// game's cursor points a dot off its round tip; this one points at it).
-pub fn hotspot(size: u32) -> (u16, u16) {
-    let corner = ARROW[0];
-    let tip = outline()
-        .into_iter()
-        .min_by(|a, b| {
-            let far = |p: &(f32, f32)| (p.0 - corner.0).hypot(p.1 - corner.1);
-            far(a).total_cmp(&far(b))
-        })
-        .unwrap_or(corner);
     let at = |unit: f32| {
         u16::try_from(to_byte_range(
             unit * size as f32 / 32.0,
@@ -194,61 +138,57 @@ fn to_byte_range(value: f32, most: f32) -> u32 {
 }
 
 /// The arrow in `palette`, `size` by `size` pixels, row by row from the top, as
-/// straight (not premultiplied) RGBA: each pixel opaque or clear.
+/// straight (not premultiplied) RGBA.
 pub fn picture(size: u32, palette: Palette) -> Vec<[u8; 4]> {
-    let outline = outline();
     (0..size * size)
-        .map(|at| pixel(size, (at % size, at / size), palette, &outline))
+        .map(|at| pixel(size, (at % size, at / size), palette))
         .collect()
 }
 
-/// One pixel: the colours of its samples that fall on the arrow or its shadow, mixed;
-/// opaque when they cover half of it or more, clear otherwise.
-fn pixel(
-    size: u32,
-    (column, row): (u32, u32),
-    palette: Palette,
-    outline: &[(f32, f32)],
-) -> [u8; 4] {
+/// One pixel: its samples' colours mixed by how much of each covers it (the arrow
+/// whole, its shadow at `SHADOW_ALPHA`).
+fn pixel(size: u32, (column, row): (u32, u32), palette: Palette) -> [u8; 4] {
     let unit = 32.0 / size as f32;
-    let (mut sum, mut covered) = ([0.0f32; 3], 0);
+    let (mut sum, mut weight) = ([0.0f32; 3], 0.0f32);
     for sample in 0..SAMPLES * SAMPLES {
         let across = (column as f32 + ((sample % SAMPLES) as f32 + 0.5) / SAMPLES as f32) * unit;
         let down = (row as f32 + ((sample / SAMPLES) as f32 + 0.5) / SAMPLES as f32) * unit;
-        if let Some(colour) = colour(outline, across, down, palette) {
-            covered += 1;
+        if let Some((colour, alpha)) = colour(across, down, palette) {
+            weight += alpha;
             for channel in 0..3 {
-                sum[channel] += colour[channel];
+                sum[channel] = colour[channel].mul_add(alpha, sum[channel]);
             }
         }
     }
-    if covered * 2 < SAMPLES * SAMPLES {
+    if weight <= 0.0 {
         return [0; 4];
     }
-    let [r, g, b] = sum.map(|channel| {
-        u8::try_from(to_byte_range(channel / covered as f32, 255.0)).unwrap_or(u8::MAX)
-    });
-    [r, g, b, u8::MAX]
+    let byte = |value: f32| u8::try_from(to_byte_range(value, 255.0)).unwrap_or(u8::MAX);
+    let [r, g, b] = sum.map(|channel| byte(channel / weight));
+    [r, g, b, byte(weight / (SAMPLES * SAMPLES) as f32 * 255.0)]
 }
 
-/// The colour at (`across`, `down`), on a 32 by 32 cursor's units: the dark edge, the
-/// white rim, the fill, or the shadow; `None` off the arrow and its shadow.
-fn colour(outline: &[(f32, f32)], across: f32, down: f32, palette: Palette) -> Option<[f32; 3]> {
-    let depth = -distance(outline, across, down);
+/// The colour at (`across`, `down`), on a 32 by 32 cursor's units, and how opaque it
+/// is: the navy edge, the white rim, the fill, or the shadow; `None` off them all.
+fn colour(across: f32, down: f32, palette: Palette) -> Option<([f32; 3], f32)> {
+    let depth = -distance(&ARROW, across, down);
     if depth > 0.0 {
         if depth < EDGE {
-            return Some(NAVY);
+            return Some((NAVY, 1.0));
         }
         if distance(&FILL, across, down) < 0.0 {
-            return Some(fill(across, down, palette));
+            return Some((fill(across, down, palette), 1.0));
         }
         // The rim: white, tinged with the fill's second colour toward the right point.
         let tinge =
             0.6 * ((across - 9.0) / 6.0).clamp(0.0, 1.0) * ((down - 12.0) / 4.0).clamp(0.0, 1.0);
         let pale = hsv(palette.hues().1, 0.12);
-        return Some([0, 1, 2].map(|i| (pale[i] - WHITE[i]).mul_add(tinge, WHITE[i])));
+        return Some((
+            [0, 1, 2].map(|i| (pale[i] - WHITE[i]).mul_add(tinge, WHITE[i])),
+            1.0,
+        ));
     }
-    (distance(outline, across - SHADOW.0, down - SHADOW.1) < 0.0).then_some(SHADE)
+    (distance(&ARROW, across - SHADOW.0, down - SHADOW.1) < 0.0).then_some((SHADE, SHADOW_ALPHA))
 }
 
 /// The fill at (`across`, `down`), as fitted to the game's: its hue turns from the
@@ -365,38 +305,40 @@ mod tests {
         assert_eq!(at(size, Palette::Blue, (20.0, 29.0))[3], 0);
     }
 
-    /// As the game's, each pixel is opaque or clear: the edges are smoothed in colour.
+    /// The point is cut short by a short top, and the cursor points at the tip, not at
+    /// the corner cut off (the user's of 2026-10-18: the game's points a dot off).
     #[test]
-    fn every_pixel_is_opaque_or_clear() {
-        for size in [32, 40, 48] {
-            assert!(
-                picture(size, Palette::Red)
-                    .iter()
-                    .all(|p| p[3] == 0 || p[3] == 255)
-            );
-        }
-    }
-
-    /// The tip is round, and the cursor points at the round tip, not at the corner
-    /// it rounds off (the user's of 2026-10-18: the game's tip is round and a dot off).
-    #[test]
-    fn the_tip_is_round_and_the_cursor_points_at_it() {
+    fn the_tip_is_cut_short_and_the_cursor_points_at_it() {
         let size = 64;
         let picture = picture(size, Palette::Blue);
         let alpha = |(column, row): (u16, u16)| {
             picture[usize::from(row) * usize::try_from(size).unwrap() + usize::from(column)][3]
         };
-        assert_eq!(alpha((0, 0)), 0, "the corner is rounded off");
-        let tip = hotspot(size);
-        assert_eq!(tip, (1, 1));
-        assert!(alpha(tip) > 128, "the cursor points at the arrow");
+        assert_eq!(alpha((0, 0)), 0, "the corner is cut off");
+        assert!(alpha(hotspot(size)) > 128, "the cursor points at the arrow");
+        assert_eq!(hotspot(32), (1, 1));
     }
 
-    /// From the left edge in: the dark edge, the white rim, then the fill.
+    /// The slanting side is one dot of navy wide all the way down, as the game's (the
+    /// user's of 2026-10-18: 「1ドット分の太さを保っています」).
     #[test]
-    fn a_dark_edge_and_a_white_rim_frame_the_fill() {
+    fn the_slanting_side_stays_a_dot_wide() {
+        let size = 32;
+        let picture = picture(size, Palette::Blue);
+        for row in 3..=12 {
+            let dark = (4..size)
+                .map(|column| picture[usize::try_from(row * size + column).unwrap()])
+                .filter(|p| p[3] >= 0xc0 && p[..3].iter().all(|&c| c < 110))
+                .count();
+            assert_eq!(dark, 1, "row {row}");
+        }
+    }
+
+    /// From the left edge in: the navy edge, the white rim, then the fill.
+    #[test]
+    fn a_navy_edge_and_a_white_rim_frame_the_fill() {
         let size = 96;
-        let edge = at(size, Palette::Blue, (0.4, 14.0));
+        let edge = at(size, Palette::Blue, (0.6, 14.0));
         assert!(edge[..3].iter().all(|&c| c < 110), "{edge:?}");
         let rim = at(size, Palette::Blue, (2.6, 14.0));
         assert!(rim[..3].iter().all(|&c| c > 230), "{rim:?}");
@@ -404,13 +346,13 @@ mod tests {
         assert!(fill[0] < 230 && fill[2] > 240, "{fill:?}");
     }
 
-    /// A dark shadow falls under the arrow's right wing, as the light comes from the
-    /// top left.
+    /// Under the right wing a pale shadow lets what is under it show through (the
+    /// user's of 2026-10-18: the game's is a thin grey, not black).
     #[test]
-    fn a_shadow_falls_under_the_right_wing() {
-        let shadow = at(64, Palette::Green, (18.0, 23.2));
-        assert_eq!(shadow[3], 255);
-        assert!(shadow[..3].iter().all(|&c| c < 60), "{shadow:?}");
+    fn a_pale_shadow_falls_under_the_right_wing() {
+        let shadow = at(64, Palette::Green, (18.0, 22.8));
+        assert!((40..=130).contains(&shadow[3]), "{shadow:?}");
+        assert!(shadow[..3].iter().all(|&c| c < 110), "{shadow:?}");
     }
 
     /// Each palette fills the arrow with its own colour.

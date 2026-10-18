@@ -188,9 +188,9 @@ buttons:
   while `process` runs; pressing it then asks the game's windows to close, like their close
   button (`409 no_window` while it has none yet).
 - `cursor.highlight` makes the mouse cursor easy to find. While the button is on, Windows'
-  arrow cursor is an arrow drawn after Blue Archive's own cursor (fitted to it): a triangle
-  lit from the top left, in a dark edge, a white rim and a shadow, filled with a gradient in
-  the colour chosen on the panel
+  arrow cursor is an arrow drawn after Blue Archive's own cursor (fitted to it): a dot-wide
+  navy edge, a white rim and a pale see-through shadow, filled with a gradient in the colour
+  chosen on the panel
   (`PUT /buttons/{id}/color`): blue as the game's until one is chosen, red or green to
   stand out over a blue screen; toward its right point blue turns violet, red amber and
   green teal. It is as big as the arrow Windows draws on the monitor the cursor is on (the
