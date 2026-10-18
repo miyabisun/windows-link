@@ -20,7 +20,7 @@ Each button does one thing:
 | `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
 | `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
 | `automation.hold` | turns "the user is using the PC" on or off; turning it on also presses its `focus` button ([Mouse board](#mouse-board)) | `held` while on; automation then waits |
-| `cursor.highlight` | turns the highlighted cursor on or off: while on, a rainbow arrow stands in for the mouse cursor | `on` while on |
+| `cursor.highlight` | turns the highlighted cursor on or off: while on, an arrow after Blue Archive's cursor, in the button's colour, stands in for the mouse cursor | `on` while on |
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -188,16 +188,23 @@ buttons:
   while `process` runs; pressing it then asks the game's windows to close, like their close
   button (`409 no_window` while it has none yet).
 - `cursor.highlight` makes the mouse cursor easy to find. While the button is on, Windows'
-  arrow cursor is an animated rainbow arrow with a dark edge, half again as big as the
-  arrow Windows draws on the monitor the cursor is on (the pointer size chosen in Windows'
-  settings, at that monitor's DPI); turning it off brings the user's own cursors back. Only
-  the arrow is replaced, and a program that draws a cursor of its own keeps it. Whether it
-  is on is kept in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
+  arrow cursor is an arrow drawn after Blue Archive's own cursor: a triangle in a dark edge
+  and a white rim, filled with a gradient in the button's `color` (`blue`, as the game's,
+  unless given; `red` or `green` stand out over a blue screen). It is half again as big as
+  the arrow Windows draws on the monitor the cursor is on (the pointer size chosen in
+  Windows' settings, at that monitor's DPI); turning it off brings the user's own cursors
+  back. Turning one `cursor.highlight` button on turns the others off. Only the arrow is
+  replaced, and a program that draws a cursor of its own keeps it. Which one is on is kept
+  in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
 
   ```yaml
   - id: blue-archive-cursor
-    label: マウスを目立たせる
+    label: カーソル青
     type: cursor.highlight
+  - id: blue-archive-cursor-red
+    label: カーソル赤
+    type: cursor.highlight
+    color: red
   ```
 - `icon` (optional, any button type) is a file whose Windows icon the button shows: an exe,
   a shortcut, an image or a `shell:AppsFolder\…` app; or a picture's `https://` URL, which

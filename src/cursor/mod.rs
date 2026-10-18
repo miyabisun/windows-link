@@ -1,33 +1,70 @@
-//! The `cursor.highlight` buttons: while one is on, a rainbow arrow half again as big as
+//! The `cursor.highlight` buttons: while one is on, an arrow half again as big as
 //! Windows' stands in for the arrow cursor, so the cursor is easy to find over a busy
-//! screen. The picture is drawn here and handed to Windows as an animated cursor file
-//! (`.ani`).
+//! screen. The arrow is drawn after Blue Archive's own cursor (a triangle in a dark
+//! edge and a white rim, filled with a gradient), in the button's colour, and handed
+//! to Windows as a cursor file (`.cur`).
 
 #![allow(
     clippy::cast_precision_loss,
     reason = "a cursor is at most 256 pixels square: its numbers fit f32 exactly"
 )]
 
+use serde::Deserialize;
+
 pub mod windows;
 
-/// Frames of the rainbow, and how long each shows in 1/60 s: a turn a second.
-pub const FRAMES: usize = 12;
-pub const JIFFIES: u32 = 5;
+/// The colour a `cursor.highlight` button fills the arrow with: blue as the game's
+/// own, red and green to stand out where the screen is blue (2026-10-18).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Palette {
+    Red,
+    Green,
+    #[default]
+    Blue,
+}
 
-/// The arrow's corners on a 32 by 32 cursor, its tip first: the shape and size of the
-/// arrow Windows draws on a cursor that size, with room for the dark edge.
+impl Palette {
+    /// The fill's colours at the arrow's left edge and at its right point.
+    fn fill(self) -> [[f32; 3]; 2] {
+        let rgb = |c: [u8; 3]| c.map(|v| f32::from(v) / 255.0);
+        match self {
+            // As the game's cursor draws it: cyan to violet.
+            Self::Blue => [rgb([140, 232, 255]), rgb([214, 172, 255])],
+            Self::Red => [rgb([255, 120, 120]), rgb([255, 150, 210])],
+            Self::Green => [rgb([110, 240, 150]), rgb([210, 250, 120])],
+        }
+    }
+
+    /// Its name, for the cursor file's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Red => "red",
+            Self::Green => "green",
+            Self::Blue => "blue",
+        }
+    }
+}
+
+/// The arrow's corners on a 32 by 32 cursor, its point (the hotspot) first: Blue
+/// Archive's cursor, a triangle cut short at its top and with a notch under its
+/// right point.
 const ARROW: [(f32, f32); 7] = [
-    (2.0, 2.0),
-    (2.0, 20.0),
-    (6.0, 16.0),
-    (9.0, 23.0),
-    (11.5, 22.0),
-    (8.6, 15.4),
-    (14.0, 15.4),
+    (0.0, 0.0),
+    (5.0, 0.0),
+    (23.3, 16.6),
+    (23.3, 22.6),
+    (12.0, 25.4),
+    (5.2, 31.0),
+    (0.0, 31.0),
 ];
-/// How wide the dark edge outside the rainbow is, on a 32 by 32 cursor. Nothing is
-/// drawn beyond it (a glow around the arrow got in the way, 2026-10-17).
-const EDGE: f32 = 1.2;
+/// The arrow's right end, where the fill reaches its second colour.
+const RIGHT: f32 = 23.3;
+/// How wide the dark edge and the white rim inside it are, on a 32 by 32 cursor.
+const EDGE: f32 = 1.6;
+const RIM: f32 = 2.0;
+/// The dark edge's colour.
+const DARK: [f32; 3] = [49.0 / 255.0, 61.0 / 255.0, 83.0 / 255.0];
 
 /// The point of the arrow, where the cursor points, on a cursor `size` pixels wide.
 pub fn hotspot(size: u32) -> (u16, u16) {
@@ -52,34 +89,40 @@ fn to_byte_range(value: f32, most: f32) -> u32 {
     value.round().clamp(0.0, most) as u32
 }
 
-/// The frames of the rainbow arrow, `size` by `size` pixels each, row by row from the
-/// top, as straight (not premultiplied) RGBA.
-pub fn frames(size: u32) -> Vec<Vec<[u8; 4]>> {
-    (0..FRAMES)
-        .map(|frame| {
-            let phase = frame as f32 / FRAMES as f32;
-            (0..size * size)
-                .map(|at| pixel(size, (at % size, at / size), phase))
-                .collect()
-        })
+/// The arrow in `palette`, `size` by `size` pixels, row by row from the top, as
+/// straight (not premultiplied) RGBA.
+pub fn picture(size: u32, palette: Palette) -> Vec<[u8; 4]> {
+    (0..size * size)
+        .map(|at| pixel(size, (at % size, at / size), palette))
         .collect()
 }
 
-/// One pixel: the dark edge, then the rainbow fill over it.
-fn pixel(size: u32, (column, row): (u32, u32), phase: f32) -> [u8; 4] {
+/// One pixel: the dark edge, the white rim inside it, then the fill inside that.
+fn pixel(size: u32, (column, row): (u32, u32), palette: Palette) -> [u8; 4] {
     let unit = 32.0 / size as f32;
     let across = (column as f32 + 0.5) * unit;
     let down = (row as f32 + 0.5) * unit;
     // How far outside the arrow, in pixels: negative inside it.
     let outside = distance(across, down) / unit;
     let pixels = |units: f32| units / unit;
-    let hue = (phase + (across + down) / 64.0).fract();
-    let rainbow = hsv(hue, 0.8, 1.0);
+    let covered = |inset: f32| (0.5 - outside - pixels(inset)).clamp(0.0, 1.0);
     let mut out = [0.0f32; 4];
-    let edge = (pixels(EDGE) + 0.5 - outside).clamp(0.0, 1.0);
-    over(&mut out, [0.12, 0.12, 0.12], edge);
-    over(&mut out, rainbow, (0.5 - outside).clamp(0.0, 1.0));
+    over(&mut out, DARK, covered(0.0));
+    over(&mut out, [1.0; 3], covered(EDGE));
+    over(&mut out, fill(across, down, palette), covered(EDGE + RIM));
     out.map(|channel| u8::try_from(to_byte_range(channel * 255.0, 255.0)).unwrap_or(u8::MAX))
+}
+
+/// The fill at (`across`, `down`): the palette's left colour to its right one from
+/// the left edge to the right point, paler toward the bottom, as the game's.
+fn fill(across: f32, down: f32, palette: Palette) -> [f32; 3] {
+    let [left, right] = palette.fill();
+    let t = (across / RIGHT).clamp(0.0, 1.0);
+    let pale = ((down - 14.0) / 10.0).clamp(0.0, 1.0) * 0.55;
+    [0, 1, 2].map(|i| {
+        let base = (right[i] - left[i]).mul_add(t, left[i]);
+        (1.0 - base).mul_add(pale, base)
+    })
 }
 
 /// Paints `color` at `alpha` over `under` (straight alpha).
@@ -115,53 +158,9 @@ fn distance(across: f32, down: f32) -> f32 {
     if inside { -nearest } else { nearest }
 }
 
-/// The colour of `hue` (0 to 1 round the wheel) at `saturation` and `value`.
-fn hsv(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
-    let sixths = hue * 6.0;
-    let within = sixths.fract();
-    let low = value * (1.0 - saturation);
-    let falling = value * saturation.mul_add(-within, 1.0);
-    let rising = value * saturation.mul_add(within - 1.0, 1.0);
-    match to_byte_range(sixths.floor(), 5.0) {
-        0 => [value, rising, low],
-        1 => [falling, value, low],
-        2 => [low, value, rising],
-        3 => [low, falling, value],
-        4 => [rising, low, value],
-        _ => [value, low, falling],
-    }
-}
-
-/// An animated cursor file of `frames` (see `frames`), each `size` by `size`,
-/// pointing at `hotspot`, each shown `JIFFIES`.
-pub fn ani(frames: &[Vec<[u8; 4]>], size: u32, hotspot: (u16, u16)) -> Vec<u8> {
-    let count = u32::try_from(frames.len()).unwrap_or(u32::MAX);
-    let mut header = Vec::new();
-    for value in [36, count, count, 0, 0, 0, 0, JIFFIES, 1] {
-        header.extend_from_slice(&u32::to_le_bytes(value));
-    }
-    let mut list = b"fram".to_vec();
-    for frame in frames {
-        list.extend(chunk(*b"icon", &cur(frame, size, hotspot)));
-    }
-    let mut body = b"ACON".to_vec();
-    body.extend(chunk(*b"anih", &header));
-    body.extend(chunk(*b"LIST", &list));
-    chunk(*b"RIFF", &body)
-}
-
-fn chunk(id: [u8; 4], data: &[u8]) -> Vec<u8> {
-    let mut out = id.to_vec();
-    out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
-    out.extend_from_slice(data);
-    if data.len() % 2 == 1 {
-        out.push(0);
-    }
-    out
-}
-
-/// One frame as a `.cur` file: a 32-bit picture with its alpha, and an empty mask.
-fn cur(frame: &[[u8; 4]], size: u32, hotspot: (u16, u16)) -> Vec<u8> {
+/// A cursor file of `picture` (see `picture`), `size` by `size`, pointing at
+/// `hotspot`: a 32-bit picture with its alpha, and an empty mask.
+pub fn cur(picture: &[[u8; 4]], size: u32, hotspot: (u16, u16)) -> Vec<u8> {
     let mask_row = size.div_ceil(32) * 4;
     let image = size * size * 4 + mask_row * size;
     // A width of 256 is written 0.
@@ -185,7 +184,7 @@ fn cur(frame: &[[u8; 4]], size: u32, hotspot: (u16, u16)) -> Vec<u8> {
     }
     // Rows from the bottom, blue first.
     let width = usize::try_from(size).unwrap_or(0);
-    for row in frame.chunks(width).rev() {
+    for row in picture.chunks(width).rev() {
         for [red, green, blue, alpha] in row {
             out.extend_from_slice(&[*blue, *green, *red, *alpha]);
         }
@@ -201,42 +200,49 @@ fn cur(frame: &[[u8; 4]], size: u32, hotspot: (u16, u16)) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn at(frame: &[[u8; 4]], size: u32, column: u32, row: u32) -> [u8; 4] {
-        frame[usize::try_from(row * size + column).unwrap()]
-    }
-
-    /// The arrow is solid from its tip down its body, clear in the far corner, and its
-    /// colours move from frame to frame.
-    #[test]
-    fn the_arrow_is_solid_at_its_tip_and_its_rainbow_turns() {
-        let size = 48;
-        let frames = frames(size);
-        assert_eq!(frames.len(), FRAMES);
-        let (hx, hy) = hotspot(size);
-        let inside = at(&frames[0], size, u32::from(hx) + 2, u32::from(hy) + 8);
-        assert_eq!(inside[3], 255);
-        assert_eq!(at(&frames[0], size, size - 1, 0)[3], 0);
-        let later = at(
-            &frames[FRAMES / 2],
-            size,
-            u32::from(hx) + 2,
-            u32::from(hy) + 8,
+    /// The pixel at (`across`, `down`) on a 32 by 32 cursor's units, drawn `size` wide.
+    fn at(size: u32, palette: Palette, (across, down): (f32, f32)) -> [u8; 4] {
+        let scale = size as f32 / 32.0;
+        let (column, row) = (
+            to_byte_range(across * scale, f32::from(u16::MAX)),
+            to_byte_range(down * scale, f32::from(u16::MAX)),
         );
-        assert_ne!(inside[..3], later[..3]);
+        picture(size, palette)[usize::try_from(row * size + column).unwrap()]
     }
 
-    /// Nothing is drawn around the arrow's dark edge: no glow spills over what is
-    /// under the cursor.
+    /// The arrow is solid inside and clear beyond its outline: nothing right of its
+    /// slanting top, nothing in the far corner.
     #[test]
-    fn nothing_shows_beyond_the_arrows_edge() {
-        let size = 64;
-        let frames = frames(size);
-        let unit = size / 32;
-        // Two units below the tip, the arrow's right side is under two units right of
-        // it: five units right lies three units outside, where a glow would show.
-        let (hx, hy) = hotspot(size);
-        let (column, row) = (u32::from(hx) + 5 * unit, u32::from(hy) + 2 * unit);
-        assert_eq!(at(&frames[0], size, column, row)[3], 0);
+    fn the_arrow_is_solid_inside_and_clear_beyond_its_edge() {
+        let size = 48;
+        assert_eq!(at(size, Palette::Blue, (6.0, 14.0))[3], 255);
+        assert_eq!(at(size, Palette::Blue, (20.0, 6.0))[3], 0);
+        assert_eq!(at(size, Palette::Blue, (31.0, 1.0))[3], 0);
+        assert_eq!(at(size, Palette::Blue, (20.0, 29.0))[3], 0);
+    }
+
+    /// From the left edge in: the dark edge, the white rim, then the fill.
+    #[test]
+    fn a_dark_edge_and_a_white_rim_frame_the_fill() {
+        let size = 96;
+        let edge = at(size, Palette::Blue, (0.4, 14.0));
+        assert!(edge[..3].iter().all(|&c| c < 110), "{edge:?}");
+        let rim = at(size, Palette::Blue, (2.6, 14.0));
+        assert!(rim[..3].iter().all(|&c| c > 230), "{rim:?}");
+        let fill = at(size, Palette::Blue, (8.0, 14.0));
+        assert!(fill[0] < 230 && fill[2] > 240, "{fill:?}");
+    }
+
+    /// Each palette fills the arrow with its own colour.
+    #[test]
+    fn each_palette_fills_its_colour() {
+        let fill = |palette| at(64, palette, (8.0, 12.0));
+        let [r, g, b, _] = fill(Palette::Red);
+        assert!(r > g + 60 && r > b + 40, "red {:?}", [r, g, b]);
+        let [r, g, b, _] = fill(Palette::Green);
+        assert!(g > r + 40 && g > b + 30, "green {:?}", [r, g, b]);
+        let [r, g, b, _] = fill(Palette::Blue);
+        assert!(b > r + 40 && b > g, "blue {:?}", [r, g, b]);
     }
 
     /// Windows takes the file for a cursor of the size asked.
@@ -244,8 +250,12 @@ mod tests {
     fn windows_loads_the_cursor_file_at_its_size() {
         let size = 48;
         let path =
-            std::env::temp_dir().join(format!("windows-link-cursor-{}.ani", std::process::id()));
-        std::fs::write(&path, ani(&frames(size), size, hotspot(size))).unwrap();
+            std::env::temp_dir().join(format!("windows-link-cursor-{}.cur", std::process::id()));
+        std::fs::write(
+            &path,
+            cur(&picture(size, Palette::Red), size, hotspot(size)),
+        )
+        .unwrap();
         let loaded = windows::loaded_size(&path, size);
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, Some(size));

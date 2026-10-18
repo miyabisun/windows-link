@@ -9,7 +9,7 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::library::Pictures;
+use crate::{cursor::Palette, library::Pictures};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,10 +140,14 @@ pub enum ButtonSpec {
         #[serde(default)]
         focus: Option<String>,
     },
-    /// Make the mouse cursor stand out: while it is on, a rainbow arrow half again as
-    /// big stands in for Windows' arrow.
+    /// Make the mouse cursor stand out: while it is on, an arrow after Blue Archive's
+    /// cursor, half again as big, filled in `color` (blue unless given), stands in for
+    /// Windows' arrow. Turning one on turns the others off.
     #[serde(rename = "cursor.highlight")]
-    CursorHighlight {},
+    CursorHighlight {
+        #[serde(default)]
+        color: Palette,
+    },
     /// Start a Steam game, or close it while it runs.
     #[serde(rename = "steam.game")]
     SteamGame {
@@ -176,7 +180,7 @@ impl ButtonSpec {
             Self::AppLaunch { .. } => "app.launch",
             Self::SteamGame { .. } => "steam.game",
             Self::AutomationHold { .. } => "automation.hold",
-            Self::CursorHighlight {} => "cursor.highlight",
+            Self::CursorHighlight { .. } => "cursor.highlight",
             Self::SteamLibrary { .. } => "steam.library",
             Self::DlsiteLibrary { .. } => "dlsite.library",
             Self::FanzaLibrary { .. } => "fanza.library",
@@ -344,7 +348,7 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             | ButtonSpec::DlsiteLibrary { .. }
             | ButtonSpec::FanzaLibrary { .. }
             | ButtonSpec::MuteToggle {}
-            | ButtonSpec::CursorHighlight {}
+            | ButtonSpec::CursorHighlight { .. }
             | ButtonSpec::Mixer {} => {}
             ButtonSpec::DiscordServer { guild_id } => {
                 if !guild_id.bytes().all(|b| b.is_ascii_digit()) {
@@ -375,7 +379,7 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ButtonSpec, parse};
+    use super::{ButtonSpec, Palette, parse};
 
     const SAMPLE: &str = r#"
 devices:
@@ -682,7 +686,20 @@ buttons:
         let config = parse(text).unwrap();
         assert!(matches!(
             &config.buttons[0].spec,
-            ButtonSpec::CursorHighlight {}
+            ButtonSpec::CursorHighlight {
+                color: Palette::Blue
+            }
+        ));
+        let red = parse(&format!(
+            "{text}    color: red
+"
+        ))
+        .unwrap();
+        assert!(matches!(
+            &red.buttons[0].spec,
+            ButtonSpec::CursorHighlight {
+                color: Palette::Red
+            }
         ));
         assert_eq!(config.buttons[0].spec.type_name(), "cursor.highlight");
         // v0.1.25 took the program it highlighted over; such a file still loads.

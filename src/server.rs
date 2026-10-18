@@ -2145,6 +2145,32 @@ buttons:
         assert!(state.highlights.held().unwrap().is_empty());
     }
 
+    /// One colour stands out at a time: turning one highlight button on turns the
+    /// others off.
+    #[tokio::test]
+    async fn turning_a_highlight_colour_on_turns_the_others_off() {
+        let text = format!(
+            "{HOLD}  - id: red
+    label: Red
+    type: cursor.highlight
+    color: red
+  - id: green
+    label: Green
+    type: cursor.highlight
+    color: green
+"
+        );
+        let state = AppState::new(
+            config::parse(&text).unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        );
+        call(state.clone(), "POST", "/buttons/red/press").await;
+        let (_, body) = call(state.clone(), "POST", "/buttons/green/press").await;
+        assert_eq!(body["button"]["state"]["on"], true);
+        let held = state.highlights.held().unwrap();
+        assert!(held.contains("green") && !held.contains("red"), "{held:?}");
+    }
+
     #[tokio::test]
     async fn holding_brings_the_app_forward_and_stops_the_wheel() {
         let (state, launcher, pointer) = hold_state();
