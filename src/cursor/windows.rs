@@ -85,13 +85,13 @@ pub fn restore() {
     }
 }
 
-/// The arrow in `palette`, `size` pixels square, in for Windows' arrow.
+/// The arrow in `palette`, `size` pixels square, in for Windows' arrow. Its file is
+/// written afresh each time: one an older version wrote under the same name draws
+/// that version's arrow (v0.1.28 left its 1.5x one behind).
 fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
     let path = dir.join(format!("cursor-highlight-{}-{size}.cur", palette.name()));
-    if !path.exists() {
-        let file = super::cur(&super::picture(size, palette), size, super::hotspot(size));
-        std::fs::write(&path, file).map_err(|e| e.to_string())?;
-    }
+    let file = super::cur(&super::picture(size, palette), size, super::hotspot(size));
+    std::fs::write(&path, file).map_err(|e| e.to_string())?;
     let cursor = load(&path, size)?;
     unsafe { SetSystemCursor(cursor, OCR_NORMAL) }.map_err(|e| e.to_string())
 }
