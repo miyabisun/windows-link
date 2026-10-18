@@ -21,9 +21,10 @@ use crate::{
     audio::Audio,
     buttons::{self, AudioSnapshot, ButtonState, ButtonView, PressError},
     config::{ButtonSpec, Config},
+    cursor::Palette,
     desktops::{self, VirtualDesktops},
     discord::{Discord, NoDiscord},
-    hold::{HIGHLIGHTS, HOLDS, Holds},
+    hold::{Colors, HIGHLIGHTS, HOLDS, Holds},
     icons,
     launch::{Launcher, windows::WindowsLauncher},
     library::{
@@ -58,6 +59,8 @@ pub struct AppState {
     holds: Arc<Holds>,
     /// The `cursor.highlight` buttons that are on.
     highlights: Arc<Holds>,
+    /// The colour chosen for each `cursor.highlight` button.
+    pub(crate) highlight_colors: Arc<Colors>,
     /// Turns the wheel of the mouse board for `POST /buttons/{id}/wheel`.
     pointer: Arc<dyn Pointer>,
 }
@@ -89,6 +92,7 @@ impl AppState {
             highlights: Arc::new(
                 Holds::in_memory(HIGHLIGHTS).expect("an in-memory database opens"),
             ),
+            highlight_colors: Arc::new(Colors::in_memory().expect("an in-memory database opens")),
             pointer: Arc::new(NoMouse),
         }
     }
@@ -162,6 +166,14 @@ impl AppState {
         self
     }
 
+    /// Keep the colours chosen for the `cursor.highlight` buttons in `colors` (by
+    /// default they last until the server stops).
+    #[must_use]
+    pub fn with_highlight_colors(mut self, colors: Arc<Colors>) -> Self {
+        self.highlight_colors = colors;
+        self
+    }
+
     /// Turn the wheel through `pointer` (tests use a fake; without one there is no mouse).
     #[must_use]
     pub fn with_pointer(mut self, pointer: Arc<dyn Pointer>) -> Self {
@@ -225,6 +237,7 @@ impl AppState {
         let launcher = self.launcher.clone();
         let holds = self.holds.clone();
         let highlights = self.highlights.clone();
+        let colors = self.highlight_colors.clone();
         let pins = self.pins.clone();
         let sign_ins: std::collections::HashMap<String, String> = self
             .libraries
@@ -242,6 +255,7 @@ impl AppState {
                 &buttons::Toggles {
                     holds: &holds,
                     highlights: &highlights,
+                    colors: &colors,
                 },
             )
         })
@@ -289,6 +303,10 @@ fn compute(
         warn!(%err, "cannot read the cursor highlights");
         std::collections::HashSet::new()
     });
+    let colors = toggles.colors.all().unwrap_or_else(|err| {
+        warn!(%err, "cannot read the cursor colours");
+        std::collections::HashMap::new()
+    });
     let snapshot = AudioSnapshot::read(audio);
     let processes = launcher.processes();
     let pins = pins.all().unwrap_or_else(|err| {
@@ -308,6 +326,7 @@ fn compute(
                     pins: &pins,
                     holds: &holds,
                     highlights: &highlights,
+                    colors: &colors,
                 };
                 buttons::view(config, button, &readings, audio)
             }
@@ -332,6 +351,7 @@ pub fn app(state: AppState) -> Router {
         .route("/buttons", get(list_buttons))
         .route("/buttons/{id}/press", post(press_button))
         .route("/buttons/{id}/wheel", post(turn_wheel))
+        .route("/buttons/{id}/color", axum::routing::put(set_color))
         .route("/buttons/{id}/icon", get(button_icon))
         .route("/buttons/{id}/library", get(library_listing))
         .route("/buttons/{id}/library/update", post(update_library))
@@ -420,11 +440,13 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
     let launcher = state.launcher.clone();
     let holds = state.holds.clone();
     let highlights = state.highlights.clone();
+    let colors = state.highlight_colors.clone();
     let pressed_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
         let toggles = buttons::Toggles {
             holds: &holds,
             highlights: &highlights,
+            colors: &colors,
         };
         buttons::press_with_toggles(
             &config,
@@ -444,6 +466,38 @@ async fn press_button(State(state): State<AppState>, Path(id): Path<String>) -> 
             &join.to_string(),
         ),
     }
+}
+
+/// A colour chosen for a `cursor.highlight` button.
+#[derive(serde::Deserialize)]
+struct ColorChange {
+    color: Palette,
+}
+
+/// Choose the colour a `cursor.highlight` button highlights the cursor in.
+async fn set_color(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(change): Json<ColorChange>,
+) -> Response {
+    let Some(button) = state.config.buttons.iter().find(|b| b.id == id) else {
+        return error(StatusCode::NOT_FOUND, "not_found", "unknown button");
+    };
+    if !matches!(button.spec, ButtonSpec::CursorHighlight {}) {
+        return error(
+            StatusCode::CONFLICT,
+            "not_highlight",
+            "only a cursor.highlight button has a colour",
+        );
+    }
+    if let Err(err) = state.highlight_colors.set(&id, change.color) {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage",
+            &err.to_string(),
+        );
+    }
+    button_response(&state, &id).await
 }
 
 /// Turn the mouse board's wheel over an app's window, unless the user holds the PC.
@@ -2145,30 +2199,40 @@ buttons:
         assert!(state.highlights.held().unwrap().is_empty());
     }
 
-    /// One colour stands out at a time: turning one highlight button on turns the
-    /// others off.
+    /// A highlight button's colour is chosen on the panel (its menu): blue until
+    /// then, kept, and told in its state while it stays on. Only a highlight button
+    /// has one, and only red, green and blue are.
     #[tokio::test]
-    async fn turning_a_highlight_colour_on_turns_the_others_off() {
+    async fn a_highlight_buttons_colour_is_chosen_and_told() {
         let text = format!(
-            "{HOLD}  - id: red
-    label: Red
+            "{HOLD}  - id: cursor
+    label: Cursor
     type: cursor.highlight
-    color: red
-  - id: green
-    label: Green
-    type: cursor.highlight
-    color: green
 "
         );
         let state = AppState::new(
             config::parse(&text).unwrap(),
             Arc::new(FakeAudio::new(Vec::new(), None)),
         );
-        call(state.clone(), "POST", "/buttons/red/press").await;
-        let (_, body) = call(state.clone(), "POST", "/buttons/green/press").await;
+        let (_, body) = call(state.clone(), "POST", "/buttons/cursor/press").await;
+        assert_eq!(body["button"]["state"]["color"], "blue");
+        let red = serde_json::json!({ "color": "red" });
+        let (status, body) = send(state.clone(), "PUT", "/buttons/cursor/color", red.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["button"]["state"]["color"], "red");
         assert_eq!(body["button"]["state"]["on"], true);
-        let held = state.highlights.held().unwrap();
-        assert!(held.contains("green") && !held.contains("red"), "{held:?}");
+        assert_eq!(
+            state.highlight_colors.all().unwrap().get("cursor"),
+            Some(&crate::cursor::Palette::Red)
+        );
+        let purple = serde_json::json!({ "color": "purple" });
+        let (status, _) = send(state.clone(), "PUT", "/buttons/cursor/color", purple).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, body) = send(state.clone(), "PUT", "/buttons/ba/color", red.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_highlight");
+        let (status, _) = send(state, "PUT", "/buttons/nothing/color", red).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

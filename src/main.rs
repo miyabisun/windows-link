@@ -23,7 +23,7 @@ use windows_link::{
     },
     dlsite::{self, DlsiteLibrary, DlsiteShop},
     fanza::{self, FanzaLibrary, FanzaShop},
-    hold::{HIGHLIGHTS, HOLDS, Holds},
+    hold::{Colors, HIGHLIGHTS, HOLDS, Holds},
     launch::windows::WindowsLauncher,
     library::{GameLibrary, Pins},
     logging,
@@ -145,11 +145,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let libraries = libraries(&config, &database)?;
     let pins = Arc::new(Pins::open(&database)?);
     let highlights = Arc::new(Holds::open(&database, HIGHLIGHTS)?);
+    let colors = Arc::new(Colors::open(&database)?);
     let highlighters = cursor::windows::buttons(&config);
     let highlighting = !highlighters.is_empty();
     if highlighting {
-        let (kept, dir) = (highlights.clone(), data_dir());
-        std::thread::spawn(move || cursor::windows::run(&highlighters, &kept, &dir));
+        let (kept, chosen, dir) = (highlights.clone(), colors.clone(), data_dir());
+        std::thread::spawn(move || cursor::windows::run(&highlighters, &kept, &chosen, &dir));
     }
     let mut state = AppState::new(config, audio)
         .with_desktops(desktops.clone())
@@ -157,6 +158,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .with_pins(pins)
         .with_holds(Arc::new(Holds::open(&database, HOLDS)?))
         .with_highlights(highlights)
+        .with_highlight_colors(colors)
         .with_pointer(Arc::new(WindowsPointer::new(Arc::new(WindowsLauncher))));
     for (button, library) in libraries.buttons {
         state = state.with_library(&button, library);

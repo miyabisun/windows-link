@@ -1,11 +1,18 @@
 //! Which toggle buttons are on, kept in `windows-link.db` so a restart, such as an
 //! update, keeps them: the `automation.hold` buttons (while one is, the user is using
 //! the PC and automation, the mouse wheel API, must wait) and the `cursor.highlight`
-//! buttons, each kind in a table of its own.
+//! buttons, each kind in a table of its own; and the colour chosen for each
+//! `cursor.highlight` button.
 
-use std::{collections::HashSet, path::Path, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Mutex,
+};
 
 use rusqlite::Connection;
+
+use crate::cursor::Palette;
 
 /// The `automation.hold` buttons' table.
 pub const HOLDS: &str = "automation_holds";
@@ -73,9 +80,93 @@ impl Holds {
     }
 }
 
+/// The colour chosen on the panel for each `cursor.highlight` button (blue, the
+/// default, for one never chosen).
+pub struct Colors {
+    conn: Mutex<Connection>,
+}
+
+impl Colors {
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        Self::init(Connection::open(path)?)
+    }
+
+    pub fn in_memory() -> rusqlite::Result<Self> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cursor_colors \
+             (button_id TEXT PRIMARY KEY, color TEXT NOT NULL);",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The colours chosen, by button; a colour this version does not know is left out.
+    pub fn all(&self) -> rusqlite::Result<HashMap<String, Palette>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT button_id, color FROM cursor_colors")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut colors = HashMap::new();
+        for row in rows {
+            let (button, name) = row?;
+            if let Some(palette) = Palette::named(&name) {
+                colors.insert(button, palette);
+            }
+        }
+        Ok(colors)
+    }
+
+    pub fn set(&self, button: &str, palette: Palette) -> rusqlite::Result<()> {
+        self.conn().execute(
+            "INSERT INTO cursor_colors (button_id, color) VALUES (?1, ?2) \
+             ON CONFLICT(button_id) DO UPDATE SET color = excluded.color",
+            [button, palette.name()],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HIGHLIGHTS, HOLDS, Holds};
+    use super::{Colors, HIGHLIGHTS, HOLDS, Holds};
+    use crate::cursor::Palette;
+
+    /// A highlight button's colour is blue until chosen, and stays chosen after
+    /// reopening.
+    #[test]
+    fn a_chosen_colour_stays_after_reopening() {
+        let path =
+            std::env::temp_dir().join(format!("windows-link-colors-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let colors = Colors::open(&path).unwrap();
+            assert!(colors.all().unwrap().is_empty());
+            colors.set("cursor", Palette::Red).unwrap();
+            colors.set("cursor", Palette::Green).unwrap();
+        }
+        let colors = Colors::open(&path).unwrap();
+        assert_eq!(
+            colors.all().unwrap().into_iter().collect::<Vec<_>>(),
+            [("cursor".to_owned(), Palette::Green)]
+        );
+        drop(colors);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn a_hold_stays_on_after_reopening() {

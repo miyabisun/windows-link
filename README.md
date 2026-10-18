@@ -20,7 +20,7 @@ Each button does one thing:
 | `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
 | `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
 | `automation.hold` | turns "the user is using the PC" on or off; turning it on also presses its `focus` button ([Mouse board](#mouse-board)) | `held` while on; automation then waits |
-| `cursor.highlight` | turns the highlighted cursor on or off: while on, an arrow after Blue Archive's cursor, in the button's colour, stands in for the mouse cursor | `on` while on |
+| `cursor.highlight` | turns the highlighted cursor on or off: while on, an arrow after Blue Archive's cursor, in the colour chosen on the panel, stands in for the mouse cursor | `on` while on, and `color` (`red`, `green` or `blue`) |
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -189,22 +189,18 @@ buttons:
   button (`409 no_window` while it has none yet).
 - `cursor.highlight` makes the mouse cursor easy to find. While the button is on, Windows'
   arrow cursor is an arrow drawn after Blue Archive's own cursor: a triangle in a dark edge
-  and a white rim, filled with a gradient in the button's `color` (`blue`, as the game's,
-  unless given; `red` or `green` stand out over a blue screen). It is half again as big as
-  the arrow Windows draws on the monitor the cursor is on (the pointer size chosen in
-  Windows' settings, at that monitor's DPI); turning it off brings the user's own cursors
-  back. Turning one `cursor.highlight` button on turns the others off. Only the arrow is
-  replaced, and a program that draws a cursor of its own keeps it. Which one is on is kept
-  in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
+  and a white rim, filled with a gradient in the colour chosen on the panel
+  (`PUT /buttons/{id}/color`): blue as the game's until one is chosen, red or green to
+  stand out over a blue screen. It is half again as big as the arrow Windows draws on the
+  monitor the cursor is on (the pointer size chosen in Windows' settings, at that monitor's
+  DPI); turning it off brings the user's own cursors back. Only the arrow is replaced, and
+  a program that draws a cursor of its own keeps it. Whether it is on and its colour are
+  kept in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
 
   ```yaml
   - id: blue-archive-cursor
-    label: カーソル青
+    label: マウスを目立たせる
     type: cursor.highlight
-  - id: blue-archive-cursor-red
-    label: カーソル赤
-    type: cursor.highlight
-    color: red
   ```
 - `icon` (optional, any button type) is a file whose Windows icon the button shows: an exe,
   a shortcut, an image or a `shell:AppsFolder\…` app; or a picture's `https://` URL, which
@@ -512,6 +508,7 @@ Discord's CDN.
 | `GET /healthz` | `ok` |
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
+| `PUT /buttons/{id}/color` | `{"color": "red"}` (`red`, `green` or `blue`): the colour a `cursor.highlight` button highlights the cursor in; returns `{"button": …}`. `409 not_highlight` for other buttons, `422` for another colour |
 | `POST /buttons/{id}/wheel` | `{"x": …, "y": …, "notches": …}`: turn the [mouse board](#mouse-board)'s wheel over an `app.launch` button's running `process` (`x`, `y` are fractions of its window, `notches` 1–20 either way, negative scrolls down); `204`. `409 user_operating` while an `automation.hold` button is on, `409 not_scrollable` for other buttons, `400 invalid_wheel`, `409 no_mouse`, `409 no_window`, `409 covered` (another window is over that point), `500 mouse` |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, or a redirect to it on the web, when `icon` is true |
 | `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null, "sign_in": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now, `sign_in` the shop to sign in to through the panel) |

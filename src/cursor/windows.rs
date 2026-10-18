@@ -21,36 +21,45 @@ use windows::{
 };
 
 use super::Palette;
-use crate::{config::ButtonSpec, config::Config, hold::Holds};
+use crate::{
+    config::ButtonSpec,
+    config::Config,
+    hold::{Colors, Holds},
+};
 
 /// How often the buttons, and the monitor the cursor is on, are looked at.
 const POLL: Duration = Duration::from_millis(150);
 /// How many times Windows' own arrow the highlighted one is.
 const SCALE: f32 = 1.5;
 
-/// The `cursor.highlight` buttons of `config`: their IDs and colours.
-pub fn buttons(config: &Config) -> Vec<(String, Palette)> {
+/// The IDs of the `cursor.highlight` buttons of `config`.
+pub fn buttons(config: &Config) -> Vec<String> {
     config
         .buttons
         .iter()
-        .filter_map(|b| match b.spec {
-            ButtonSpec::CursorHighlight { color } => Some((b.id.clone(), color)),
-            _ => None,
-        })
+        .filter(|b| matches!(b.spec, ButtonSpec::CursorHighlight {}))
+        .map(|b| b.id.clone())
         .collect()
 }
 
-/// Keep the cursor highlighted in the colour of the one of `buttons` on in
-/// `highlights` (the first, should more be), at the size for the monitor the cursor
-/// is on, writing the cursor files into `dir`. Runs for good on its own thread.
-pub fn run(buttons: &[(String, Palette)], highlights: &Holds, dir: &Path) {
+/// Keep the cursor highlighted while one of `buttons` is on in `highlights`, in the
+/// colour chosen for it in `colors` (the first's, should more be on), at the size for
+/// the monitor the cursor is on, writing the cursor files into `dir`. Runs for good
+/// on its own thread.
+pub fn run(buttons: &[String], highlights: &Holds, colors: &Colors, dir: &Path) {
     // A run stopped while it showed the highlight leaves it until Windows' arrow is put back.
     restore();
     let mut shown: Option<(u32, Palette)> = None;
     loop {
         std::thread::sleep(POLL);
         let on = highlights.held().unwrap_or_default();
-        if let Some(&(_, palette)) = buttons.iter().find(|(id, _)| on.contains(id)) {
+        if let Some(id) = buttons.iter().find(|id| on.contains(*id)) {
+            let palette = colors
+                .all()
+                .unwrap_or_default()
+                .get(id)
+                .copied()
+                .unwrap_or_default();
             let wanted = (size_here(), palette);
             if shown != Some(wanted) {
                 if let Err(err) = apply(dir, wanted.0, palette) {

@@ -1,21 +1,22 @@
 //! The `cursor.highlight` buttons: while one is on, an arrow half again as big as
 //! Windows' stands in for the arrow cursor, so the cursor is easy to find over a busy
 //! screen. The arrow is drawn after Blue Archive's own cursor (a triangle in a dark
-//! edge and a white rim, filled with a gradient), in the button's colour, and handed
-//! to Windows as a cursor file (`.cur`).
+//! edge and a white rim, filled with a gradient), in the colour chosen for the button
+//! on the panel, and handed to Windows as a cursor file (`.cur`).
 
 #![allow(
     clippy::cast_precision_loss,
     reason = "a cursor is at most 256 pixels square: its numbers fit f32 exactly"
 )]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub mod windows;
 
-/// The colour a `cursor.highlight` button fills the arrow with: blue as the game's
-/// own, red and green to stand out where the screen is blue (2026-10-18).
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Hash)]
+/// The colour a `cursor.highlight` button fills the arrow with, chosen on the panel:
+/// blue as the game's own, red and green to stand out where the screen is blue
+/// (2026-10-18).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Palette {
     Red,
@@ -36,13 +37,20 @@ impl Palette {
         }
     }
 
-    /// Its name, for the cursor file's.
+    /// Its name, as the API and the database write it.
     pub fn name(self) -> &'static str {
         match self {
             Self::Red => "red",
             Self::Green => "green",
             Self::Blue => "blue",
         }
+    }
+
+    /// The palette of `name` (see `name`).
+    pub fn named(name: &str) -> Option<Self> {
+        [Self::Red, Self::Green, Self::Blue]
+            .into_iter()
+            .find(|p| p.name() == name)
     }
 }
 
