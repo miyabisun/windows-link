@@ -1,6 +1,5 @@
-//! The `cursor.highlight` buttons: while one is on, an arrow half again as big as
-//! Windows' stands in for the arrow cursor, so the cursor is easy to find over a busy
-//! screen. The arrow is drawn after Blue Archive's own cursor (a triangle in a dark
+//! The `cursor.highlight` buttons: while one is on, an arrow as big as Windows' stands
+//! in for the arrow cursor, so the cursor is easy to find over a busy screen. The arrow is drawn after Blue Archive's own cursor (a triangle in a dark
 //! edge and a white rim, filled with a gradient), in the colour chosen for the button
 //! on the panel, and handed to Windows as a cursor file (`.cur`).
 
@@ -26,14 +25,16 @@ pub enum Palette {
 }
 
 impl Palette {
-    /// The fill's colours at the arrow's left edge and at its right point.
+    /// The fill's colours at the arrow's left edge and at its right point, where
+    /// the next colour mixes in: blue takes red (violet, as the game's cursor draws
+    /// it), red takes green (amber) and green takes blue (teal), the user's of
+    /// 2026-10-18.
     fn fill(self) -> [[f32; 3]; 2] {
         let rgb = |c: [u8; 3]| c.map(|v| f32::from(v) / 255.0);
         match self {
-            // As the game's cursor draws it: cyan to violet.
             Self::Blue => [rgb([140, 232, 255]), rgb([214, 172, 255])],
-            Self::Red => [rgb([255, 120, 120]), rgb([255, 150, 210])],
-            Self::Green => [rgb([110, 240, 150]), rgb([210, 250, 120])],
+            Self::Red => [rgb([255, 120, 120]), rgb([255, 205, 120])],
+            Self::Green => [rgb([110, 240, 150]), rgb([120, 230, 230])],
         }
     }
 
@@ -66,6 +67,73 @@ const ARROW: [(f32, f32); 7] = [
     (5.2, 31.0),
     (0.0, 31.0),
 ];
+/// How round the tip is: the radius its two corners are rounded off at, and how many
+/// points draw each rounded corner.
+const TIP: f32 = 2.0;
+const ARC: usize = 8;
+
+/// The arrow's outline: `ARROW` with the tip's two corners rounded off at `TIP`, as
+/// the game's cursor draws its tip round.
+fn outline() -> Vec<(f32, f32)> {
+    let mut points = Vec::new();
+    for (i, &corner) in ARROW.iter().enumerate() {
+        if i > 1 {
+            points.push(corner);
+            continue;
+        }
+        let toward = |to: (f32, f32)| {
+            let (run, rise) = (to.0 - corner.0, to.1 - corner.1);
+            let length = run.hypot(rise);
+            (run / length, rise / length)
+        };
+        let (back, ahead) = (
+            toward(ARROW[(i + ARROW.len() - 1) % ARROW.len()]),
+            toward(ARROW[i + 1]),
+        );
+        // Half the corner's angle, and the circle touching both its sides.
+        let half = back
+            .0
+            .mul_add(ahead.0, back.1 * ahead.1)
+            .clamp(-1.0, 1.0)
+            .acos()
+            / 2.0;
+        let middle = (back.0 + ahead.0, back.1 + ahead.1);
+        let reach = TIP / half.sin() / middle.0.hypot(middle.1);
+        let centre = (
+            middle.0.mul_add(reach, corner.0),
+            middle.1.mul_add(reach, corner.1),
+        );
+        let along = TIP / half.tan();
+        let angle = |at: (f32, f32)| {
+            let point = (
+                back.0.mul_add(at.0, corner.0),
+                back.1.mul_add(at.0, corner.1),
+            );
+            let point = (
+                ahead.0.mul_add(at.1, point.0),
+                ahead.1.mul_add(at.1, point.1),
+            );
+            (point.1 - centre.1).atan2(point.0 - centre.0)
+        };
+        let (from, to) = (angle((along, 0.0)), angle((0.0, along)));
+        // The short way round, from the side behind to the side ahead.
+        let mut sweep = to - from;
+        if sweep > std::f32::consts::PI {
+            sweep -= std::f32::consts::TAU;
+        } else if sweep < -std::f32::consts::PI {
+            sweep += std::f32::consts::TAU;
+        }
+        for k in 0..=ARC {
+            let at = (k as f32 / ARC as f32).mul_add(sweep, from);
+            points.push((
+                TIP.mul_add(at.cos(), centre.0),
+                TIP.mul_add(at.sin(), centre.1),
+            ));
+        }
+    }
+    points
+}
+
 /// The arrow's right end, where the fill reaches its second colour.
 const RIGHT: f32 = 23.3;
 /// How wide the dark edge and the white rim inside it are, on a 32 by 32 cursor.
@@ -74,8 +142,17 @@ const RIM: f32 = 2.0;
 /// The dark edge's colour.
 const DARK: [f32; 3] = [49.0 / 255.0, 61.0 / 255.0, 83.0 / 255.0];
 
-/// The point of the arrow, where the cursor points, on a cursor `size` pixels wide.
+/// The point of the arrow, where the cursor points, on a cursor `size` pixels wide:
+/// the round tip's point nearest the corner it rounds off, a dot or so inside it.
 pub fn hotspot(size: u32) -> (u16, u16) {
+    let corner = ARROW[0];
+    let tip = outline()
+        .into_iter()
+        .min_by(|a, b| {
+            let far = |p: &(f32, f32)| (p.0 - corner.0).hypot(p.1 - corner.1);
+            far(a).total_cmp(&far(b))
+        })
+        .unwrap_or(corner);
     let at = |unit: f32| {
         u16::try_from(to_byte_range(
             unit * size as f32 / 32.0,
@@ -83,7 +160,7 @@ pub fn hotspot(size: u32) -> (u16, u16) {
         ))
         .unwrap_or(0)
     };
-    (at(ARROW[0].0), at(ARROW[0].1))
+    (at(tip.0), at(tip.1))
 }
 
 /// `value` rounded into 0..=`most`, for a pixel's place or colour (a cursor is at most
@@ -100,18 +177,24 @@ fn to_byte_range(value: f32, most: f32) -> u32 {
 /// The arrow in `palette`, `size` by `size` pixels, row by row from the top, as
 /// straight (not premultiplied) RGBA.
 pub fn picture(size: u32, palette: Palette) -> Vec<[u8; 4]> {
+    let outline = outline();
     (0..size * size)
-        .map(|at| pixel(size, (at % size, at / size), palette))
+        .map(|at| pixel(size, (at % size, at / size), palette, &outline))
         .collect()
 }
 
 /// One pixel: the dark edge, the white rim inside it, then the fill inside that.
-fn pixel(size: u32, (column, row): (u32, u32), palette: Palette) -> [u8; 4] {
+fn pixel(
+    size: u32,
+    (column, row): (u32, u32),
+    palette: Palette,
+    outline: &[(f32, f32)],
+) -> [u8; 4] {
     let unit = 32.0 / size as f32;
     let across = (column as f32 + 0.5) * unit;
     let down = (row as f32 + 0.5) * unit;
     // How far outside the arrow, in pixels: negative inside it.
-    let outside = distance(across, down) / unit;
+    let outside = distance(outline, across, down) / unit;
     let pixels = |units: f32| units / unit;
     let covered = |inset: f32| (0.5 - outside - pixels(inset)).clamp(0.0, 1.0);
     let mut out = [0.0f32; 4];
@@ -146,12 +229,12 @@ fn over(under: &mut [f32; 4], color: [f32; 3], alpha: f32) {
     under[3] = total;
 }
 
-/// How far (`across`, `down`) lies from the arrow's outline, negative inside it.
-fn distance(across: f32, down: f32) -> f32 {
+/// How far (`across`, `down`) lies from `outline`, negative inside it.
+fn distance(outline: &[(f32, f32)], across: f32, down: f32) -> f32 {
     let mut nearest = f32::INFINITY;
     let mut inside = false;
-    for corner in 0..ARROW.len() {
-        let (from, to) = (ARROW[corner], ARROW[(corner + 1) % ARROW.len()]);
+    for corner in 0..outline.len() {
+        let (from, to) = (outline[corner], outline[(corner + 1) % outline.len()]);
         let (run, rise) = (to.0 - from.0, to.1 - from.1);
         let along = (((across - from.0) * run + (down - from.1) * rise)
             / run.mul_add(run, rise * rise))
@@ -229,6 +312,21 @@ mod tests {
         assert_eq!(at(size, Palette::Blue, (20.0, 29.0))[3], 0);
     }
 
+    /// The tip is round, and the cursor points at the round tip, not at the corner
+    /// it rounds off (the user's of 2026-10-18: the game's tip is round and a dot off).
+    #[test]
+    fn the_tip_is_round_and_the_cursor_points_at_it() {
+        let size = 64;
+        let picture = picture(size, Palette::Blue);
+        let alpha = |(column, row): (u16, u16)| {
+            picture[usize::from(row) * usize::try_from(size).unwrap() + usize::from(column)][3]
+        };
+        assert_eq!(alpha((0, 0)), 0, "the corner is rounded off");
+        let tip = hotspot(size);
+        assert_eq!(tip, (1, 1));
+        assert!(alpha(tip) > 128, "the cursor points at the arrow");
+    }
+
     /// From the left edge in: the dark edge, the white rim, then the fill.
     #[test]
     fn a_dark_edge_and_a_white_rim_frame_the_fill() {
@@ -239,6 +337,20 @@ mod tests {
         assert!(rim[..3].iter().all(|&c| c > 230), "{rim:?}");
         let fill = at(size, Palette::Blue, (8.0, 14.0));
         assert!(fill[0] < 230 && fill[2] > 240, "{fill:?}");
+    }
+
+    /// Toward its right point each palette mixes in the next colour, as the game's
+    /// blue turns violet: blue takes red, red takes green, green takes blue (the
+    /// user's of 2026-10-18).
+    #[test]
+    fn toward_its_right_point_each_palette_mixes_in_the_next_colour() {
+        let point = |palette| at(64, palette, (17.0, 17.0));
+        let [r, g, _, _] = point(Palette::Blue);
+        assert!(r > g, "blue takes red {:?}", point(Palette::Blue));
+        let [_, g, b, _] = point(Palette::Red);
+        assert!(g > b + 30, "red takes green {:?}", point(Palette::Red));
+        let [r, _, b, _] = point(Palette::Green);
+        assert!(b > r + 60, "green takes blue {:?}", point(Palette::Green));
     }
 
     /// Each palette fills the arrow with its own colour.

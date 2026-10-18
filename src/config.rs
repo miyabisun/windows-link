@@ -141,8 +141,8 @@ pub enum ButtonSpec {
         focus: Option<String>,
     },
     /// Make the mouse cursor stand out: while it is on, an arrow after Blue Archive's
-    /// cursor, half again as big, in the colour chosen on the panel (blue until then),
-    /// stands in for Windows' arrow.
+    /// cursor, in the colour chosen on the panel (blue until then), stands in for
+    /// Windows' arrow.
     #[serde(rename = "cursor.highlight")]
     CursorHighlight {},
     /// Start a Steam game, or close it while it runs.

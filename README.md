@@ -191,9 +191,9 @@ buttons:
   arrow cursor is an arrow drawn after Blue Archive's own cursor: a triangle in a dark edge
   and a white rim, filled with a gradient in the colour chosen on the panel
   (`PUT /buttons/{id}/color`): blue as the game's until one is chosen, red or green to
-  stand out over a blue screen. It is half again as big as the arrow Windows draws on the
-  monitor the cursor is on (the pointer size chosen in Windows' settings, at that monitor's
-  DPI); turning it off brings the user's own cursors back. Only the arrow is replaced, and
+  stand out over a blue screen; toward its right point blue turns violet, red amber and
+  green teal. It is as big as the arrow Windows draws on the monitor the cursor is on (the
+  pointer size chosen in Windows' settings, at that monitor's DPI); turning it off brings the user's own cursors back. Only the arrow is replaced, and
   a program that draws a cursor of its own keeps it. Whether it is on and its colour are
   kept in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
 

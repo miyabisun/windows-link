@@ -29,8 +29,6 @@ use crate::{
 
 /// How often the buttons, and the monitor the cursor is on, are looked at.
 const POLL: Duration = Duration::from_millis(150);
-/// How many times Windows' own arrow the highlighted one is.
-const SCALE: f32 = 1.5;
 
 /// The IDs of the `cursor.highlight` buttons of `config`.
 pub fn buttons(config: &Config) -> Vec<String> {
@@ -115,8 +113,8 @@ fn load(path: &Path, size: u32) -> Result<HCURSOR, String> {
     Ok(HCURSOR(handle.0))
 }
 
-/// Half again as big as Windows draws its arrow on the monitor the cursor is on: the
-/// pointer size the user chose (`CursorBaseSize`, 32 by default) at that monitor's DPI.
+/// As big as Windows draws its arrow on the monitor the cursor is on: the pointer size
+/// the user chose (`CursorBaseSize`, 32 by default) at that monitor's DPI.
 fn size_here() -> u32 {
     let mut base = 0u32;
     let mut len = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(4);
@@ -134,7 +132,7 @@ fn size_here() -> u32 {
     if read.is_err() || base == 0 {
         base = 32;
     }
-    let size = base.min(256) as f32 * dpi_here().min(960) as f32 / 96.0 * SCALE;
+    let size = base.min(256) as f32 * dpi_here().min(960) as f32 / 96.0;
     super::to_byte_range(size, 255.0).max(32)
 }
 
