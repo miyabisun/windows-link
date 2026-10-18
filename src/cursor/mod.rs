@@ -64,15 +64,15 @@ impl Palette {
 /// the point short, the slanting side, the right point, the notch under it, and the
 /// left side.
 const ARROW: [(f32, f32); 9] = [
-    (0.15, 1.5),
-    (1.2, 0.0),
-    (4.0, 0.0),
+    (0.1, 1.5),
+    (1.2, 0.1),
+    (4.0, 0.1),
     (17.45, 12.3),
     (22.55, 16.9),
     (23.45, 20.6),
     (11.7, 23.1),
     (3.5, 29.3),
-    (0.15, 28.6),
+    (0.1, 28.6),
 ];
 /// Where the fill is, inside the white rim: the rim is wider along the slanting top
 /// and under the right point than along the left edge.
@@ -89,14 +89,24 @@ const FILL: [(f32, f32); 7] = [
 /// under it shows through it.
 const SHADOW: (f32, f32) = (0.2, 1.8);
 const SHADOW_ALPHA: f32 = 0.33;
-/// How wide the navy edge is.
-const EDGE: f32 = 1.2;
+/// How wide the navy edge is, in the cursor's own pixels at any size: a dot, with the
+/// next one shading off as the game's (scaled with the arrow, a bigger cursor's edge
+/// spread over two dots, the user's of 2026-10-18: 「左2列目の黒…薄くする」).
+const EDGE_PIXELS: f32 = 1.25;
+/// The inner corner of the tip, shaded a little grey so the tip reads as even on both
+/// sides (the user's of 2026-10-18: 「左上から3ドット・3ドットの座標を暗くする」): its
+/// centre and reach on a 32 by 32 cursor, how far toward `CORNER` it goes and that grey.
+const CORNER_AT: (f32, f32) = (2.0, 2.0);
+const CORNER_REACH: f32 = 0.75;
+const CORNER_SHADE: f32 = 0.75;
+const CORNER: [f32; 3] = [174.0, 181.0, 191.0];
 /// The edge's, the shadow's and the rim's colours.
 const NAVY: [f32; 3] = [47.0, 62.0, 89.0];
 const SHADE: [f32; 3] = [55.0, 70.0, 95.0];
 const WHITE: [f32; 3] = [248.0, 251.0, 255.0];
-/// Samples a pixel is drawn from, across and down.
-const SAMPLES: u32 = 4;
+/// Samples a pixel is drawn from, across and down: enough to shade an edge as finely
+/// as the game's.
+const SAMPLES: u32 = 8;
 
 /// The point of the arrow, where the cursor points, on a cursor `size` pixels wide:
 /// the point of the outline nearest the corner its short top cuts off, a dot inside
@@ -153,7 +163,7 @@ fn pixel(size: u32, (column, row): (u32, u32), palette: Palette) -> [u8; 4] {
     for sample in 0..SAMPLES * SAMPLES {
         let across = (column as f32 + ((sample % SAMPLES) as f32 + 0.5) / SAMPLES as f32) * unit;
         let down = (row as f32 + ((sample / SAMPLES) as f32 + 0.5) / SAMPLES as f32) * unit;
-        if let Some((colour, alpha)) = colour(across, down, palette) {
+        if let Some((colour, alpha)) = colour(across, down, palette, EDGE_PIXELS * unit) {
             weight += alpha;
             for channel in 0..3 {
                 sum[channel] = colour[channel].mul_add(alpha, sum[channel]);
@@ -169,11 +179,12 @@ fn pixel(size: u32, (column, row): (u32, u32), palette: Palette) -> [u8; 4] {
 }
 
 /// The colour at (`across`, `down`), on a 32 by 32 cursor's units, and how opaque it
-/// is: the navy edge, the white rim, the fill, or the shadow; `None` off them all.
-fn colour(across: f32, down: f32, palette: Palette) -> Option<([f32; 3], f32)> {
+/// is: the navy edge (`edge` wide, in those units), the white rim, the fill, or the
+/// shadow; `None` off them all.
+fn colour(across: f32, down: f32, palette: Palette, edge: f32) -> Option<([f32; 3], f32)> {
     let depth = -distance(&ARROW, across, down);
     if depth > 0.0 {
-        if depth < EDGE {
+        if depth < edge {
             return Some((NAVY, 1.0));
         }
         if distance(&FILL, across, down) < 0.0 {
@@ -183,8 +194,11 @@ fn colour(across: f32, down: f32, palette: Palette) -> Option<([f32; 3], f32)> {
         let tinge =
             0.6 * ((across - 9.0) / 6.0).clamp(0.0, 1.0) * ((down - 12.0) / 4.0).clamp(0.0, 1.0);
         let pale = hsv(palette.hues().1, 0.12);
+        let rim = [0, 1, 2].map(|i| (pale[i] - WHITE[i]).mul_add(tinge, WHITE[i]));
+        let near = (across - CORNER_AT.0).hypot(down - CORNER_AT.1) / CORNER_REACH;
+        let shade = CORNER_SHADE * (1.0 - near).max(0.0);
         return Some((
-            [0, 1, 2].map(|i| (pale[i] - WHITE[i]).mul_add(tinge, WHITE[i])),
+            [0, 1, 2].map(|i| (CORNER[i] - rim[i]).mul_add(shade, rim[i])),
             1.0,
         ));
     }
@@ -334,11 +348,45 @@ mod tests {
         }
     }
 
+    /// On a 40-pixel cursor (125% scaling) as on the game's 32: the left edge's first
+    /// column is dark and the second a light grey, not two dark ones.
+    #[test]
+    fn the_left_edge_is_a_dark_dot_then_a_light_one_at_any_size() {
+        for size in [32, 40, 48] {
+            let picture = picture(size, Palette::Blue);
+            let row = usize::try_from(size / 2 * size).unwrap();
+            let (first, second) = (picture[row], picture[row + 1]);
+            assert!(
+                first[3] >= 0xd0 && first[..3].iter().all(|&c| c < 110),
+                "{size}: {first:?}"
+            );
+            assert!(
+                second[..3].iter().all(|&c| (150..=200).contains(&c)),
+                "{size}: {second:?}"
+            );
+        }
+    }
+
+    /// The inner corner of the tip is shaded, so the tip reads as even: on a 40-pixel
+    /// cursor the third dot down and across is greyer than the rim beyond it.
+    #[test]
+    fn the_tips_inner_corner_is_shaded() {
+        let size = 40;
+        let picture = picture(size, Palette::Blue);
+        let at = |(column, row): (usize, usize)| picture[row * 40 + column];
+        let lightness = |p: [u8; 4]| p[..3].iter().map(|&c| u32::from(c)).sum::<u32>();
+        assert!(
+            lightness(at((2, 2))) + 40 < lightness(at((3, 4))),
+            "{:?}",
+            at((2, 2))
+        );
+    }
+
     /// From the left edge in: the navy edge, the white rim, then the fill.
     #[test]
     fn a_navy_edge_and_a_white_rim_frame_the_fill() {
-        let size = 96;
-        let edge = at(size, Palette::Blue, (0.6, 14.0));
+        let size = 32;
+        let edge = at(size, Palette::Blue, (0.4, 14.0));
         assert!(edge[..3].iter().all(|&c| c < 110), "{edge:?}");
         let rim = at(size, Palette::Blue, (2.6, 14.0));
         assert!(rim[..3].iter().all(|&c| c > 230), "{rim:?}");
