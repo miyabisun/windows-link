@@ -56,6 +56,9 @@ fn wide(buffer: &[u16]) -> String {
 /// GDI name (`\\.\DISPLAYn`) -> (friendly name, device path) for active displays.
 fn display_paths() -> HashMap<String, (String, String)> {
     let mut found = HashMap::new();
+    // SAFETY: the counts are live locals; `paths` and `modes` are allocated with exactly the counts
+    // QueryDisplayConfig is told, and only the first `path_count` entries it reports are read. Each
+    // device-info header's `size` is that of the live struct it heads.
     unsafe {
         let (mut path_count, mut mode_count) = (0u32, 0u32);
         if GetDisplayConfigBufferSizes(
@@ -114,6 +117,8 @@ fn display_paths() -> HashMap<String, (String, String)> {
 fn gdi_name(monitor: HMONITOR) -> Option<(String, bool)> {
     let mut info = MONITORINFOEXW::default();
     info.monitorInfo.cbSize = u32::try_from(mem::size_of::<MONITORINFOEXW>()).unwrap_or_default();
+    // SAFETY: `info` is a live MONITORINFOEXW whose cbSize says so, which GetMonitorInfoW accepts
+    // through a MONITORINFO pointer; `monitor` is only read.
     unsafe {
         GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>())
             .as_bool()
@@ -132,6 +137,8 @@ unsafe extern "system" fn collect_monitor(
     _: *mut RECT,
     data: LPARAM,
 ) -> BOOL {
+    // SAFETY: `data` is the address of the `Vec` that `monitors` passes to EnumDisplayMonitors,
+    // which calls back synchronously while that `Vec` is borrowed for nothing else.
     let list = unsafe { &mut *(data.0 as *mut Vec<(String, bool)>) };
     if let Some(entry) = gdi_name(monitor) {
         list.push(entry);
@@ -142,6 +149,8 @@ unsafe extern "system" fn collect_monitor(
 /// GDI names of monitors that a touch digitizer is mapped to.
 fn touch_gdi_names() -> HashSet<String> {
     let mut names = HashSet::new();
+    // SAFETY: `count` is a live local; `devices` holds exactly `count` entries when
+    // GetPointerDevices fills it, and only the entries it reports are read.
     unsafe {
         let mut count = 0u32;
         if GetPointerDevices(&raw mut count, None).is_err() || count == 0 {
@@ -167,6 +176,8 @@ pub struct WindowsDisplays;
 impl Displays for WindowsDisplays {
     fn monitors(&self) -> Result<Vec<Monitor>, String> {
         let mut gdi: Vec<(String, bool)> = Vec::new();
+        // SAFETY: `collect_monitor` reads `data` as the `Vec` given here, which outlives the
+        // synchronous call.
         unsafe {
             EnumDisplayMonitors(
                 None,
@@ -202,6 +213,7 @@ impl Displays for WindowsDisplays {
 /// Monitor under a screen point (physical pixels): its ID and whether a touch
 /// digitizer is mapped to it.
 fn monitor_at(x: i32, y: i32) -> Option<MonitorAt> {
+    // SAFETY: MonitorFromPoint takes the point by value and only returns a handle.
     let monitor = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL) };
     if monitor.is_invalid() {
         return None;
@@ -212,11 +224,14 @@ fn monitor_at(x: i32, y: i32) -> Option<MonitorAt> {
 }
 
 fn now_ms() -> u64 {
+    // SAFETY: GetTickCount64 takes no arguments.
     unsafe { GetTickCount64() }
 }
 
 unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
+        // SAFETY: for a low-level mouse hook with a non-negative code, `lparam` points to an
+        // MSLLHOOKSTRUCT that stays valid for this call.
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         match classify(info.dwExtraInfo) {
             Source::Mouse => {
@@ -231,6 +246,7 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
             Source::Pen => {}
         }
     }
+    // SAFETY: the hook passes its own arguments through unchanged, as Windows requires.
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
@@ -248,6 +264,8 @@ pub fn start_hook(keep: KeepCursor) -> Result<(), String> {
 }
 
 fn hook_thread(keep: &KeepCursor, ready: &mpsc::Sender<Result<(), String>>) {
+    // SAFETY: `start` and `msg` are live locals the calls write into; `hook` has the signature a
+    // WH_MOUSE_LL hook needs; the timer has no callback, so it posts WM_TIMER to this thread.
     unsafe {
         let mut start = POINT::default();
         if GetCursorPos(&raw mut start).is_ok() {
@@ -291,6 +309,7 @@ struct Poller {
 impl Poller {
     fn tick(&mut self, keep: &KeepCursor) {
         let mut point = POINT::default();
+        // SAFETY: `point` is a live local the call writes the cursor position into.
         if unsafe { GetCursorPos(&raw mut point) }.is_err() {
             return;
         }
@@ -324,9 +343,11 @@ impl Poller {
         if !keep.get(&id) {
             return;
         }
+        // SAFETY: SetCursorPos only takes coordinates.
         let _ = unsafe { SetCursorPos(real.0, real.1) };
         // If Windows clipped the target, where it landed is the real position.
         let mut landed = POINT::default();
+        // SAFETY: `landed` is a live local the call writes the cursor position into.
         if unsafe { GetCursorPos(&raw mut landed) }.is_ok() {
             LAST_X.store(landed.x, Ordering::Relaxed);
             LAST_Y.store(landed.y, Ordering::Relaxed);

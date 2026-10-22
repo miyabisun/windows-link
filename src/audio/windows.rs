@@ -220,6 +220,9 @@ fn worker(
     ready: &mpsc::Sender<AudioResult<()>>,
 ) {
     let setup = || -> AudioResult<(IMMDeviceEnumerator, Option<IMMNotificationClient>)> {
+        // SAFETY: COM is initialised on this worker thread before any other call, every call goes
+        // through interfaces COM just returned, and the notification client stays registered only
+        // while `_client` keeps it alive for the rest of the worker.
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED)
                 .ok()
@@ -279,6 +282,9 @@ struct ComState {
 
 impl ComState {
     fn devices(&self) -> AudioResult<Vec<Device>> {
+        // SAFETY: `enumerator` is a live COM object of this thread, and every call goes through
+        // interfaces it returned; `device_id` and `friendly_name` only read the device they are
+        // given.
         unsafe {
             let collection = self
                 .enumerator
@@ -308,6 +314,8 @@ impl ComState {
     }
 
     fn default_output(&self) -> AudioResult<Option<String>> {
+        // SAFETY: `enumerator` is a live COM object of this thread; `device_id` only reads the
+        // endpoint.
         unsafe {
             match self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
                 Ok(device) => device_id(&device).map(Some),
@@ -318,6 +326,8 @@ impl ComState {
 
     fn set_default_output(&self, id: &str) -> AudioResult<()> {
         let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives both calls reading it as a
+        // PCWSTR, and `policy` is a live COM object created just before its calls.
         unsafe {
             let device = self
                 .enumerator
@@ -346,6 +356,8 @@ impl ComState {
 
     /// The default output's volume control.
     fn endpoint_volume(&self) -> AudioResult<IAudioEndpointVolume> {
+        // SAFETY: `enumerator` is a live COM object of this thread; `Activate` takes no activation
+        // parameters.
         unsafe {
             self.enumerator
                 .GetDefaultAudioEndpoint(eRender, eConsole)
@@ -357,6 +369,7 @@ impl ComState {
 
     fn master(&self) -> AudioResult<Master> {
         let endpoint = self.endpoint_volume()?;
+        // SAFETY: `endpoint` is a live IAudioEndpointVolume returned by `endpoint_volume`.
         unsafe {
             Ok(Master {
                 volume: endpoint
@@ -372,6 +385,8 @@ impl ComState {
 
     fn set_master(&self, volume: Option<f32>, muted: Option<bool>) -> AudioResult<()> {
         let endpoint = self.endpoint_volume()?;
+        // SAFETY: `endpoint` is a live IAudioEndpointVolume; a null event context is allowed and
+        // means no caller-supplied context GUID.
         unsafe {
             if let Some(volume) = volume {
                 endpoint
@@ -392,6 +407,9 @@ impl ComState {
     /// its file name without `.exe`.
     fn apps(&self) -> AudioResult<Vec<AppSound>> {
         let mut apps: Vec<AppSound> = Vec::new();
+        // SAFETY: `enumerator` is a live COM object of this thread and every call goes through
+        // interfaces it returned; `process_file_name` only queries the process with the reported
+        // id.
         unsafe {
             let device = self
                 .enumerator
@@ -455,6 +473,9 @@ impl ComState {
     /// Live sessions of `process` across all active render endpoints.
     fn sessions(&self, process: &str) -> AudioResult<Vec<ISimpleAudioVolume>> {
         let mut found = Vec::new();
+        // SAFETY: `enumerator` is a live COM object of this thread and every call goes through
+        // interfaces it returned; `process_file_name` only queries the process with the reported
+        // id.
         unsafe {
             let collection = self
                 .enumerator
@@ -506,12 +527,15 @@ impl ComState {
         let sessions = self.sessions(process)?;
         Ok(sessions
             .first()
+            // SAFETY: `volume` is a live ISimpleAudioVolume taken from `sessions`.
             .and_then(|volume| unsafe { volume.GetMasterVolume().ok() }))
     }
 
     fn set_app_volume(&self, process: &str, level: f32) -> AudioResult<usize> {
         let sessions = self.sessions(process)?;
         for volume in &sessions {
+            // SAFETY: `volume` is a live ISimpleAudioVolume taken from `sessions`; a null event
+            // context is allowed.
             unsafe {
                 volume
                     .SetMasterVolume(level, std::ptr::null())
@@ -528,6 +552,7 @@ impl ComState {
         if sessions.is_empty() {
             return Ok(None);
         }
+        // SAFETY: `volume` is a live ISimpleAudioVolume taken from `sessions`.
         Ok(Some(sessions.iter().all(|volume| unsafe {
             volume.GetMute().is_ok_and(windows::core::BOOL::as_bool)
         })))
@@ -536,6 +561,8 @@ impl ComState {
     fn set_app_mute(&self, process: &str, muted: bool) -> AudioResult<usize> {
         let sessions = self.sessions(process)?;
         for volume in &sessions {
+            // SAFETY: `volume` is a live ISimpleAudioVolume taken from `sessions`; a null event
+            // context is allowed.
             unsafe {
                 volume
                     .SetMute(muted, std::ptr::null())
@@ -546,7 +573,9 @@ impl ComState {
     }
 }
 
-unsafe fn device_id(device: &IMMDevice) -> AudioResult<String> {
+fn device_id(device: &IMMDevice) -> AudioResult<String> {
+    // SAFETY: `device` is a live IMMDevice. `GetId` returns a CoTaskMemAlloc'd string, which is
+    // read once and then freed exactly once.
     unsafe {
         let raw: PWSTR = device.GetId().map_err(|e| err("GetId", &e))?;
         let id = raw
@@ -557,7 +586,8 @@ unsafe fn device_id(device: &IMMDevice) -> AudioResult<String> {
     }
 }
 
-unsafe fn friendly_name(device: &IMMDevice) -> AudioResult<String> {
+fn friendly_name(device: &IMMDevice) -> AudioResult<String> {
+    // SAFETY: `device` is a live IMMDevice, and its property store is only read.
     unsafe {
         let store = device
             .OpenPropertyStore(STGM_READ)
@@ -570,6 +600,9 @@ unsafe fn friendly_name(device: &IMMDevice) -> AudioResult<String> {
 }
 
 fn process_file_name(pid: u32) -> Option<String> {
+    // SAFETY: the process handle is used only after `OpenProcess` succeeded and is closed exactly
+    // once; `buffer` and `len` describe the same writable buffer, and only the `len` characters
+    // written are read back.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buffer = [0u16; 1024];

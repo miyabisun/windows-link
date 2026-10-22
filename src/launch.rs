@@ -120,6 +120,9 @@ pub mod windows {
 
     fn snapshot() -> Vec<(u32, String)> {
         let mut found = Vec::new();
+        // SAFETY: the snapshot handle is used only after it was created and is closed exactly once;
+        // `entry` is a live PROCESSENTRY32W whose dwSize says so, and only its NUL-terminated name
+        // is read.
         unsafe {
             let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
                 return found;
@@ -157,6 +160,9 @@ pub mod windows {
 
     /// The executable's full path, when Windows lets this user read it.
     fn exe_path(pid: u32) -> Option<PathBuf> {
+        // SAFETY: the process handle is used only after `OpenProcess` succeeded and is closed
+        // exactly once; `buffer` and `len` describe the same writable buffer, and only the `len`
+        // characters written are read back.
         unsafe {
             let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
             let mut buffer = [0u16; 1024];
@@ -192,16 +198,21 @@ pub mod windows {
             found: Option<HWND>,
         }
         unsafe extern "system" fn each(hwnd: HWND, data: LPARAM) -> BOOL {
+            // SAFETY: `data` is the address of the `Search` that `main_window` gives EnumWindows,
+            // which calls back synchronously while nothing else uses it.
             let search = unsafe { &mut *(data.0 as *mut Search<'_>) };
             let mut pid = 0;
-            unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
-            let tool =
-                unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) }.cast_unsigned() & WS_EX_TOOLWINDOW.0;
-            let main = search.pids.contains(&pid)
-                && unsafe { IsWindowVisible(hwnd) }.as_bool()
-                && unsafe { GetWindow(hwnd, GW_OWNER) }.is_err()
-                && unsafe { GetWindowTextLengthW(hwnd) } > 0
-                && tool == 0;
+            // SAFETY: `hwnd` is a window EnumWindows reported and is only read, and `pid` is a live
+            // local the call writes into.
+            let main = unsafe {
+                GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
+                let tool = GetWindowLongW(hwnd, GWL_EXSTYLE).cast_unsigned() & WS_EX_TOOLWINDOW.0;
+                search.pids.contains(&pid)
+                    && IsWindowVisible(hwnd).as_bool()
+                    && GetWindow(hwnd, GW_OWNER).is_err()
+                    && GetWindowTextLengthW(hwnd) > 0
+                    && tool == 0
+            };
             if main {
                 search.found = Some(hwnd);
                 return BOOL(0);
@@ -209,6 +220,8 @@ pub mod windows {
             BOOL(1)
         }
         let mut search = Search { pids, found: None };
+        // SAFETY: `each` reads `data` as this `Search`, which outlives the synchronous EnumWindows
+        // call.
         unsafe {
             let _ = EnumWindows(Some(each), LPARAM(&raw mut search as isize));
         }
@@ -270,6 +283,8 @@ pub mod windows {
                     },
                 },
             };
+            // SAFETY: `hwnd` is the window `main_window` found and is only passed by value; `alt`
+            // and the size passed with it are those of an INPUT array that outlives the call.
             unsafe {
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -295,6 +310,8 @@ pub mod windows {
             let dir = working_dir(target).map(|d| wide(d.as_os_str()));
             let as_ptr =
                 |v: &Option<Vec<u16>>| v.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr()));
+            // SAFETY: every string is a NUL-terminated UTF-16 buffer (or null for an optional one)
+            // that outlives the call; ShellExecuteW needs no owner window.
             let result = unsafe {
                 ShellExecuteW(
                     None,
@@ -326,13 +343,19 @@ pub mod windows {
                 asked: usize,
             }
             unsafe extern "system" fn each(hwnd: HWND, data: LPARAM) -> BOOL {
+                // SAFETY: `data` is the address of the `Search` that `close` gives EnumWindows,
+                // which calls back synchronously while nothing else uses it.
                 let search = unsafe { &mut *(data.0 as *mut Search) };
                 let mut pid = 0;
-                unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
-                if search.pids.contains(&pid)
-                    && unsafe { IsWindowVisible(hwnd) }.as_bool()
-                    && unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
-                {
+                // SAFETY: `hwnd` is a window EnumWindows reported, `pid` is a live local the call
+                // writes into, and WM_CLOSE carries no pointers.
+                let asked = unsafe {
+                    GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
+                    search.pids.contains(&pid)
+                        && IsWindowVisible(hwnd).as_bool()
+                        && PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok()
+                };
+                if asked {
                     search.asked += 1;
                 }
                 BOOL(1)
@@ -344,6 +367,8 @@ pub mod windows {
             if search.pids.is_empty() {
                 return Ok(0);
             }
+            // SAFETY: `each` reads `data` as this `Search`, which outlives the synchronous
+            // EnumWindows call.
             unsafe {
                 EnumWindows(Some(each), LPARAM(&raw mut search as isize))
                     .map_err(|err| format!("cannot list windows: {err}"))?;

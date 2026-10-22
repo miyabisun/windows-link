@@ -1,1 +1,2 @@
 doc-valid-idents = ["DLsite", "DLsiteNest", "LiteDB", ".."]
+allow-unwrap-in-tests = true

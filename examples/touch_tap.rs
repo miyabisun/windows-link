@@ -32,12 +32,13 @@ const TOUCH_MASK_PRESSURE: u32 = 0x4;
 
 fn cursor() -> (i32, i32) {
     let mut point = POINT::default();
+    // SAFETY: `point` is a live local the call writes the cursor position into.
     let _ = unsafe { GetCursorPos(&raw mut point) };
     (point.x, point.y)
 }
 
 fn contact(x: i32, y: i32, flags: POINTER_FLAGS) -> POINTER_TOUCH_INFO {
-    let mut info: POINTER_TOUCH_INFO = unsafe { mem::zeroed() };
+    let mut info = POINTER_TOUCH_INFO::default();
     info.pointerInfo.pointerType = PT_TOUCH;
     info.pointerInfo.ptPixelLocation = POINT { x, y };
     info.pointerInfo.pointerFlags = flags;
@@ -54,6 +55,7 @@ fn contact(x: i32, y: i32, flags: POINTER_FLAGS) -> POINTER_TOUCH_INFO {
 }
 
 fn inject(info: &POINTER_TOUCH_INFO) -> Result<(), String> {
+    // SAFETY: `info` is a live POINTER_TOUCH_INFO that outlives the call reading it.
     unsafe { InjectTouchInput(std::slice::from_ref(info)) }.map_err(|e| e.to_string())
 }
 
@@ -66,6 +68,7 @@ fn moving() -> POINTER_FLAGS {
 }
 
 fn run(args: &[i32], swipe: bool) -> Result<(), String> {
+    // SAFETY: InitializeTouchInjection only takes a contact count and a feedback mode.
     unsafe { InitializeTouchInjection(1, TOUCH_FEEDBACK_DEFAULT) }.map_err(|e| e.to_string())?;
     println!("cursor before     = {:?}", cursor());
     let (x1, y1) = (args[0], args[1]);
@@ -93,6 +96,7 @@ fn run(args: &[i32], swipe: bool) -> Result<(), String> {
 /// Move the cursor, then nudge it 1 px and back with real mouse input so hooks
 /// record a real-mouse position there (zero-length moves are dropped by Windows).
 fn park(x: i32, y: i32) -> Result<(), String> {
+    // SAFETY: SetCursorPos only takes coordinates.
     unsafe { SetCursorPos(x, y) }.map_err(|e| e.to_string())?;
     let nudge = |dx: i32| INPUT {
         r#type: INPUT_MOUSE,
@@ -105,6 +109,7 @@ fn park(x: i32, y: i32) -> Result<(), String> {
         },
     };
     let size = i32::try_from(mem::size_of::<INPUT>()).unwrap_or_default();
+    // SAFETY: the INPUT array outlives the call, and `size` is the size of one INPUT.
     if unsafe { SendInput(&[nudge(1), nudge(-1)], size) } != 2 {
         return Err("SendInput failed".to_owned());
     }
@@ -114,6 +119,7 @@ fn park(x: i32, y: i32) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    // SAFETY: SetProcessDpiAwarenessContext takes a predefined context constant and no pointers.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }

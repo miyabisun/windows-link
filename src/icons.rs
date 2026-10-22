@@ -63,6 +63,10 @@ pub fn icon_png(path: &Path) -> Result<Vec<u8>, String> {
         return Err(format!("{} does not exist", path.display()));
     }
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the calls reading it. `info` and
+    // `header` are live locals whose sizes are passed with them, and `bgra` holds exactly the
+    // `height` rows of `width` 32-bit pixels GetDIBits is asked for. The bitmap and the screen DC
+    // are released exactly once, after their last use.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let factory: IShellItemImageFactory =

@@ -105,6 +105,8 @@ impl Pointer for WindowsPointer {
             return Err(ScrollError::NoWindow);
         }
         let window = main_window_of(&wheel.process).ok_or(ScrollError::NoWindow)?;
+        // SAFETY: GetForegroundWindow takes no arguments and only returns a handle, which is
+        // compared.
         if unsafe { GetForegroundWindow() } != window {
             return Err(ScrollError::Failed(format!(
                 "{} did not come to the front",
@@ -112,6 +114,8 @@ impl Pointer for WindowsPointer {
             )));
         }
         let mut client = RECT::default();
+        // SAFETY: `window` is a window handle that is only read, and `client` is a live local the
+        // call fills in.
         unsafe { GetClientRect(window, &raw mut client) }
             .map_err(|err| ScrollError::Failed(err.to_string()))?;
         #[allow(
@@ -122,13 +126,19 @@ impl Pointer for WindowsPointer {
             x: (f64::from(client.right) * wheel.x).round() as i32,
             y: (f64::from(client.bottom) * wheel.y).round() as i32,
         };
+        // SAFETY: `window` is a window handle that is only read, and `point` is a live local the
+        // call converts in place.
         let _ = unsafe { ClientToScreen(window, &raw mut point) };
 
         // The wheel goes to whatever is under the cursor, so the cursor visits the
         // point and then goes back where the user left it.
         let mut saved = POINT::default();
+        // SAFETY: `saved` is a live local the call writes the cursor position into.
         let _ = unsafe { GetCursorPos(&raw mut saved) };
+        // SAFETY: SetCursorPos only takes coordinates.
         let _ = unsafe { SetCursorPos(point.x, point.y) };
+        // SAFETY: WindowFromPoint takes a point by value, and GetAncestor only reads the handle it
+        // returned.
         let result = if unsafe { GetAncestor(WindowFromPoint(point), GA_ROOT) } == window {
             let turned = self.turn(wheel.notches);
             sleep(SETTLE);
@@ -136,6 +146,7 @@ impl Pointer for WindowsPointer {
         } else {
             Err(ScrollError::Covered)
         };
+        // SAFETY: SetCursorPos only takes coordinates.
         let _ = unsafe { SetCursorPos(saved.x, saved.y) };
         result
     }

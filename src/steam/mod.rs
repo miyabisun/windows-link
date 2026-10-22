@@ -59,6 +59,7 @@ pub fn steam_dir() -> PathBuf {
     };
     let mut buffer = [0u16; 1024];
     let mut size = u32::try_from(std::mem::size_of_val(&buffer)).unwrap_or(0);
+    // SAFETY: `buffer` and `size` describe the same writable buffer, so the value read fits in it.
     let read = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,

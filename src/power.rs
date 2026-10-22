@@ -17,6 +17,8 @@ pub fn sleep() -> Result<(), String> {
         core::w,
     };
 
+    // SAFETY: `token` and `luid` are live locals the calls write into, the token is closed exactly
+    // once after its last use, and `privileges` outlives the AdjustTokenPrivileges call reading it.
     unsafe {
         // Sleeping needs the shutdown privilege, which users have but is off by default.
         let mut token = HANDLE::default();

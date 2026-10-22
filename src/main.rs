@@ -50,6 +50,7 @@ const USAGE: &str = "usage: windows-link [devices | discord-servers | --version]
 
 fn main() -> ExitCode {
     // Hook, cursor and monitor coordinates must all be physical pixels.
+    // SAFETY: SetProcessDpiAwarenessContext takes a predefined context constant and no pointers.
     unsafe {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -78,6 +79,7 @@ fn attach_console() -> bool {
     if cfg!(debug_assertions) {
         return true;
     }
+    // SAFETY: AttachConsole only takes the predefined parent-process id.
     unsafe {
         windows::Win32::System::Console::AttachConsole(
             windows::Win32::System::Console::ATTACH_PARENT_PROCESS,

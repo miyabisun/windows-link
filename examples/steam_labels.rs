@@ -19,7 +19,8 @@ fn main() {
         result.expect("the step failed")
     };
     let find = |id: &str| {
-        let all = parse_collections(&run("list", scripts::collections())).unwrap();
+        let all = parse_collections(&run("list", scripts::collections()))
+            .expect("Steam answered the label list in an unknown shape");
         all.into_iter().find(|c| c.id == id)
     };
     let made = run("create", scripts::create("windows-link test"));
