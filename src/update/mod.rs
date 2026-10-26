@@ -17,7 +17,6 @@ use std::{
     time::Duration,
 };
 
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
@@ -25,14 +24,16 @@ use tracing::{error, info, warn};
 pub const ASSET: &str = "windows-link-x86_64-pc-windows-msvc.exe";
 pub const CHECKSUM_ASSET: &str = "windows-link-x86_64-pc-windows-msvc.exe.sha256";
 
-/// Latest release of the public repository; `WINDOWS_LINK_UPDATE_URL` overrides it.
-pub const DEFAULT_FEED: &str =
-    "https://api.github.com/repos/miyabisun/windows-link/releases/latest";
+/// The public repository's web address; `WINDOWS_LINK_UPDATE_URL` overrides it. Its
+/// `/releases/latest` sends to the latest release (`/releases/tag/<tag>`), whose files lie
+/// at `/releases/download/<tag>/<name>`. GitHub's API is not used: without a token it
+/// allows a home 60 calls an hour, shared by every machine there, and once they were
+/// spent the checks failed (2026-10-26).
+pub const DEFAULT_FEED: &str = "https://github.com/miyabisun/windows-link";
 
 pub const CHECK_INTERVAL: Duration = Duration::from_hours(1);
 
 /// Size limits for what the feed sends; the exe is about 5 MB.
-pub const FEED_LIMIT: u64 = 1 << 20;
 pub const CHECKSUM_LIMIT: u64 = 1 << 10;
 pub const EXE_LIMIT: u64 = 64 << 20;
 
@@ -77,29 +78,18 @@ pub struct Release {
     pub checksum_url: String,
 }
 
-/// Read a GitHub "latest release" response.
-pub fn release_from_json(json: &Value) -> Result<Release, String> {
-    let tag = json["tag_name"].as_str().ok_or("release has no tag_name")?;
+/// The release `/releases/latest` of the repository at `feed` sent to (`location`,
+/// `.../releases/tag/<tag>`), with where its exe and checksum file are.
+pub fn release_from_location(feed: &str, location: &str) -> Result<Release, String> {
+    let (_, tag) = location
+        .rsplit_once("/releases/tag/")
+        .ok_or("no release is published")?;
     let version = Version::from_tag(tag).ok_or_else(|| format!("unexpected release tag {tag}"))?;
-    if json["draft"].as_bool() == Some(true) || json["prerelease"].as_bool() == Some(true) {
-        return Err(format!("release {tag} is a draft or pre-release"));
-    }
-    let url = |name: &str| {
-        let assets = json["assets"].as_array().ok_or("release has no assets")?;
-        let mut matching = assets.iter().filter(|a| a["name"].as_str() == Some(name));
-        match (matching.next(), matching.next()) {
-            (Some(asset), None) => asset["browser_download_url"]
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| format!("asset {name} has no download URL")),
-            (None, _) => Err(format!("release {tag} has no asset {name}")),
-            (Some(_), Some(_)) => Err(format!("release {tag} has more than one asset {name}")),
-        }
-    };
+    let files = format!("{}/releases/download/{tag}", feed.trim_end_matches('/'));
     Ok(Release {
         version,
-        exe_url: url(ASSET)?,
-        checksum_url: url(CHECKSUM_ASSET)?,
+        exe_url: format!("{files}/{ASSET}"),
+        checksum_url: format!("{files}/{CHECKSUM_ASSET}"),
     })
 }
 
@@ -224,7 +214,8 @@ impl Updater {
                 reason: "another check is running".into(),
             });
         };
-        let release = release_from_json(&github::fetch_json(&self.feed, FEED_LIMIT)?)?;
+        let latest = format!("{}/releases/latest", self.feed.trim_end_matches('/'));
+        let release = release_from_location(&self.feed, &github::fetch_location(&latest)?)?;
         if release.version.cmp(&self.current) != Ordering::Greater {
             return Ok(Outcome::UpToDate {
                 latest: release.version,
@@ -295,12 +286,11 @@ pub async fn run_periodically(updater: Arc<Updater>) {
 mod tests {
     use std::path::Path;
 
-    use serde_json::json;
     use sha2::{Digest, Sha256};
 
     use super::{
         ASSET, CHECKSUM_ASSET, Version, eligibility, expected_digest, matches_digest,
-        release_from_json,
+        release_from_location,
     };
 
     #[test]
@@ -325,35 +315,36 @@ mod tests {
         assert_eq!(Version(1, 20, 3).to_string(), "1.20.3");
     }
 
-    fn release(tag: &str, assets: &[&str]) -> serde_json::Value {
-        let assets: Vec<_> = assets
-            .iter()
-            .map(|name| json!({ "name": name, "browser_download_url": format!("https://example.test/{name}") }))
-            .collect();
-        json!({ "tag_name": tag, "draft": false, "prerelease": false, "assets": assets })
-    }
+    const FEED: &str = "https://github.com/miyabisun/windows-link";
 
     #[test]
-    fn picks_this_platforms_exe_and_its_checksum() {
-        let json = release("v0.2.0", &["notes.txt", CHECKSUM_ASSET, ASSET]);
-        let picked = release_from_json(&json).unwrap();
+    fn the_latest_release_is_where_its_page_sends_to() {
+        let picked = release_from_location(FEED, &format!("{FEED}/releases/tag/v0.2.0")).unwrap();
         assert_eq!(picked.version, Version(0, 2, 0));
-        assert_eq!(picked.exe_url, format!("https://example.test/{ASSET}"));
+        let files = format!("{FEED}/releases/download/v0.2.0");
+        assert_eq!(picked.exe_url, format!("{files}/{ASSET}"));
+        assert_eq!(picked.checksum_url, format!("{files}/{CHECKSUM_ASSET}"));
+        // A test server on this machine may send a path alone.
+        let local =
+            release_from_location("http://127.0.0.1:4799/", "/releases/tag/v0.3.1").unwrap();
         assert_eq!(
-            picked.checksum_url,
-            format!("https://example.test/{CHECKSUM_ASSET}")
+            local.exe_url,
+            format!("http://127.0.0.1:4799/releases/download/v0.3.1/{ASSET}")
         );
     }
 
     #[test]
-    fn rejects_releases_without_both_assets_or_with_odd_tags() {
-        assert!(release_from_json(&release("v0.2.0", &[ASSET])).is_err());
-        assert!(release_from_json(&release("v0.2.0", &[CHECKSUM_ASSET])).is_err());
-        assert!(release_from_json(&release("v0.2.0", &[ASSET, ASSET, CHECKSUM_ASSET])).is_err());
-        assert!(release_from_json(&release("nightly", &[ASSET, CHECKSUM_ASSET])).is_err());
-        let mut pre = release("v0.2.0", &[ASSET, CHECKSUM_ASSET]);
-        pre["prerelease"] = json!(true);
-        assert!(release_from_json(&pre).is_err());
+    fn no_release_or_an_odd_tag_is_no_update() {
+        assert_eq!(
+            release_from_location(FEED, &format!("{FEED}/releases")),
+            Err("no release is published".to_owned())
+        );
+        for odd in ["nightly", "v0.2", "v0.2.0-rc.1", "v0.2.0/x", ""] {
+            assert!(
+                release_from_location(FEED, &format!("{FEED}/releases/tag/{odd}")).is_err(),
+                "{odd}"
+            );
+        }
     }
 
     #[test]

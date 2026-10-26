@@ -65,7 +65,7 @@ The server reads these environment variables:
 | `PORT` | `4730` | TCP port to listen on |
 | `LOG_LEVEL` | `info` | `off`, `error`, `warn`, `info`, `debug` or `trace` |
 | `WINDOWS_LINK_CONFIG` | `%LOCALAPPDATA%\windows-link\config.yaml` | configuration file |
-| `WINDOWS_LINK_UPDATE_URL` | this repository's latest release in the GitHub API | where [updates](#updates) come from |
+| `WINDOWS_LINK_UPDATE_URL` | `https://github.com/miyabisun/windows-link` | the repository [updates](#updates) come from (its web address, not the API) |
 | `WINDOWS_LINK_SECRETS` | `%LOCALAPPDATA%\windows-link\secrets.yaml` | credentials for outside services ([Discord](#discord), [Steam](#steam-library), [DLsite](#dlsite-library)) |
 
 The release build has no console window. When it is started without a terminal (for
@@ -656,10 +656,13 @@ audio sessions are not reachable from the service session.
 
 ## Updates
 
-The installed server checks the latest GitHub release when it starts and every hour.
-When the release is newer than itself it updates without asking:
+The installed server checks the latest GitHub release when it starts and every hour. It
+reads the release's tag from where `https://github.com/miyabisun/windows-link/releases/latest`
+redirects to, not from GitHub's API, whose 60 calls an hour without a token every machine at
+home shares. When the release is newer than itself it updates without asking:
 
-1. downloads the exe and its `.sha256` file over HTTPS and checks the SHA-256,
+1. downloads the exe and its `.sha256` file over HTTPS from
+   `releases/download/<tag>/` and checks the SHA-256,
 2. saves it as `windows-link.exe.new` and checks that it runs and reports the release's
    version,
 3. renames the running exe to `windows-link.exe.old` (Windows allows renaming a running
@@ -718,8 +721,9 @@ cargo test --locked
 The button logic and the HTTP API are tested against an in-memory audio backend; the
 Windows Core Audio backend (`src/audio/windows.rs`) is exercised on a real machine.
 
-To try an update without publishing a release, serve a GitHub-style release JSON from
-this machine and point `WINDOWS_LINK_UPDATE_URL` at it (plain HTTP is accepted only for
+To try an update without publishing a release, serve a GitHub-like repository from this
+machine (`/releases/latest` redirecting to `/releases/tag/vX.Y.Z`, the files under
+`/releases/download/vX.Y.Z/`) and point `WINDOWS_LINK_UPDATE_URL` at it (plain HTTP is accepted only for
 `127.0.0.1`, `localhost` and `[::1]`; every other URL must be HTTPS).
 
 To check the touch cursor keeper without a finger, inject synthetic touch (coordinates
