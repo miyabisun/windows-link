@@ -24,8 +24,8 @@ Each button does one thing:
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
-Windows virtual desktops, darkens every monitor but the panel's while the PC rests (see
-[Resting](#resting)), and updates itself from GitHub Releases (see [Updates](#updates)).
+Windows virtual desktops, darkens every monitor but the panel's and mutes the PC while it
+rests (see [Resting](#resting)), and updates itself from GitHub Releases (see [Updates](#updates)).
 
 ## Requirements
 
@@ -610,7 +610,7 @@ interrupted.
 
 Resting stands in for sleep. Waking from sleep re-plugs USB hubs, monitors and the devices
 on them, which chime and keep the PC busy for a while; resting leaves the PC running and
-only darkens every monitor but the one the panel is on. Nothing is unplugged: it does not
+only darkens every monitor but the one the panel is on, and mutes the PC. Nothing is unplugged: it does not
 turn monitors off either, as a monitor turned off over DDC/CI re-plugs its own USB hub and
 a DisplayPort one may drop out of Windows altogether.
 
@@ -618,11 +618,13 @@ a DisplayPort one may drop out of Windows altogether.
 | --- | --- |
 | `GET /power` | `{"resting": bool}` |
 | `POST /power/rest` | `{"keep": "<id from GET /touch-monitors>"}`: darken every other monitor; returns `{"resting": true}` (`404 not_found` when that monitor is not connected). Resting already changes nothing |
-| `POST /power/wake` | put each monitor's brightness back and lift the black windows; returns `{"resting": false}`. Not resting changes nothing. `409 unrestored` names the monitors whose brightness could not be put back (disconnected, or refusing DDC/CI): their values stay saved and the next wake tries again |
+| `POST /power/wake` | put each monitor's brightness back, lift the black windows and unmute the PC; returns `{"resting": false}`. Not resting changes nothing. `409 unrestored` names the monitors whose brightness could not be put back (disconnected, or refusing DDC/CI): their values stay saved and the next wake tries again |
 
 - Each other monitor's brightness is read over DDC/CI, saved in `windows-link.db` and set
   to 0; a black window is laid over it. A monitor that does not answer DDC/CI keeps its
   brightness and only gets the black window.
+- The default output is muted while resting, and unmuted on waking. One that was muted
+  already stays muted. If unmuting fails, the next wake tries again.
 - A monitor whose brightness is still saved (a wake could not put it back) keeps that value
   when resting again, rather than saving the 0 it was left at.
 - While resting, a restart of the server (such as an update) lays the black windows again.

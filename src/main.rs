@@ -156,7 +156,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         let (kept, chosen, dir) = (highlights.clone(), colors.clone(), data_dir());
         std::thread::spawn(move || cursor::windows::run(&highlighters, &kept, &chosen, &dir));
     }
-    let mut state = AppState::new(config, audio)
+    let mut state = AppState::new(config, audio.clone())
         .with_desktops(desktops.clone())
         .with_discord(discord)
         .with_pins(pins)
@@ -198,7 +198,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         error!(%err, "touch cursor keeper is unavailable");
     }
     let touch = TouchState::new(Arc::new(WindowsDisplays), store, keep);
-    let rest = rest(&database)?;
+    let rest = rest(&database, audio)?;
 
     let updater = Arc::new(Updater::from_env());
     if let Some(exe) = updater.installed_exe() {
@@ -225,10 +225,11 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Resting, picked up again when the server restarts while resting (an update).
-fn rest(database: &std::path::Path) -> rusqlite::Result<Arc<Rest>> {
+fn rest(database: &std::path::Path, audio: Arc<dyn Audio>) -> rusqlite::Result<Arc<Rest>> {
     let rest = Arc::new(Rest::new(
         Arc::new(WindowsDisplays),
         Arc::new(WindowsScreens::start()),
+        audio,
         RestStore::open(database)?,
     ));
     if let Err(err) = rest.resume() {

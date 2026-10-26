@@ -2,13 +2,17 @@
 //! darkened (its brightness set to 0 over DDC/CI and a black window laid over it) until
 //! the panel wakes them. Nothing is unplugged, unlike sleep: waking from sleep re-plugs
 //! the USB hubs, the panel's monitor and their devices, and turning a monitor's power
-//! off over DDC/CI re-plugs its built-in hub (both observed on 2026-10-26).
+//! off over DDC/CI re-plugs its built-in hub (both observed on 2026-10-26). The PC is
+//! muted while resting, unless it was muted already.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tracing::warn;
 
-use crate::touch::{Displays, Monitor};
+use crate::{
+    audio::Audio,
+    touch::{Displays, Monitor},
+};
 
 pub mod api;
 pub mod store;
@@ -52,16 +56,23 @@ pub fn darkened(monitors: &[Monitor], keep: &str) -> Option<Vec<Monitor>> {
 pub struct Rest {
     displays: Arc<dyn Displays>,
     screens: Arc<dyn Screens>,
+    audio: Arc<dyn Audio>,
     store: RestStore,
     /// Resting and waking one at a time, so neither sees the other half done.
     busy: Mutex<()>,
 }
 
 impl Rest {
-    pub fn new(displays: Arc<dyn Displays>, screens: Arc<dyn Screens>, store: RestStore) -> Self {
+    pub fn new(
+        displays: Arc<dyn Displays>,
+        screens: Arc<dyn Screens>,
+        audio: Arc<dyn Audio>,
+        store: RestStore,
+    ) -> Self {
         Self {
             displays,
             screens,
+            audio,
             store,
             busy: Mutex::new(()),
         }
@@ -99,6 +110,22 @@ impl Rest {
             }
         }
         self.screens.cover(&others);
+        self.mute()
+    }
+
+    /// Mute the PC unless it is muted already, remembering to unmute it on waking.
+    fn mute(&self) -> Result<(), RestError> {
+        match self.audio.master() {
+            Ok(master) if !master.muted => {
+                self.store.set_muted(true)?;
+                if let Err(err) = self.audio.set_master(None, Some(true)) {
+                    warn!(%err, "cannot mute the PC");
+                    self.store.set_muted(false)?;
+                }
+            }
+            Ok(_) => {}
+            Err(err) => warn!(%err, "cannot read whether the PC is muted"),
+        }
         Ok(())
     }
 
@@ -128,6 +155,12 @@ impl Rest {
             }
         }
         self.screens.cover(&[]);
+        if self.store.muted()? {
+            match self.audio.set_master(None, Some(false)) {
+                Ok(()) => self.store.set_muted(false)?,
+                Err(err) => warn!(%err, "cannot unmute the PC; the next wake tries again"),
+            }
+        }
         self.store.stop()?;
         if unrestored.is_empty() {
             Ok(())
@@ -163,7 +196,10 @@ mod tests {
     };
 
     use super::{Rest, RestError, Screens, darkened, store::RestStore};
-    use crate::touch::{Displays, Monitor};
+    use crate::{
+        audio::{Audio, fake::FakeAudio},
+        touch::{Displays, Monitor},
+    };
 
     fn monitor(id: &str) -> Monitor {
         Monitor {
@@ -234,7 +270,7 @@ mod tests {
 
     /// The panel (no DDC/CI, as the T10FA), a main monitor at 40, a side one at 70 and
     /// one without DDC/CI.
-    fn setup() -> (Rest, Arc<FakeDisplays>, Arc<FakeScreens>) {
+    fn setup() -> (Rest, Arc<FakeDisplays>, Arc<FakeScreens>, Arc<FakeAudio>) {
         let ids = ["panel", "main", "side", "plain"];
         let displays = Arc::new(FakeDisplays(Mutex::new(
             ids.iter().map(|id| monitor(id)).collect(),
@@ -246,12 +282,18 @@ mod tests {
             ("side".into(), Some(70)),
             ("plain".into(), None),
         ]);
+        let audio = Arc::new(FakeAudio::new(Vec::new(), None));
         let rest = Rest::new(
             displays.clone(),
             screens.clone(),
+            audio.clone(),
             RestStore::in_memory().unwrap(),
         );
-        (rest, displays, screens)
+        (rest, displays, screens, audio)
+    }
+
+    fn muted(audio: &FakeAudio) -> bool {
+        audio.master().unwrap().muted
     }
 
     #[test]
@@ -269,7 +311,7 @@ mod tests {
 
     #[test]
     fn resting_saves_and_zeroes_each_brightness_and_covers_the_others() {
-        let (rest, _, screens) = setup();
+        let (rest, _, screens, _) = setup();
         assert!(!rest.resting().unwrap());
         rest.rest("panel").unwrap();
         assert!(rest.resting().unwrap());
@@ -284,7 +326,7 @@ mod tests {
 
     #[test]
     fn a_monitor_whose_brightness_cannot_be_read_is_left_as_it_is() {
-        let (rest, _, screens) = setup();
+        let (rest, _, screens, _) = setup();
         screens
             .brightness
             .lock()
@@ -297,7 +339,7 @@ mod tests {
 
     #[test]
     fn resting_again_keeps_the_saved_brightness() {
-        let (rest, _, screens) = setup();
+        let (rest, _, screens, _) = setup();
         rest.rest("panel").unwrap();
         rest.rest("panel").unwrap();
         assert_eq!(rest.store.brightness().unwrap()["main"], 40);
@@ -307,7 +349,7 @@ mod tests {
 
     #[test]
     fn waking_puts_the_brightness_back_and_lifts_the_cover() {
-        let (rest, _, screens) = setup();
+        let (rest, _, screens, _) = setup();
         rest.rest("panel").unwrap();
         rest.wake().unwrap();
         assert!(!rest.resting().unwrap());
@@ -319,7 +361,7 @@ mod tests {
 
     #[test]
     fn waking_when_not_resting_changes_nothing() {
-        let (rest, _, screens) = setup();
+        let (rest, _, screens, _) = setup();
         rest.wake().unwrap();
         assert_eq!(screens.level("main"), Some(40));
         assert!(!rest.resting().unwrap());
@@ -327,7 +369,7 @@ mod tests {
 
     #[test]
     fn a_brightness_that_cannot_be_put_back_stays_saved_for_the_next_wake() {
-        let (rest, displays, screens) = setup();
+        let (rest, displays, screens, _) = setup();
         rest.rest("panel").unwrap();
         screens.refuse.lock().unwrap().push("main".into());
         displays.0.lock().unwrap().retain(|m| m.id != "side");
@@ -357,42 +399,63 @@ mod tests {
 
     #[test]
     fn an_unknown_monitor_to_keep_changes_nothing() {
-        let (rest, _, screens) = setup();
+        let (rest, _, screens, audio) = setup();
         assert_eq!(rest.rest("gone"), Err(RestError::UnknownMonitor));
+        assert!(!muted(&audio));
         assert!(!rest.resting().unwrap());
         assert_eq!(screens.level("main"), Some(40));
         assert!(screens.covered().is_empty());
     }
 
     #[test]
+    fn resting_mutes_the_pc_and_waking_unmutes_it() {
+        let (rest, _, _, audio) = setup();
+        rest.rest("panel").unwrap();
+        assert!(muted(&audio));
+        rest.wake().unwrap();
+        assert!(!muted(&audio));
+    }
+
+    #[test]
+    fn a_pc_muted_before_resting_stays_muted_after_waking() {
+        let (rest, _, _, audio) = setup();
+        audio.set_master(None, Some(true)).unwrap();
+        rest.rest("panel").unwrap();
+        rest.wake().unwrap();
+        assert!(muted(&audio));
+    }
+
+    #[test]
     fn a_restart_while_resting_covers_again_and_can_still_wake() {
-        let (rest, displays, screens) = setup();
+        let (rest, displays, screens, audio) = setup();
         rest.rest("panel").unwrap();
         // A new process: the same store, nothing covered yet.
-        let restarted = Rest::new(displays, screens.clone(), rest.store);
+        let restarted = Rest::new(displays, screens.clone(), audio.clone(), rest.store);
         screens.cover(&[]);
         restarted.resume().unwrap();
         assert_eq!(screens.covered(), ["main", "side", "plain"]);
         restarted.wake().unwrap();
         assert_eq!(screens.level("main"), Some(40));
         assert!(screens.covered().is_empty());
+        assert!(!muted(&audio));
     }
 
     #[test]
     fn a_restart_without_the_kept_monitor_wakes() {
-        let (rest, displays, screens) = setup();
+        let (rest, displays, screens, audio) = setup();
         rest.rest("panel").unwrap();
         displays.0.lock().unwrap().retain(|m| m.id != "panel");
-        let restarted = Rest::new(displays, screens.clone(), rest.store);
+        let restarted = Rest::new(displays, screens.clone(), audio.clone(), rest.store);
         restarted.resume().unwrap();
         assert!(!restarted.resting().unwrap());
         assert_eq!(screens.level("main"), Some(40));
         assert!(screens.covered().is_empty());
+        assert!(!muted(&audio));
     }
 
     #[test]
     fn resuming_when_not_resting_does_nothing() {
-        let (rest, _, screens) = setup();
+        let (rest, _, screens, _) = setup();
         rest.resume().unwrap();
         assert!(screens.covered().is_empty());
         assert!(!rest.resting().unwrap());

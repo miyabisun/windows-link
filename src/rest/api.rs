@@ -94,6 +94,7 @@ mod tests {
 
     use super::router;
     use crate::{
+        audio::fake::FakeAudio,
         rest::{Rest, Screens, store::RestStore},
         touch::{Displays, Monitor},
     };
@@ -149,6 +150,7 @@ mod tests {
         let rest = Rest::new(
             Arc::new(FakeDisplays(vec![monitor("panel"), monitor("main")])),
             screens.clone(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
             RestStore::in_memory().unwrap(),
         );
         (Arc::new(rest), screens)

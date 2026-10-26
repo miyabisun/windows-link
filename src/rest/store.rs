@@ -1,6 +1,6 @@
 //! The resting state in `windows-link.db`, so a restart (an update) keeps it: the
 //! monitor kept lit while resting, and each darkened monitor's own brightness until it
-//! is put back.
+//! is put back; and whether resting muted the PC, to unmute it on waking.
 
 use std::{
     collections::HashMap,
@@ -32,7 +32,8 @@ impl RestStore {
              CREATE TABLE IF NOT EXISTS rest_brightness (
                  monitor_id TEXT PRIMARY KEY,
                  brightness INTEGER NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS rest_muted (muted INTEGER NOT NULL);",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -83,6 +84,23 @@ impl RestStore {
         Ok(())
     }
 
+    /// Whether resting muted the PC and it is not unmuted yet.
+    pub fn muted(&self) -> rusqlite::Result<bool> {
+        self.conn()
+            .query_row("SELECT EXISTS (SELECT 1 FROM rest_muted)", [], |row| {
+                row.get(0)
+            })
+    }
+
+    pub fn set_muted(&self, muted: bool) -> rusqlite::Result<()> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM rest_muted", [])?;
+        if muted {
+            conn.execute("INSERT INTO rest_muted (muted) VALUES (1)", [])?;
+        }
+        Ok(())
+    }
+
     /// No longer resting; brightness not yet put back stays saved.
     pub fn stop(&self) -> rusqlite::Result<()> {
         self.conn().execute("DELETE FROM rest_keep", [])?;
@@ -126,9 +144,13 @@ mod tests {
         {
             let store = RestStore::open(&path).unwrap();
             store.start("panel", &[("main".into(), 40)]).unwrap();
+            store.set_muted(true).unwrap();
         }
         let reopened = RestStore::open(&path).unwrap();
         assert_eq!(reopened.keep().unwrap().as_deref(), Some("panel"));
+        assert!(reopened.muted().unwrap());
+        reopened.set_muted(false).unwrap();
+        assert!(!reopened.muted().unwrap());
         assert_eq!(reopened.brightness().unwrap()["main"], 40);
         drop(reopened);
         let _ = std::fs::remove_dir_all(dir);
