@@ -15,6 +15,7 @@ pub mod logging;
 pub mod mouse;
 pub mod port;
 pub mod power;
+pub mod rest;
 pub mod secrets;
 pub mod server;
 pub mod shop;

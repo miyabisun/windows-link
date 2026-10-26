@@ -48,7 +48,7 @@ static LAST_Y: AtomicI32 = AtomicI32::new(0);
 static LAST_REAL_MS: AtomicU64 = AtomicU64::new(0);
 static TOUCH_DOWN: AtomicBool = AtomicBool::new(false);
 
-fn wide(buffer: &[u16]) -> String {
+pub(crate) fn wide(buffer: &[u16]) -> String {
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..len])
 }

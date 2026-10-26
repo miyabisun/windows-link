@@ -28,7 +28,9 @@ use windows_link::{
     library::{GameLibrary, Pins},
     logging,
     mouse::windows::WindowsPointer,
-    port, secrets,
+    port,
+    rest::{Rest, api as rest_api, store::RestStore, windows::WindowsScreens},
+    secrets,
     server::{self, AppState},
     shop::ShopStore,
     steam::{self, SteamLibrary},
@@ -196,6 +198,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         error!(%err, "touch cursor keeper is unavailable");
     }
     let touch = TouchState::new(Arc::new(WindowsDisplays), store, keep);
+    let rest = rest(&database)?;
 
     let updater = Arc::new(Updater::from_env());
     if let Some(exe) = updater.installed_exe() {
@@ -204,6 +207,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(update::run_periodically(updater.clone()));
     let app = server::app(state)
         .merge(touch_api::router(touch))
+        .merge(rest_api::router(rest))
         .merge(desktop_api::router(DesktopState::new(desktops, defined)))
         .merge(update_api::router(updater))
         .layer(cors::layer());
@@ -218,6 +222,19 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("server stopped");
     Ok(())
+}
+
+/// Resting, picked up again when the server restarts while resting (an update).
+fn rest(database: &std::path::Path) -> rusqlite::Result<Arc<Rest>> {
+    let rest = Arc::new(Rest::new(
+        Arc::new(WindowsDisplays),
+        Arc::new(WindowsScreens::start()),
+        RestStore::open(database)?,
+    ));
+    if let Err(err) = rest.resume() {
+        error!(?err, "cannot resume resting");
+    }
+    Ok(rest)
 }
 
 /// A previous instance (restarted by Task Scheduler or an update) may still hold the
