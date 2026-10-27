@@ -67,15 +67,17 @@ pub enum ButtonState {
     /// pressing; `pins` are the games pinned to the button's tab, in order,
     /// `pictures` says whether the games' pictures are store art or program icons,
     /// `license_keys` whether a game's license keys can be read (`GET …/keys`),
-    /// `sign_in` the shop the user has to sign in to through the panel, when so, and
+    /// `sign_in` the shop the user has to sign in to through the panel, when so,
     /// `rounds` whether the library downloads in rounds that say how they go
-    /// (`GET …/library/update`).
+    /// (`GET …/library/update`), and `pages` whether its games have pages in the shop
+    /// (`POST …/page`).
     Library {
         pins: Vec<Pin>,
         pictures: Pictures,
         license_keys: bool,
         sign_in: Option<String>,
         rounds: bool,
+        pages: bool,
     },
     /// `automation.hold`: `held` while the user is using the PC and automation waits.
     Hold {
@@ -257,6 +259,7 @@ fn library_state(button: &ButtonConfig, readings: &Readings<'_>) -> ButtonState 
         license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
         sign_in: readings.sign_ins.get(&button.id).cloned(),
         rounds: !matches!(spec, ButtonSpec::SteamLibrary { .. }),
+        pages: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
     }
 }
 
@@ -609,6 +612,7 @@ mod tests {
                 license_keys: false,
                 sign_in: Some("fanza".into()),
                 rounds: true,
+                pages: false,
             }
         );
         assert!(matches!(
@@ -1130,6 +1134,7 @@ buttons:
                 license_keys: false,
                 sign_in: None,
                 rounds: false,
+                pages: false,
             }
         );
         assert_eq!(
@@ -1140,6 +1145,7 @@ buttons:
                 license_keys: true,
                 sign_in: None,
                 rounds: true,
+                pages: true,
             }
         );
         assert!(matches!(

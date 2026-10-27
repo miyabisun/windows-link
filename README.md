@@ -20,7 +20,7 @@ Each button does one thing:
 | `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
 | `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
 
-A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`).
+A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`), and `"pages": true` for DLsite, whose games have pages in the shop (`POST …/page`; the listing gives each game's `page`).
 | `automation.hold` | turns "the user is using the PC" on or off; turning it on also presses its `focus` button ([Mouse board](#mouse-board)) | `held` while on; automation then waits |
 | `cursor.highlight` | turns the highlighted cursor on or off: while on, an arrow after Blue Archive's cursor, in the colour chosen on the panel, stands in for the mouse cursor | `on` while on, and `color` (`red`, `green` or `blue`) |
 
