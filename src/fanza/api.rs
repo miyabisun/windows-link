@@ -55,6 +55,7 @@ pub fn library_page(json: &Value) -> Result<(usize, Vec<Work>), String> {
                 kind: text(&item["libraryProductType"]),
                 windows: true,
                 version: text(&item["deliveryBeginDate"]),
+                bought: None,
             })
         })
         .collect();
@@ -188,6 +189,7 @@ mod tests {
                     kind: "single".into(),
                     windows: true,
                     version: "2014-04-25 10:00".into(),
+                    bought: None,
                 },
                 Work {
                     id: "set_0001".into(),
@@ -197,6 +199,7 @@ mod tests {
                     kind: "set".into(),
                     windows: true,
                     version: "2020-01-01 00:00".into(),
+                    bought: None,
                 },
             ]
         );

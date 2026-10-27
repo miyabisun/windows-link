@@ -26,6 +26,12 @@ pub struct Item {
     pub labels: Vec<String>,
     /// How getting or updating it is going, such as `ダウンロード中 40%`, when it is.
     pub status: Option<String>,
+    /// When its latest version came out and when it was bought, in Unix seconds, when
+    /// the shop says; the panel can sort by them.
+    pub updated: Option<i64>,
+    pub bought: Option<i64>,
+    /// Its page in the shop, when it has one (`POST …/page` opens it).
+    pub page: Option<String>,
 }
 
 /// How the items' pictures are shown: wide store art filling a tile, or pictures of any
@@ -106,6 +112,36 @@ pub enum Update {
     /// The shop's round of downloads and updates is on its way; the listing shows how
     /// each game is going.
     Round,
+}
+
+/// How a shop's round of reading the purchases, then downloading and updating the
+/// games, is going: the one under way, else the last one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Round {
+    /// What it is doing; `None` between rounds.
+    pub doing: Option<Doing>,
+    /// When it began and when it ended, in Unix seconds.
+    pub started: Option<i64>,
+    pub finished: Option<i64>,
+    /// Why the purchases could not be read, when they could not.
+    pub purchases: Option<String>,
+    /// The games it downloads or updates, in order.
+    pub jobs: Vec<Job>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Doing {
+    Purchases,
+    Downloads,
+}
+
+/// A game a round downloads or updates, and how that is going (`完了` once done).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Job {
+    pub id: String,
+    pub name: String,
+    pub status: String,
 }
 
 /// Why a library cannot be brought up to date.
@@ -211,6 +247,14 @@ pub trait GameLibrary: Send + Sync + 'static {
         Err(UpdateError::Unavailable(
             "this library cannot be updated".into(),
         ))
+    }
+    /// How its round of downloads and updates is going, when it has rounds.
+    fn round(&self) -> Option<Round> {
+        None
+    }
+    /// The item's page in the shop, when it has one.
+    fn page(&self, _id: &str) -> Option<String> {
+        None
     }
 }
 
@@ -393,8 +437,8 @@ pub mod fake {
     };
 
     use super::{
-        GameLibrary, Item, KeyError, Label, LabelError, LicenseKey, Listing, Picture, Programs,
-        Start, StartError, Update, UpdateError,
+        Doing, GameLibrary, Item, Job, KeyError, Label, LabelError, LicenseKey, Listing, Picture,
+        Programs, Round, Start, StartError, Update, UpdateError,
     };
 
     /// Items `"1"` (installed in `C:\Games\One`, a picture on the web) and `"2"` (not
@@ -454,6 +498,9 @@ pub mod fake {
                     .filter(|(_, items)| items.contains(id))
                     .map(|(label, _)| label.id.clone())
                     .collect(),
+                updated: None,
+                bought: None,
+                page: (id == "1").then(|| "https://shop.example/1".to_owned()),
             };
             Listing {
                 items: vec![item("1", "One", true), item("2", "Two", false)],
@@ -470,6 +517,24 @@ pub mod fake {
 
         fn folder(&self, id: &str) -> Option<PathBuf> {
             (id == "1").then(|| PathBuf::from(r"C:\Games\One"))
+        }
+
+        fn page(&self, id: &str) -> Option<String> {
+            (id == "1").then(|| "https://shop.example/1".to_owned())
+        }
+
+        fn round(&self) -> Option<Round> {
+            Some(Round {
+                doing: Some(Doing::Downloads),
+                started: Some(100),
+                finished: None,
+                purchases: Some("DLsite's login page: http status: 403".into()),
+                jobs: vec![Job {
+                    id: "1".into(),
+                    name: "One".into(),
+                    status: "完了".into(),
+                }],
+            })
         }
 
         fn create_label(&self, name: &str) -> Result<Label, LabelError> {

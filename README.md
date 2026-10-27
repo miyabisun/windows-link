@@ -19,6 +19,8 @@ Each button does one thing:
 | `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
 | `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
 | `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
+
+A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`).
 | `automation.hold` | turns "the user is using the PC" on or off; turning it on also presses its `focus` button ([Mouse board](#mouse-board)) | `held` while on; automation then waits |
 | `cursor.highlight` | turns the highlighted cursor on or off: while on, an arrow after Blue Archive's cursor, in the colour chosen on the panel, stands in for the mouse cursor | `on` while on, and `color` (`red`, `green` or `blue`) |
 
@@ -357,7 +359,12 @@ the games found when the folder was last read. The folder is read again in the
 background after each listing and each download. A game added or removed by hand shows
 the second time the list is opened. Starting a game reads its own folder again, so a
 renamed program still starts. Each game lists its maker as `detail` and comes
-recently started first, then recently added. Its picture is the work's art on DLsite
+recently started first, then recently added. It also carries, in Unix seconds or `null`,
+`updated`, when its latest version came out on DLsite (from the purchases as last read,
+else the version in its folder), and `bought`, when it was bought (kept in
+`dlsite_bought` each time the purchases are read, so it stays while they cannot be), for a
+panel to sort by. A game known by its `RJ…` work ID has its DLsite page as `page`;
+`POST …/page` opens it in the default browser. Its picture is the work's art on DLsite
 (`image` in the listing), or its program's icon until the work is known; the button's
 state says `"pictures": "whole"`, as both are shown whole.
 
@@ -430,6 +437,12 @@ up; the panel's list and the log show how it goes.
   `save` in it), and files the update lacks stay.
 - **Failures** (DLsite refusing, a full disk, an archive that does not unpack) are logged,
   shown as the game's `status`, and tried again in the next round.
+- **How a round goes**: `GET /buttons/{id}/library/update` answers for the round under way,
+  else the last one: `doing` (`purchases` while reading them, `downloads`, `null` between
+  rounds), `started` and `finished` (Unix seconds), `purchases` (why they could not be
+  read, such as `secrets.yaml has no DLsite account`), and `jobs`, the games it downloads
+  or updates in order, each `{id, name, status}` with `status` as in the list, or `完了`
+  once done. FANZA's rounds answer the same way.
 
 ## FANZA library
 
@@ -513,8 +526,9 @@ Discord's CDN.
 | `PUT /buttons/{id}/color` | `{"color": "red"}` (`red`, `green` or `blue`): the colour a `cursor.highlight` button highlights the cursor in; returns `{"button": …}`. `409 not_highlight` for other buttons, `422` for another colour |
 | `POST /buttons/{id}/wheel` | `{"x": …, "y": …, "notches": …}`: turn the [mouse board](#mouse-board)'s wheel over an `app.launch` button's running `process` (`x`, `y` are fractions of its window, `notches` 1–20 either way, negative scrolls down); `204`. `409 user_operating` while an `automation.hold` button is on, `409 not_scrollable` for other buttons, `400 invalid_wheel`, `409 no_mouse`, `409 no_window`, `409 covered` (another window is over that point), `500 mouse` |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, or a redirect to it on the web, when `icon` is true |
-| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null, "sign_in": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now, `sign_in` the shop to sign in to through the panel) |
+| `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, status, updated, bought, page, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null, "sign_in": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `status` how its download goes; `updated` and `bought` when its latest version came out and when it was bought, in Unix seconds, when the shop says; `page` its page in the shop; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now, `sign_in` the shop to sign in to through the panel) |
 | `POST /buttons/{id}/library/update` | bring a library button's games up to date, leaving out its `hide` labels: Steam updates its games and shows its install screen for those not installed, answering `{"updates": n, "installs": n}` ([Updating the library](#updating-the-library)); DLsite and FANZA start their round of downloads and updates now, or right after the one under way (`202 {"round": true}`; the listing shows how each game goes). `409 sign_in` while FANZA needs signing in, `409 update_unavailable` with the reason (Steam not running or not accepting remote control, no DLsite account) |
+| `GET /buttons/{id}/library/update` | how a DLsite or FANZA library's round of downloads and updates goes: `{"doing": "downloads", "started": …, "finished": null, "purchases": null, "jobs": [{id, name, status}]}` ([Downloads and updates](#downloads-and-updates)); `404 no_rounds` for Steam's |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
 | `GET /audio/mixer` | the default output's volume and mute and the applications with sound on it: `{"master": {volume, muted}, "apps": [{process, name, volume, muted}]}` (volumes 0–1) |
@@ -522,6 +536,7 @@ Discord's CDN.
 | `PUT /audio/apps/{process}` | `{"volume": …}`, `{"muted": …}` or both for every session of the program (a volume alone unmutes); returns the mixer (`404` when it has no sound now, `400 invalid_change` with neither) |
 | `PUT /buttons/{id}/pins/{item}`, `DELETE …` | pin a game to the button, or take it off; returns `{"button": …}` |
 | `POST /buttons/{id}/library/{item}/folder` | show an installed game's folder in Explorer (`204`; `404` when not installed) |
+| `POST /buttons/{id}/library/{item}/page` | open a game's `page` in the shop in the default browser (`204`; `404` when it has none) |
 | `GET /buttons/{id}/library/{item}/programs` | a game's programs to choose from: `{"candidates": ["Game.exe", …], "chosen": null}` (`404` when it has no choice) |
 | `PUT /buttons/{id}/library/{item}/program` | `{"program": …}`: remember which program starts the game (`204`) |
 | `GET /buttons/{id}/library/{item}/keys` | a game's license keys from its store: `{"keys": [{label, value}]}` (empty when it has none; `404` when the library does not know them; `409 keys_unavailable` with the reason when the store cannot be asked). A library button's state says `"license_keys": true` when its games have them (DLsite) |

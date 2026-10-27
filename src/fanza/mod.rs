@@ -164,6 +164,7 @@ impl ShopLibrary<FanzaShop> {
     /// Read the works bought and find out which folder is which. Failures are logged
     /// and leave what was known; a needed sign-in shows on the panel.
     pub fn refresh(&self) {
+        self.begin_round();
         match self.shop().purchases() {
             Ok(works) => {
                 tracing::info!(works = works.len(), "FANZA purchases read");
@@ -179,9 +180,11 @@ impl ShopLibrary<FanzaShop> {
             }
             Err(FanzaError::SignIn) => {
                 tracing::warn!("FANZA needs signing in again through the panel");
+                self.purchases_failed("FANZA needs signing in again through the panel");
             }
             Err(FanzaError::Failed(reason)) => {
                 tracing::warn!(%reason, "cannot read the FANZA purchases");
+                self.purchases_failed(&reason);
             }
         }
     }
@@ -216,6 +219,7 @@ mod tests {
             kind: "single".into(),
             windows: true,
             version: "2014-04-25 10:00".into(),
+            bought: None,
         }
     }
 

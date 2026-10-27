@@ -18,14 +18,29 @@ pub fn is_game(work: &Work) -> bool {
         && !work.name.contains("ゲームデータ（AI翻訳）")
 }
 
-/// A time DLsite gives, such as `2017-12-09T15:00:00.000000Z` (UTC).
+/// A time DLsite gives, such as `2017-12-09T15:00:00.000000Z` (UTC) or
+/// `2026-01-02T03:04:05+09:00` (a purchase, in Japan's time).
 pub fn parse_date(text: &str) -> Option<SystemTime> {
     let number = |at: std::ops::Range<usize>| text.get(at)?.parse::<i64>().ok();
     if text.get(4..5)? != "-" || text.get(10..11)? != "T" {
         return None;
     }
     let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let seconds = number(11..13)? * 3600 + number(14..16)? * 60 + number(17..19)?;
+    // Past the seconds and their fraction: `Z`, `±HH:MM`, or nothing (UTC).
+    let zone = text
+        .get(19..)?
+        .trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset = match zone.as_bytes().first() {
+        None | Some(b'Z') => 0,
+        Some(&sign @ (b'+' | b'-')) => {
+            let hours = zone.get(1..3)?.parse::<i64>().ok()?;
+            let minutes = zone.get(4..6)?.parse::<i64>().ok()?;
+            let east = (hours * 60 + minutes) * 60;
+            if sign == b'+' { east } else { -east }
+        }
+        Some(_) => return None,
+    };
+    let seconds = number(11..13)? * 3600 + number(14..16)? * 60 + number(17..19)? - offset;
     // Days since 1970-01-01, by Howard Hinnant's days_from_civil.
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
@@ -82,6 +97,16 @@ mod tests {
         assert_eq!(parse_date("1970-01-02T00:00:01.000000Z"), at(86_401));
         assert_eq!(parse_date("2017-12-09T15:00:00.000000Z"), at(1_512_831_600));
         assert_eq!(parse_date("2017-12-09T15:00:00Z"), at(1_512_831_600));
+        // Purchases are written in Japan's time.
+        assert_eq!(
+            parse_date("2026-01-02T03:04:05+09:00"),
+            parse_date("2026-01-01T18:04:05Z")
+        );
+        assert_eq!(
+            parse_date("2026-01-01T18:04:05.5-01:30"),
+            parse_date("2026-01-01T19:34:05Z")
+        );
+        assert_eq!(parse_date("2026-01-01T18:04:05+9"), None);
         assert_eq!(parse_date(""), None);
         assert_eq!(parse_date("yesterday"), None);
     }

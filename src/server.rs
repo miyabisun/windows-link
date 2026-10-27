@@ -354,10 +354,14 @@ pub fn app(state: AppState) -> Router {
         .route("/buttons/{id}/color", axum::routing::put(set_color))
         .route("/buttons/{id}/icon", get(button_icon))
         .route("/buttons/{id}/library", get(library_listing))
-        .route("/buttons/{id}/library/update", post(update_library))
+        .route(
+            "/buttons/{id}/library/update",
+            get(library_round).post(update_library),
+        )
         .route("/buttons/{id}/library/{item}/start", post(start_item))
         .route("/buttons/{id}/library/{item}/image", get(item_picture))
         .route("/buttons/{id}/library/{item}/folder", post(open_folder))
+        .route("/buttons/{id}/library/{item}/page", post(open_page))
         .route("/buttons/{id}/library/{item}/programs", get(item_programs))
         .route("/buttons/{id}/library/{item}/keys", get(license_keys))
         .route("/audio/mixer", get(mixer))
@@ -676,6 +680,54 @@ async fn open_folder(
     match opened {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(failure)) => press_error(&id, failure, "the game is not installed"),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// Open a game's page in the shop in the default browser (`204`).
+async fn open_page(
+    State(state): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+) -> Response {
+    let Some((_, library)) = state.library_button(&id) else {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    };
+    let launcher = state.launcher.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        let page = library.page(&item).ok_or(PressError::NotFound)?;
+        launcher
+            .open(&page, None, false)
+            .map_err(PressError::Launch)
+    })
+    .await;
+    match opened {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(failure)) => press_error(&id, failure, "the game has no page in its shop"),
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    }
+}
+
+/// How the library's round of downloads and updates is going (`404 no_rounds` for a
+/// library without rounds, such as Steam's).
+async fn library_round(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some((_, library)) = state.library_button(&id) else {
+        return error(StatusCode::NOT_FOUND, "not_found", NOT_A_LIBRARY);
+    };
+    match tokio::task::spawn_blocking(move || library.round()).await {
+        Ok(Some(round)) => Json(round).into_response(),
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            "no_rounds",
+            "this library does not download in rounds",
+        ),
         Err(join) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
@@ -1800,6 +1852,47 @@ buttons:
         let (status, body) = call(state, "POST", "/buttons/games/library/2/folder").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn a_games_page_opens_in_the_browser() {
+        let (state, launcher) = library_state();
+        let (_, body) = call(state.clone(), "GET", "/buttons/games/library").await;
+        assert_eq!(body["items"][0]["page"], "https://shop.example/1");
+        assert_eq!(body["items"][1]["page"], Value::Null);
+        let (status, _) = call(state.clone(), "POST", "/buttons/games/library/1/page").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(*launcher.opened.lock().unwrap(), ["https://shop.example/1"]);
+        let (status, body) = call(state.clone(), "POST", "/buttons/games/library/2/page").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+        let (status, _) = call(state, "POST", "/buttons/nope/library/1/page").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_librarys_round_says_how_it_goes() {
+        let (state, _) = library_state();
+        let (status, body) = call(state, "GET", "/buttons/games/library/update").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "doing": "downloads",
+                "started": 100,
+                "finished": null,
+                "purchases": "DLsite's login page: http status: 403",
+                "jobs": [{"id": "1", "name": "One", "status": "完了"}]
+            })
+        );
+        // A library without rounds (Steam's, or none at all) says so.
+        let config =
+            config::parse("buttons:\n  - id: steam\n    label: Steam\n    type: steam.library\n")
+                .unwrap();
+        let state = AppState::new(config, Arc::new(FakeAudio::new(Vec::new(), None)));
+        let (status, body) = call(state, "GET", "/buttons/steam/library/update").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "no_rounds");
     }
 
     #[tokio::test]

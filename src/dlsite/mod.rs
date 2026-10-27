@@ -75,6 +75,14 @@ impl Shop for DlsiteShop {
         Ok(files)
     }
 
+    /// `RJ…` works (every game here so far) are on the doujin floor; an all-ages one
+    /// shows there too.
+    fn page(&self, work: &str) -> Option<String> {
+        let number = work.strip_prefix("RJ")?;
+        (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| format!("https://www.dlsite.com/maniax/work/=/product_id/{work}.html"))
+    }
+
     /// Read from DLsite each time, so the keys are kept nowhere on this PC.
     fn license_keys(&self, work: &str) -> Result<Vec<LicenseKey>, KeyError> {
         let account = self
@@ -142,6 +150,7 @@ impl ShopLibrary<DlsiteShop> {
             .account
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = account.cloned();
+        self.begin_round();
         self.adopt_legacy_works();
         let Ok(games) = self.rescan() else {
             return;
@@ -156,9 +165,13 @@ impl ShopLibrary<DlsiteShop> {
             }
             Some(Err(reason)) => {
                 tracing::warn!(%reason, "cannot read the DLsite purchases");
+                self.purchases_failed(&reason);
                 Vec::new()
             }
-            None => Vec::new(),
+            None => {
+                self.purchases_failed("secrets.yaml has no DLsite account");
+                Vec::new()
+            }
         };
         let pictured: HashSet<&str> = purchases
             .iter()
@@ -952,6 +965,7 @@ mod tests {
             kind: kind.into(),
             windows,
             version: "2024-01-01T00:00:00.000000Z".into(),
+            bought: None,
         };
         library.set_purchases(&[
             bought("RJ7", "Coming", "RPG", true),
@@ -990,6 +1004,150 @@ mod tests {
             library.start("RJ8"),
             Err(StartError::NotDownloaded("ダウンロード中 40%".into()))
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn games_carry_when_they_were_updated_and_bought_and_their_page() {
+        use super::play::Work;
+
+        let root = games("dates");
+        let store = std::sync::Arc::new(ShopStore::in_memory("dlsite").unwrap());
+        let library = |store: &std::sync::Arc<ShopStore>| {
+            DlsiteLibrary::new(root.clone(), store.clone(), DlsiteShop::default())
+        };
+        let first = library(&store);
+        // "One" was downloaded at the version of 2024-03-01.
+        store
+            .record_download(
+                "RJ1",
+                &root.join(r"Maker\One"),
+                None,
+                "2024-03-01T00:00:00.000000Z",
+            )
+            .unwrap();
+        let bought = |id: &str, version: &str, at: i64| Work {
+            id: id.into(),
+            name: format!("{id} name"),
+            maker: "Brand".into(),
+            kind: "RPG".into(),
+            windows: true,
+            version: version.into(),
+            bought: Some(at),
+            ..Work::default()
+        };
+        first.set_purchases(&[
+            bought("RJ1", "2025-06-01T00:00:00.000000Z", 1_767_290_645),
+            bought("RJ7", "2025-11-09T15:00:00.000000Z", 1_770_120_000),
+        ]);
+        let dates = |library: &DlsiteLibrary| -> Vec<_> {
+            let mut rows: Vec<_> = library
+                .listing()
+                .items
+                .into_iter()
+                .map(|i| (i.name, i.updated, i.bought, i.page))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let page = |id: &str| {
+            Some(format!(
+                "https://www.dlsite.com/maniax/work/=/product_id/{id}.html"
+            ))
+        };
+        assert_eq!(
+            dates(&first),
+            [
+                ("None".to_owned(), None, None, None),
+                // DLsite's latest version, not the one in the folder.
+                (
+                    "One".to_owned(),
+                    Some(1_748_736_000),
+                    Some(1_767_290_645),
+                    page("RJ1")
+                ),
+                (
+                    "RJ7 name".to_owned(),
+                    Some(1_762_700_400),
+                    Some(1_770_120_000),
+                    page("RJ7")
+                ),
+                ("Two".to_owned(), None, None, None),
+            ]
+        );
+        assert_eq!(first.page("RJ1"), page("RJ1"));
+        assert_eq!(first.page(&title_id("Maker", "Two")), None);
+
+        // After a restart that cannot read the purchases, the folder's version and the
+        // day it was bought are still known.
+        assert_eq!(
+            dates(&library(&store)),
+            [
+                ("None".to_owned(), None, None, None),
+                (
+                    "One".to_owned(),
+                    Some(1_709_251_200),
+                    Some(1_767_290_645),
+                    page("RJ1")
+                ),
+                ("Two".to_owned(), None, None, None),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_round_says_what_it_does_and_how_each_game_goes() {
+        use crate::library::{Doing, Job};
+
+        let root = games("round");
+        let library = library(&root);
+        assert_eq!(library.round(), Some(crate::library::Round::default()));
+
+        library.begin_round();
+        let round = library.round().unwrap();
+        assert_eq!(round.doing, Some(Doing::Purchases));
+        assert!(round.started.is_some());
+        assert_eq!(round.finished, None);
+
+        library.plan_round(&[
+            ("RJ7".to_owned(), "Coming".to_owned()),
+            ("RJ8".to_owned(), "Next".to_owned()),
+            ("RJ9".to_owned(), "Last".to_owned()),
+        ]);
+        library
+            .progress
+            .lock()
+            .unwrap()
+            .insert("RJ8".into(), "ダウンロード中 40%".into());
+        library.job_done("RJ7");
+        let job = |id: &str, name: &str, status: &str| Job {
+            id: id.into(),
+            name: name.into(),
+            status: status.into(),
+        };
+        let round = library.round().unwrap();
+        assert_eq!(round.doing, Some(Doing::Downloads));
+        assert_eq!(
+            round.jobs,
+            [
+                job("RJ7", "Coming", "完了"),
+                job("RJ8", "Next", "ダウンロード中 40%"),
+                job("RJ9", "Last", "ダウンロード待ち"),
+            ]
+        );
+
+        // Without the account nothing is read or downloaded, and the round says why.
+        library.refresh(None);
+        library.download();
+        let round = library.round().unwrap();
+        assert_eq!(round.doing, None);
+        assert!(round.finished.is_some());
+        assert_eq!(
+            round.purchases.as_deref(),
+            Some("secrets.yaml has no DLsite account")
+        );
+        assert_eq!(round.jobs, []);
         let _ = std::fs::remove_dir_all(root);
     }
 

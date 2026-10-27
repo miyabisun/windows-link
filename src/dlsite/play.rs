@@ -104,7 +104,7 @@ pub struct RemoteFile {
 }
 
 impl Session {
-    /// Every purchased work.
+    /// Every purchased work, with when it was bought.
     pub fn purchases(&self) -> Result<Vec<Work>, String> {
         let bought = sales(&json(
             self.agent
@@ -112,8 +112,13 @@ impl Session {
                 .call(),
             "the DLsite purchases",
         )?);
+        let ids: Vec<&str> = bought.iter().map(|(id, _)| id.as_str()).collect();
+        let when: HashMap<&str, i64> = bought
+            .iter()
+            .filter_map(|(id, at)| Some((id.as_str(), (*at)?)))
+            .collect();
         let mut found = Vec::new();
-        for batch in bought.chunks(WORKS_PER_REQUEST) {
+        for batch in ids.chunks(WORKS_PER_REQUEST) {
             let body = serde_json::to_string(batch).unwrap_or_default();
             found.extend(works(&json(
                 self.agent
@@ -122,6 +127,9 @@ impl Session {
                     .send(body),
                 "the DLsite works",
             )?));
+        }
+        for work in &mut found {
+            work.bought = when.get(work.id.as_str()).copied();
         }
         Ok(found)
     }
@@ -319,13 +327,20 @@ pub fn signed_in(html: &str) -> bool {
     html.contains("ログイン中です")
 }
 
-/// The work IDs in `/api/v3/content/sales`.
-pub fn sales(answer: &Value) -> Vec<String> {
+/// The work IDs in `/api/v3/content/sales`, each with when it was bought (Unix
+/// seconds) when DLsite says.
+pub fn sales(answer: &Value) -> Vec<(String, Option<i64>)> {
     answer
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|sale| sale["workno"].as_str().map(str::to_owned))
+        .filter_map(|sale| {
+            let at = sale["sales_date"]
+                .as_str()
+                .and_then(super::works::parse_date)
+                .and_then(crate::shop::unix_seconds);
+            Some((sale["workno"].as_str()?.to_owned(), at))
+        })
         .collect()
 }
 
@@ -359,6 +374,7 @@ pub fn works(answer: &Value) -> Vec<Work> {
                     .or_else(|| date("regist_date"))
                     .unwrap_or_default()
                     .to_owned(),
+                bought: None,
             })
         })
         .collect()
@@ -416,7 +432,13 @@ mod tests {
             {"sales_date": "2026-01-02T03:04:05+09:00"},
             {"workno": "RJ316251"}
         ]);
-        assert_eq!(sales(&answer), ["RJ01464588", "RJ316251"]);
+        assert_eq!(
+            sales(&answer),
+            [
+                ("RJ01464588".to_owned(), Some(1_767_290_645)),
+                ("RJ316251".to_owned(), None)
+            ]
+        );
 
         let answer = json!({"works": [
             {
@@ -452,6 +474,7 @@ mod tests {
                     kind: "RPG".into(),
                     windows: true,
                     version: "2025-11-09T15:00:00.000000Z".into(),
+                    bought: None,
                 },
                 Work {
                     id: "VJ0001".into(),
@@ -461,6 +484,7 @@ mod tests {
                     kind: "ADV".into(),
                     windows: false,
                     version: "2005-10-02T15:00:00.000000Z".into(),
+                    bought: None,
                 },
             ]
         );

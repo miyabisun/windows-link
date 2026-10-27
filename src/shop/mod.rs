@@ -1,7 +1,8 @@
 //! A shop's game library read from the folders `<root>\<maker>\<title>`: the games bought
 //! but not there yet are downloaded into the same layout, and updated games are brought
-//! up to date. Which work each folder is, labels, the chosen programs and when each game
-//! was last started are kept in windows-link's database, in tables of the shop's own. A
+//! up to date. Which work each folder is, labels, the chosen programs, when each game
+//! was last started and when each was bought are kept in windows-link's database, in
+//! tables of the shop's own. A
 //! game goes by its work ID once known, else by an ID from its folder. The shop itself
 //! (signing in, reading purchases, fetching files) is behind `Shop`.
 
@@ -17,8 +18,8 @@ use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use crate::library::{
-    GameLibrary, Item, KeyError, Label, LabelError, LicenseKey, Listing, Picture, Programs, Start,
-    StartError, Update, UpdateError,
+    Doing, GameLibrary, Item, Job, KeyError, Label, LabelError, LicenseKey, Listing, Picture,
+    Programs, Round, Start, StartError, Update, UpdateError,
 };
 
 pub mod download;
@@ -39,6 +40,11 @@ pub struct Title {
 /// How a folder is recorded: its path in lower case, as DLsiteNest records it too.
 pub(crate) fn folder_key(folder: &Path) -> String {
     folder.to_string_lossy().to_lowercase()
+}
+
+/// A time in Unix seconds.
+pub(crate) fn unix_seconds(time: SystemTime) -> Option<i64> {
+    i64::try_from(time.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs()).ok()
 }
 
 /// A stable ID for a game from where it lives, safe in a URL.
@@ -192,6 +198,10 @@ impl ShopStore {
                  path    TEXT NOT NULL UNIQUE,
                  image   TEXT,
                  version TEXT
+             );
+             CREATE TABLE IF NOT EXISTS shop_bought (
+                 work_id TEXT PRIMARY KEY,
+                 at      INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS shop_titles (
                  root     TEXT NOT NULL,
@@ -492,6 +502,32 @@ impl ShopStore {
         rows.collect()
     }
 
+    /// When each work was bought (Unix seconds), as last read.
+    pub fn bought(&self) -> rusqlite::Result<HashMap<String, i64>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&self.sql("SELECT work_id, at FROM shop_bought"))?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Remember when the works were bought, for when the purchases cannot be read.
+    pub fn keep_bought(&self, works: &[Work]) -> rusqlite::Result<()> {
+        let mut conn = self.conn();
+        let saving = conn.transaction()?;
+        for work in works {
+            if let Some(at) = work.bought {
+                saving.execute(
+                    &self.sql(
+                        "INSERT INTO shop_bought (work_id, at) VALUES (?1, ?2)
+                         ON CONFLICT (work_id) DO UPDATE SET at = excluded.at",
+                    ),
+                    params![work.id, at],
+                )?;
+            }
+        }
+        saving.commit()
+    }
+
     /// Remember that a game's folder holds `version`.
     pub fn set_version(&self, work: &str, version: &str) -> rusqlite::Result<()> {
         self.conn().execute(
@@ -621,6 +657,8 @@ fn program_path(folder: &Path, program: &str) -> PathBuf {
 
 /// The status of a game waiting to be downloaded.
 const WAITING: &str = "ダウンロード待ち";
+/// A game this round downloaded or updated.
+const DONE: &str = "完了";
 
 /// The work a game folder is, with its main picture when known.
 #[derive(Clone, Debug, PartialEq)]
@@ -659,6 +697,9 @@ pub fn waiting(
                     .cloned()
                     .unwrap_or_else(|| WAITING.to_owned()),
             ),
+            updated: None,
+            bought: None,
+            page: None,
         })
         .collect()
 }
@@ -691,6 +732,9 @@ pub fn listing(
                 image: images.get(&title.id).cloned(),
                 installed: true,
                 status: None,
+                updated: None,
+                bought: None,
+                page: None,
                 labels: labels
                     .iter()
                     .filter(|(_, items)| items.contains(&title.id))
@@ -735,6 +779,8 @@ pub struct Work {
     /// When its latest version came out (its last update, else its release), as the
     /// shop writes it.
     pub version: String,
+    /// When it was bought, in Unix seconds, when the shop says.
+    pub bought: Option<i64>,
 }
 
 /// What a library needs from the shop its games come from.
@@ -759,6 +805,10 @@ pub trait Shop: Send + Sync + 'static {
     ) -> Result<Vec<PathBuf>, String>;
     /// A work's license keys, read from the shop each time.
     fn license_keys(&self, work: &str) -> Result<Vec<LicenseKey>, KeyError>;
+    /// The work's page in the shop, when the shop has pages by work ID.
+    fn page(&self, _work: &str) -> Option<String> {
+        None
+    }
     /// The shop the user has to sign in to through the panel, when it is so.
     fn sign_in(&self) -> Option<&'static str> {
         None
@@ -774,6 +824,9 @@ pub struct ShopLibrary<S> {
     pub(crate) purchases: Mutex<Vec<Work>>,
     /// How each download or update planned this round is going, by work ID.
     pub(crate) progress: Mutex<HashMap<String, String>>,
+    /// The round under way, else the last one. A job's empty status stands for how
+    /// `progress` says it goes.
+    round: Mutex<Round>,
     /// Wakes the round of downloads and updates before its time.
     wake: std::sync::Arc<tokio::sync::Notify>,
     /// Held while the folders are read, one reading at a time.
@@ -788,6 +841,7 @@ impl<S: Shop> ShopLibrary<S> {
             shop,
             purchases: Mutex::default(),
             progress: Mutex::default(),
+            round: Mutex::default(),
             wake: std::sync::Arc::default(),
             reading: Mutex::new(()),
         }
@@ -826,16 +880,60 @@ impl<S: Shop> ShopLibrary<S> {
         &self.shop
     }
 
-    /// Keep the purchases just read, the games among them.
+    /// Keep the purchases just read, the games among them, and when each was bought.
     pub fn set_purchases(&self, works: &[Work]) {
-        *self
-            .purchases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = works
+        let games: Vec<Work> = works
             .iter()
             .filter(|work| self.shop.wants(work))
             .cloned()
             .collect();
+        if let Err(err) = self.store.keep_bought(&games) {
+            tracing::warn!(shop = self.shop.name(), %err, "cannot keep when the games were bought");
+        }
+        *self
+            .purchases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = games;
+    }
+
+    fn round_state(&self) -> MutexGuard<'_, Round> {
+        self.round.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Begin a round: the purchases are read first.
+    pub(crate) fn begin_round(&self) {
+        *self.round_state() = Round {
+            doing: Some(Doing::Purchases),
+            started: unix_seconds(SystemTime::now()),
+            ..Round::default()
+        };
+    }
+
+    /// Say why this round could not read the purchases.
+    pub(crate) fn purchases_failed(&self, reason: &str) {
+        self.round_state().purchases = Some(reason.to_owned());
+    }
+
+    /// Go on to download and update `jobs` (work ID and name), in order.
+    pub(crate) fn plan_round(&self, jobs: &[(String, String)]) {
+        let mut round = self.round_state();
+        round.doing = Some(Doing::Downloads);
+        round.jobs = jobs
+            .iter()
+            .map(|(id, name)| Job {
+                id: id.clone(),
+                name: name.clone(),
+                status: String::new(),
+            })
+            .collect();
+    }
+
+    pub(crate) fn job_done(&self, id: &str) {
+        for job in &mut self.round_state().jobs {
+            if job.id == id {
+                DONE.clone_into(&mut job.status);
+            }
+        }
     }
 
     fn purchases(&self) -> Vec<Work> {
@@ -852,10 +950,17 @@ impl<S: Shop> ShopLibrary<S> {
     }
 
     /// Download the games bought but not in the folder yet, and update those whose
-    /// folder is older than their latest version, one at a time. Needs the purchases
-    /// read before. Failures are logged and shown in the listing, and tried again
-    /// next time.
+    /// folder is older than their latest version, one at a time, ending the round.
+    /// Needs the purchases read before. Failures are logged and shown in the listing,
+    /// and tried again next time.
     pub fn download(&self) {
+        self.download_all();
+        let mut round = self.round_state();
+        round.doing = None;
+        round.finished = unix_seconds(SystemTime::now());
+    }
+
+    fn download_all(&self) {
         if !self.shop.ready() {
             return;
         }
@@ -898,6 +1003,14 @@ impl<S: Shop> ShopLibrary<S> {
             updates = plan.updates.len(),
             "downloads planned"
         );
+        let planned: Vec<(String, String)> = plan
+            .fresh
+            .iter()
+            .copied()
+            .chain(plan.updates.iter().map(|(work, _)| *work))
+            .map(|work| (work.id.clone(), work.name.clone()))
+            .collect();
+        self.plan_round(&planned);
         let jobs = plan.fresh.iter().map(|work| (*work, None)).chain(
             plan.updates
                 .iter()
@@ -911,6 +1024,7 @@ impl<S: Shop> ShopLibrary<S> {
                     // Listed as here before it stops showing as coming.
                     let _ = self.rescan();
                     self.progress().remove(&work.id);
+                    self.job_done(&work.id);
                     tracing::info!(shop, work = %work.id, folder = %folder.display(), "game downloaded");
                 }
                 Err(reason) => {
@@ -1079,6 +1193,23 @@ impl<S: Shop> GameLibrary for ShopLibrary<S> {
         let purchases = self.purchases();
         let coming = waiting(&purchases, &here, &labels, &progress);
         listing.items.splice(0..0, coming);
+        // The latest version and the purchase as last read, else the version in the
+        // folder and the purchase as kept.
+        let latest: HashMap<&str, &Work> = purchases.iter().map(|w| (w.id.as_str(), w)).collect();
+        let versions = self.store.versions().unwrap_or_default();
+        let bought = self.store.bought().unwrap_or_default();
+        for item in &mut listing.items {
+            let work = latest.get(item.id.as_str());
+            item.updated = work
+                .map(|w| w.version.as_str())
+                .or_else(|| versions.get(&item.id).map(String::as_str))
+                .and_then(|version| self.shop.released(version))
+                .and_then(unix_seconds);
+            item.bought = work
+                .and_then(|w| w.bought)
+                .or_else(|| bought.get(&item.id).copied());
+            item.page = self.shop.page(&item.id);
+        }
         listing.sign_in = self.shop.sign_in().map(str::to_owned);
         listing
     }
@@ -1177,6 +1308,24 @@ impl<S: Shop> GameLibrary for ShopLibrary<S> {
 
     fn sign_in(&self) -> Option<&'static str> {
         self.shop.sign_in()
+    }
+
+    fn round(&self) -> Option<Round> {
+        let mut round = self.round_state().clone();
+        let progress = self.progress();
+        for job in &mut round.jobs {
+            if job.status.is_empty() {
+                job.status = progress
+                    .get(&job.id)
+                    .cloned()
+                    .unwrap_or_else(|| WAITING.to_owned());
+            }
+        }
+        Some(round)
+    }
+
+    fn page(&self, id: &str) -> Option<String> {
+        self.shop.page(id)
     }
 
     /// Start the round of downloads and updates now rather than at its time, or right

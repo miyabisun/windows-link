@@ -66,13 +66,16 @@ pub enum ButtonState {
     /// A game library the panel opens (`GET /buttons/{id}/library`) instead of
     /// pressing; `pins` are the games pinned to the button's tab, in order,
     /// `pictures` says whether the games' pictures are store art or program icons,
-    /// `license_keys` whether a game's license keys can be read (`GET …/keys`), and
-    /// `sign_in` the shop the user has to sign in to through the panel, when so.
+    /// `license_keys` whether a game's license keys can be read (`GET …/keys`),
+    /// `sign_in` the shop the user has to sign in to through the panel, when so, and
+    /// `rounds` whether the library downloads in rounds that say how they go
+    /// (`GET …/library/update`).
     Library {
         pins: Vec<Pin>,
         pictures: Pictures,
         license_keys: bool,
         sign_in: Option<String>,
+        rounds: bool,
     },
     /// `automation.hold`: `held` while the user is using the PC and automation waits.
     Hold {
@@ -246,6 +249,17 @@ pub fn view(
     }
 }
 
+fn library_state(button: &ButtonConfig, readings: &Readings<'_>) -> ButtonState {
+    let spec = &button.spec;
+    ButtonState::Library {
+        pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
+        pictures: spec.pictures().unwrap_or_default(),
+        license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
+        sign_in: readings.sign_ins.get(&button.id).cloned(),
+        rounds: !matches!(spec, ButtonSpec::SteamLibrary { .. }),
+    }
+}
+
 fn state(
     config: &Config,
     button: &ButtonConfig,
@@ -338,12 +352,7 @@ fn state(
         },
         ButtonSpec::SteamLibrary { .. }
         | ButtonSpec::DlsiteLibrary { .. }
-        | ButtonSpec::FanzaLibrary { .. } => ButtonState::Library {
-            pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
-            pictures: spec.pictures().unwrap_or_default(),
-            license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
-            sign_in: readings.sign_ins.get(&button.id).cloned(),
-        },
+        | ButtonSpec::FanzaLibrary { .. } => library_state(button, readings),
         ButtonSpec::AutomationHold { .. } => ButtonState::Hold {
             held: readings.holds.contains(&button.id),
         },
@@ -599,6 +608,7 @@ mod tests {
                 pictures: Pictures::Whole,
                 license_keys: false,
                 sign_in: Some("fanza".into()),
+                rounds: true,
             }
         );
         assert!(matches!(
@@ -1118,7 +1128,8 @@ buttons:
                 pins: vec![pinned],
                 pictures: Pictures::Cover,
                 license_keys: false,
-                sign_in: None
+                sign_in: None,
+                rounds: false,
             }
         );
         assert_eq!(
@@ -1127,7 +1138,8 @@ buttons:
                 pins: vec![],
                 pictures: Pictures::Whole,
                 license_keys: true,
-                sign_in: None
+                sign_in: None,
+                rounds: true,
             }
         );
         assert!(matches!(

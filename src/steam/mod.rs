@@ -684,6 +684,9 @@ pub fn listing(
             image: None,
             installed: local(id).is_some(),
             status: None,
+            updated: None,
+            bought: None,
+            page: None,
             labels: collections
                 .iter()
                 .filter(|c| c.apps.contains(&id))
