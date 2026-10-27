@@ -62,10 +62,7 @@ async fn answer(
         Ok(Err(RestError::Unrestored(monitors))) => error(
             StatusCode::CONFLICT,
             "unrestored",
-            &format!(
-                "cannot put the brightness back on {}; wake again to retry",
-                monitors.join(", ")
-            ),
+            &format!("cannot put the brightness back on {}", monitors.join(", ")),
         ),
         Ok(Err(RestError::Failed(message))) => {
             error(StatusCode::INTERNAL_SERVER_ERROR, "rest", &message)
@@ -147,12 +144,13 @@ mod tests {
     fn rest() -> (Arc<Rest>, Arc<FakeScreens>) {
         let screens = Arc::new(FakeScreens::default());
         screens.levels.lock().unwrap().insert("main".into(), 40);
-        let rest = Rest::new(
+        let mut rest = Rest::new(
             Arc::new(FakeDisplays(vec![monitor("panel"), monitor("main")])),
             screens.clone(),
             Arc::new(FakeAudio::new(Vec::new(), None)),
             RestStore::in_memory().unwrap(),
         );
+        rest.retry_waits.clear();
         (Arc::new(rest), screens)
     }
 

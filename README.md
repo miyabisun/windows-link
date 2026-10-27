@@ -618,7 +618,7 @@ a DisplayPort one may drop out of Windows altogether.
 | --- | --- |
 | `GET /power` | `{"resting": bool}` |
 | `POST /power/rest` | `{"keep": "<id from GET /touch-monitors>"}`: darken every other monitor; returns `{"resting": true}` (`404 not_found` when that monitor is not connected). Resting already changes nothing |
-| `POST /power/wake` | put each monitor's brightness back, lift the black windows and unmute the PC; returns `{"resting": false}`. Not resting changes nothing. `409 unrestored` names the monitors whose brightness could not be put back (disconnected, refusing DDC/CI, or reading another value once it is set): their values stay saved and the next wake tries again |
+| `POST /power/wake` | put each monitor's brightness back, lift the black windows and unmute the PC; returns `{"resting": false}`. Not resting changes nothing. `409 unrestored` names the monitors whose brightness could not be put back (disconnected, or refusing DDC/CI or reading another value once it is set, 3 more tries 1, 2 and 4 seconds apart included): the PC is awake all the same, their values stay saved and the next wake tries again |
 
 - Each other monitor's brightness is read over DDC/CI, saved in `windows-link.db` and set
   to 0; a black window is laid over it. A monitor that does not answer DDC/CI keeps its
@@ -629,9 +629,11 @@ a DisplayPort one may drop out of Windows altogether.
   when resting again, rather than saving the 0 it was left at.
 - While resting, a restart of the server (such as an update) lays the black windows again.
   Started without the kept monitor, it wakes instead, as there is no panel to wake from.
-- Waking reads each brightness back after setting it. It can only see what the monitor
-  answers: on 2026-10-27 a JAPANNEXT answered its brightness and stayed black until its HDMI
-  cable was plugged in again.
+- Waking reads each brightness back after setting it, and sets it again after 1, 2 and 4
+  seconds while it does not take: on 2026-10-27 a JAPANNEXT did not answer right after being
+  set, and took its value 6 seconds later. The value is absolute, so sending it again does no
+  harm. It can only see what the monitor answers: the same day the JAPANNEXT had answered its
+  brightness and stayed black until its HDMI cable was plugged in again.
 - Each rest, wake and restart while resting is written to `windows-link.log`: the monitor
   kept, each monitor darkened with its saved brightness, the monitors covered, the values put
   back and the monitors that were not, and whether the PC is muted.

@@ -6,7 +6,10 @@
 //! muted while resting, unless it was muted already. Each rest, wake and restart while
 //! resting is logged, what went through as well as what did not.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::{
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use tracing::{info, warn};
 
@@ -58,6 +61,15 @@ fn names<'a>(monitors: impl IntoIterator<Item = &'a Monitor>) -> Vec<&'a str> {
     monitors.into_iter().map(|m| m.name.trim()).collect()
 }
 
+/// The waits before each new try of a brightness that did not take on waking: on
+/// 2026-10-27 a JAPANNEXT did not answer right after being set to its brightness, and
+/// took it when woken again 6 seconds later.
+const RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
 pub struct Rest {
     displays: Arc<dyn Displays>,
     screens: Arc<dyn Screens>,
@@ -65,6 +77,7 @@ pub struct Rest {
     store: RestStore,
     /// Resting and waking one at a time, so neither sees the other half done.
     busy: Mutex<()>,
+    retry_waits: Vec<Duration>,
 }
 
 impl Rest {
@@ -80,6 +93,7 @@ impl Rest {
             audio,
             store,
             busy: Mutex::new(()),
+            retry_waits: RETRY_WAITS.to_vec(),
         }
     }
 
@@ -194,9 +208,24 @@ impl Rest {
         }
     }
 
+    /// Put `value` back, trying again after each of the retry waits while it does not take.
+    /// The value is absolute, so sending it again to a monitor that took it changes nothing.
+    fn put_back(&self, monitor: &Monitor, value: u32) -> Result<(), String> {
+        for wait in &self.retry_waits {
+            match self.set_and_check(monitor, value) {
+                Ok(()) => return Ok(()),
+                Err(message) => {
+                    warn!(%message, ?wait, "the brightness did not take; trying again");
+                    std::thread::sleep(*wait);
+                }
+            }
+        }
+        self.set_and_check(monitor, value)
+    }
+
     /// Set `value` and read it back: a monitor may take the command over DDC/CI and keep
     /// its own brightness. A monitor that answers with the value may still stay dark.
-    fn put_back(&self, monitor: &Monitor, value: u32) -> Result<(), String> {
+    fn set_and_check(&self, monitor: &Monitor, value: u32) -> Result<(), String> {
         self.screens.set_brightness(monitor, value)?;
         let name = monitor.name.trim();
         match self.screens.brightness(monitor) {
@@ -230,9 +259,10 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
-    use super::{Rest, RestError, Screens, darkened, store::RestStore};
+    use super::{RETRY_WAITS, Rest, RestError, Screens, darkened, store::RestStore};
     use crate::{
         audio::{Audio, fake::FakeAudio},
         touch::{Displays, Monitor},
@@ -258,12 +288,14 @@ mod tests {
     }
 
     /// Monitors' brightness by id (`None`: no DDC/CI), the ids that refuse a new value,
-    /// the ids that accept one and keep their own, and the ids covered.
+    /// how many new values each id accepts and keeps its own for, the ids each value was
+    /// sent to, and the ids covered.
     #[derive(Default)]
     struct FakeScreens {
         brightness: Mutex<HashMap<String, Option<u32>>>,
         refuse: Mutex<Vec<String>>,
-        ignore: Mutex<Vec<String>>,
+        ignore: Mutex<HashMap<String, usize>>,
+        sent: Mutex<Vec<String>>,
         covered: Mutex<Vec<String>>,
     }
 
@@ -278,10 +310,12 @@ mod tests {
         }
 
         fn set_brightness(&self, monitor: &Monitor, value: u32) -> Result<(), String> {
+            self.sent.lock().unwrap().push(monitor.id.clone());
             if self.refuse.lock().unwrap().contains(&monitor.id) {
                 return Err(format!("{} refused", monitor.id));
             }
-            if self.ignore.lock().unwrap().contains(&monitor.id) {
+            if let Some(left @ 1..) = self.ignore.lock().unwrap().get_mut(&monitor.id) {
+                *left -= 1;
                 return Ok(());
             }
             let mut all = self.brightness.lock().unwrap();
@@ -307,6 +341,14 @@ mod tests {
         fn covered(&self) -> Vec<String> {
             self.covered.lock().unwrap().clone()
         }
+
+        /// How many values were sent to `id` since the last call.
+        fn sent_to(&self, id: &str) -> usize {
+            let mut sent = self.sent.lock().unwrap();
+            let count = sent.iter().filter(|s| *s == id).count();
+            sent.clear();
+            count
+        }
     }
 
     /// The panel (no DDC/CI, as the T10FA), a main monitor at 40, a side one at 70 and
@@ -324,12 +366,13 @@ mod tests {
             ("plain".into(), None),
         ]);
         let audio = Arc::new(FakeAudio::new(Vec::new(), None));
-        let rest = Rest::new(
+        let mut rest = Rest::new(
             displays.clone(),
             screens.clone(),
             audio.clone(),
             RestStore::in_memory().unwrap(),
         );
+        rest.retry_waits = vec![Duration::ZERO; RETRY_WAITS.len()];
         (rest, displays, screens, audio)
     }
 
@@ -442,12 +485,18 @@ mod tests {
     fn a_brightness_the_monitor_does_not_take_stays_saved_for_the_next_wake() {
         let (rest, _, screens, _) = setup();
         rest.rest("panel").unwrap();
-        // DDC/CI accepts the value, and the monitor reads 0 still.
-        screens.ignore.lock().unwrap().push("main".into());
+        // DDC/CI accepts the value, and the monitor reads 0 still, try after try.
+        screens
+            .ignore
+            .lock()
+            .unwrap()
+            .insert("main".into(), usize::MAX);
+        screens.sent_to("main");
         assert_eq!(
             rest.wake(),
             Err(RestError::Unrestored(vec!["main name".into()]))
         );
+        assert_eq!(screens.sent_to("main"), 4);
         assert_eq!(screens.level("main"), Some(0));
         assert_eq!(screens.level("side"), Some(70));
         assert!(screens.covered().is_empty());
@@ -457,6 +506,18 @@ mod tests {
         );
         screens.ignore.lock().unwrap().clear();
         rest.wake().unwrap();
+        assert_eq!(screens.level("main"), Some(40));
+        assert!(rest.store.brightness().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_brightness_that_takes_on_a_later_try_is_put_back() {
+        let (rest, _, screens, _) = setup();
+        rest.rest("panel").unwrap();
+        screens.ignore.lock().unwrap().insert("main".into(), 2);
+        screens.sent_to("main");
+        rest.wake().unwrap();
+        assert_eq!(screens.sent_to("main"), 3);
         assert_eq!(screens.level("main"), Some(40));
         assert!(rest.store.brightness().unwrap().is_empty());
     }
