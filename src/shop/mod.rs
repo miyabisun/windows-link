@@ -22,6 +22,7 @@ use crate::library::{
     Programs, Round, Start, StartError, Update, UpdateError,
 };
 
+pub mod cookies;
 pub mod download;
 
 /// Labels every shop's library has, like Steam's own.

@@ -55,6 +55,7 @@ pub struct AppState {
     pins: Arc<Pins>,
     /// FANZA's sign-in, and how to start a FANZA round at once, when a button needs it.
     fanza: Option<(Arc<crate::fanza::Client>, Arc<Notify>)>,
+    dlsite: Option<(Arc<crate::dlsite::session::DlsiteSession>, Arc<Notify>)>,
     /// The `automation.hold` buttons that are on.
     holds: Arc<Holds>,
     /// The `cursor.highlight` buttons that are on.
@@ -88,6 +89,7 @@ impl AppState {
             libraries: Arc::default(),
             pins: Arc::new(Pins::in_memory().expect("an in-memory database opens")),
             fanza: None,
+            dlsite: None,
             holds: Arc::new(Holds::in_memory(HOLDS).expect("an in-memory database opens")),
             highlights: Arc::new(
                 Holds::in_memory(HIGHLIGHTS).expect("an in-memory database opens"),
@@ -147,6 +149,18 @@ impl AppState {
     #[must_use]
     pub fn with_fanza(mut self, client: Arc<crate::fanza::Client>, wake: Arc<Notify>) -> Self {
         self.fanza = Some((client, wake));
+        self
+    }
+
+    /// Take DLsite's sign-in from the panel (`PUT /dlsite/session`) into `session`, then
+    /// wake the DLsite round through `wake`.
+    #[must_use]
+    pub fn with_dlsite(
+        mut self,
+        session: Arc<crate::dlsite::session::DlsiteSession>,
+        wake: Arc<Notify>,
+    ) -> Self {
+        self.dlsite = Some((session, wake));
         self
     }
 
@@ -385,6 +399,7 @@ pub fn app(state: AppState) -> Router {
             axum::routing::put(pin_item).delete(unpin_item),
         )
         .route("/fanza/session", axum::routing::put(fanza_session))
+        .route("/dlsite/session", axum::routing::put(dlsite_session))
         .route("/power/sleep", post(sleep))
         .route("/events", get(events))
         .layer(TraceLayer::new_for_http())
@@ -395,16 +410,17 @@ async fn healthz() -> &'static str {
     "ok\n"
 }
 
+/// A shop's cookies from the panel's login window.
 #[derive(serde::Deserialize)]
-struct FanzaSession {
-    cookies: Vec<crate::fanza::session::Cookie>,
+struct PanelSession {
+    cookies: Vec<crate::shop::cookies::Cookie>,
 }
 
 /// Keep the cookies of the panel's FANZA login window, then read the purchases and
 /// download what is missing at once.
 async fn fanza_session(
     State(state): State<AppState>,
-    Json(session): Json<FanzaSession>,
+    Json(session): Json<PanelSession>,
 ) -> Response {
     let Some((client, wake)) = state.fanza.clone() else {
         return error(
@@ -428,6 +444,51 @@ async fn fanza_session(
             &join.to_string(),
         ),
     }
+}
+
+/// Keep the cookies of the panel's DLsite login window once DLsite Play takes them,
+/// then read the purchases and download what is missing at once.
+async fn dlsite_session(
+    State(state): State<AppState>,
+    Json(panel): Json<PanelSession>,
+) -> Response {
+    use crate::dlsite::session::DlsiteError;
+
+    let Some((session, wake)) = state.dlsite.clone() else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no DLsite library is set up",
+        );
+    };
+    let kept = tokio::task::spawn_blocking(move || {
+        let kept = session.keep(panel.cookies).map_err(DlsiteError::Failed)?;
+        session.resume().map(|_| kept)
+    })
+    .await;
+    let response = match kept {
+        Ok(Ok(kept)) => {
+            info!(kept, "signed in to DLsite through the panel");
+            wake.notify_one();
+            Json(json!({ "kept": kept })).into_response()
+        }
+        Ok(Err(DlsiteError::SignIn)) => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_session",
+            "DLsite Play does not take the cookies",
+        ),
+        Ok(Err(DlsiteError::Failed(reason))) => {
+            error(StatusCode::BAD_REQUEST, "invalid_session", &reason)
+        }
+        Err(join) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &join.to_string(),
+        ),
+    };
+    // Either way, the button shows whether DLsite still needs a sign-in.
+    state.refresh().await;
+    response
 }
 
 async fn list_buttons(State(state): State<AppState>) -> Json<Vec<ButtonView>> {
@@ -1764,6 +1825,38 @@ buttons:
 
         // Without a FANZA library there is nothing to sign in to.
         let (status, _) = send(plain, "PUT", "/fanza/session", json!({ "cookies": [] })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_panels_dlsite_sign_in_needs_dlsites_cookies() {
+        use serde_json::json;
+
+        let file = std::env::temp_dir().join(format!(
+            "windows-link-dlsite-session-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file);
+        let session = Arc::new(crate::dlsite::session::DlsiteSession::open(file.clone()));
+        let (plain, _) = state();
+        let state = plain
+            .clone()
+            .with_dlsite(session.clone(), Arc::new(tokio::sync::Notify::new()));
+        // Only other sites' cookies: nothing to sign in with, and nothing is asked of DLsite.
+        let (status, body) = send(
+            state,
+            "PUT",
+            "/dlsite/session",
+            json!({ "cookies": [{ "name": "a", "value": "1", "domain": ".example.com" }] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_session");
+        assert!(!session.signed_in());
+        assert!(!file.exists());
+
+        // Without a DLsite library there is nothing to sign in to.
+        let (status, _) = send(plain, "PUT", "/dlsite/session", json!({ "cookies": [] })).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

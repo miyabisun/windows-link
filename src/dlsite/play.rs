@@ -1,31 +1,31 @@
-//! The user's DLsite purchases, through DLsite Play: sign in with the account in
-//! `secrets.yaml`, list the works bought with each work's name, maker, main picture,
-//! type and latest version, and download a work's files.
+//! The user's DLsite purchases, through DLsite Play with the session the panel signed in
+//! (`super::session`): list the works bought with each work's name, maker, main picture,
+//! type, latest version and purchase date, and download a work's files.
 //!
-//! The login follows dlsite-async (MIT, <https://github.com/bhrevol/dlsite-async>): the
-//! login form's `_token`, a form post, then DLsite Play's authorization. Downloads
-//! follow what dlsite-manager (MIT, <https://github.com/AcrylicShrimp/dlsite-manager>)
-//! found: DLsite Play's download link leads to the archive, or to a page listing the
-//! parts of a split one.
+//! DLsite Play's authorization follows dlsite-async (MIT,
+//! <https://github.com/bhrevol/dlsite-async>). Downloads follow what dlsite-manager (MIT,
+//! <https://github.com/AcrylicShrimp/dlsite-manager>) found: DLsite Play's download link
+//! leads to the archive, or to a page listing the parts of a split one.
 
 use std::{collections::HashMap, path::Path, time::Duration};
 
 use serde_json::Value;
+use ureq::ResponseExt;
 
 pub use crate::shop::Work;
-use crate::{secrets::DlsiteAccount, shop::download};
+use crate::shop::{cookies::PANEL_USER_AGENT, download};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const LIMIT: u64 = 32 * 1024 * 1024;
 /// How many works DLsite Play describes in one request (its `page_limit`).
 const WORKS_PER_REQUEST: usize = 50;
 
-/// HTTPS with a cookie jar, which carries the session from the login to DLsite Play.
-fn agent() -> ureq::Agent {
+/// HTTPS with a cookie jar, which carries the session across DLsite's sites.
+pub fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .https_only(true)
         .timeout_global(Some(TIMEOUT))
-        .user_agent(concat!("windows-link/", env!("CARGO_PKG_VERSION")))
+        .user_agent(PANEL_USER_AGENT)
         .build()
         .into()
 }
@@ -55,45 +55,36 @@ pub struct Session {
     agent: ureq::Agent,
 }
 
-/// Sign in with the account in `secrets.yaml`.
-pub fn sign_in(account: &DlsiteAccount) -> Result<Session, String> {
-    let agent = agent();
-    let page = text(
-        agent.get("https://login.dlsite.com/login?user=self").call(),
-        "DLsite's login page",
-    )?;
-    let token = login_token(&page).ok_or("DLsite's login page has no _token")?;
-    let answer = text(
-        agent.post("https://login.dlsite.com/login").send_form([
-            ("_token", token.as_str()),
-            ("login_id", account.login_id.as_str()),
-            ("password", account.password.as_str()),
-        ]),
-        "signing in to DLsite",
-    )?;
-    if !signed_in(&answer) {
-        return Err(
-            "DLsite did not accept the login ID and password in secrets.yaml (or asked for more, such as a CAPTCHA)"
-                .into(),
-        );
+impl Session {
+    /// A session on `agent`, whose cookie jar holds what signs in to DLsite.
+    pub fn new(agent: ureq::Agent) -> Self {
+        Self { agent }
     }
-    text(
-        agent.get("https://play.dlsite.com/login/").call(),
-        "DLsite Play",
-    )?;
-    text(
-        agent
-            .get("https://play.dlsite.com/api/authorize")
-            .header("Referer", "https://play.dlsite.com/")
-            .call(),
-        "DLsite Play's authorization",
-    )?;
-    Ok(Session { agent })
-}
 
-/// Sign in and list every purchased work.
-pub fn fetch_purchases(account: &DlsiteAccount) -> Result<Vec<Work>, String> {
-    sign_in(account)?.purchases()
+    pub fn cookie_jar(&self) -> ureq::CookieJar<'_> {
+        self.agent.cookie_jar_lock()
+    }
+
+    /// Whether DLsite Play knows the user (`/api/authorize`, which also renews its own
+    /// session from DLsite's).
+    pub fn authorized(&self) -> Result<bool, String> {
+        Ok(super::session::authorized(&json(
+            self.agent
+                .get("https://play.dlsite.com/api/authorize")
+                .header("Referer", "https://play.dlsite.com/")
+                .call(),
+            "DLsite Play's authorization",
+        )?))
+    }
+
+    /// Go through DLsite's login as DLsite Play does, which lets a visitor DLsite knows
+    /// through. False when it stops at a page, such as the login form.
+    pub fn enter(&self) -> bool {
+        self.agent
+            .get("https://play.dlsite.com/login/")
+            .call()
+            .is_ok_and(|response| response.get_uri().host() == Some("play.dlsite.com"))
+    }
 }
 
 /// A file of a work's download.
@@ -312,21 +303,6 @@ pub fn file_name(url: &str) -> Option<String> {
     plain.then(|| name.to_owned())
 }
 
-/// The `_token` hidden field of DLsite's login form.
-pub fn login_token(html: &str) -> Option<String> {
-    html.split('<')
-        .filter(|tag| tag.starts_with("input") && tag.contains(r#"name="_token""#))
-        .find_map(|tag| {
-            let value = tag.split(r#"value=""#).nth(1)?;
-            Some(value[..value.find('"')?].to_owned())
-        })
-}
-
-/// Whether DLsite's answer to the login form says the user is signed in.
-pub fn signed_in(html: &str) -> bool {
-    html.contains("ログイン中です")
-}
-
 /// The work IDs in `/api/v3/content/sales`, each with when it was bought (Unix
 /// seconds) when DLsite says.
 pub fn sales(answer: &Value) -> Vec<(String, Option<i64>)> {
@@ -403,27 +379,7 @@ pub fn public_images(answer: &Value) -> Vec<(String, String)> {
 mod tests {
     use serde_json::json;
 
-    use super::{
-        Work, file_name, license_keys, login_token, public_images, sales, signed_in, split_parts,
-        works,
-    };
-
-    #[test]
-    fn finds_the_login_forms_token() {
-        let html = r#"<form method="POST" action="https://login.dlsite.com/login">
-            <input type="hidden" name="_token" value="abc123XYZ">
-            <input name="login_id"></form>"#;
-        assert_eq!(login_token(html).as_deref(), Some("abc123XYZ"));
-        let reordered = r#"<input value="t0k" type="hidden" name="_token" />"#;
-        assert_eq!(login_token(reordered).as_deref(), Some("t0k"));
-        assert_eq!(login_token("<form></form>"), None);
-    }
-
-    #[test]
-    fn tells_a_signed_in_page() {
-        assert!(signed_in("<p>ログイン中です</p>"));
-        assert!(!signed_in("<p>ログインIDかパスワードが間違っています</p>"));
-    }
+    use super::{Work, file_name, license_keys, public_images, sales, split_parts, works};
 
     #[test]
     fn reads_sales_and_works() {

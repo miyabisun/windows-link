@@ -8,35 +8,36 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Mutex,
     time::SystemTime,
 };
 
 use crate::{
     library::{KeyError, LicenseKey},
-    secrets::DlsiteAccount,
     shop::{Known, Shop, ShopLibrary, Title, Work, folder_key},
 };
 
 pub mod nest;
 pub mod play;
+pub mod session;
 pub mod works;
+
+use session::DlsiteSession;
 
 /// Where DLsiteNest puts games.
 pub const DEFAULT_ROOT: &str = r"D:\DLsiteNest\Game";
 
-/// DLsite, signed in with the account in `secrets.yaml` that `refresh` was given.
-#[derive(Default)]
+/// DLsite, signed in through the panel.
 pub struct DlsiteShop {
-    account: Mutex<Option<DlsiteAccount>>,
+    session: std::sync::Arc<DlsiteSession>,
 }
 
 impl DlsiteShop {
-    fn account(&self) -> Option<DlsiteAccount> {
-        self.account
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    pub fn new(session: std::sync::Arc<DlsiteSession>) -> Self {
+        Self { session }
+    }
+
+    pub fn session(&self) -> &DlsiteSession {
+        &self.session
     }
 }
 
@@ -50,7 +51,7 @@ impl Shop for DlsiteShop {
     }
 
     fn ready(&self) -> bool {
-        self.account().is_some()
+        self.session.signed_in()
     }
 
     fn released(&self, version: &str) -> Option<SystemTime> {
@@ -63,8 +64,7 @@ impl Shop for DlsiteShop {
         staging: &Path,
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<Vec<PathBuf>, String> {
-        let account = self.account().ok_or("secrets.yaml has no DLsite account")?;
-        let session = play::sign_in(&account)?;
+        let session = self.session.resume().map_err(|err| err.to_string())?;
         let mut files = Vec::new();
         for page in session.parts(&work.id)? {
             let file = session.resolve(&page)?;
@@ -85,12 +85,15 @@ impl Shop for DlsiteShop {
 
     /// Read from DLsite each time, so the keys are kept nowhere on this PC.
     fn license_keys(&self, work: &str) -> Result<Vec<LicenseKey>, KeyError> {
-        let account = self
-            .account()
-            .ok_or_else(|| KeyError::Unavailable("secrets.yaml has no DLsite account".into()))?;
-        play::sign_in(&account)
+        self.session
+            .resume()
+            .map_err(|err| err.to_string())
             .and_then(|session| session.license_keys(work))
             .map_err(KeyError::Unavailable)
+    }
+
+    fn sign_in(&self) -> Option<&'static str> {
+        (!self.session.signed_in()).then_some("dlsite")
     }
 }
 
@@ -141,15 +144,11 @@ impl ShopLibrary<DlsiteShop> {
     }
 
     /// Find out again which DLsite work each game is: from what was recorded, from
-    /// DLsiteNest's records, and from the account's purchases when `secrets.yaml` has
-    /// one. Pictures of works known only through DLsiteNest come from DLsite's public
-    /// information. Failures are logged and leave what was known.
-    pub fn refresh(&self, account: Option<&DlsiteAccount>) {
-        *self
-            .shop()
-            .account
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = account.cloned();
+    /// DLsiteNest's records, and from the purchases while the panel's sign-in lasts.
+    /// Pictures of works known only through DLsiteNest come from DLsite's public
+    /// information. Failures are logged and leave what was known; a needed sign-in
+    /// shows on the panel.
+    pub fn refresh(&self) {
         self.begin_round();
         self.adopt_legacy_works();
         let Ok(games) = self.rescan() else {
@@ -157,19 +156,21 @@ impl ShopLibrary<DlsiteShop> {
         };
         let titles: Vec<Title> = games.into_iter().map(|(title, _)| title).collect();
         let nest = nest::read();
-        let purchases = match account.map(play::fetch_purchases) {
-            Some(Ok(works)) => {
+        let read = self
+            .shop()
+            .session
+            .resume()
+            .map_err(|err| err.to_string())
+            .and_then(|session| session.purchases());
+        let purchases = match read {
+            Ok(works) => {
                 tracing::info!(works = works.len(), "DLsite purchases read");
                 self.set_purchases(&works);
                 works
             }
-            Some(Err(reason)) => {
+            Err(reason) => {
                 tracing::warn!(%reason, "cannot read the DLsite purchases");
                 self.purchases_failed(&reason);
-                Vec::new()
-            }
-            None => {
-                self.purchases_failed("secrets.yaml has no DLsite account");
                 Vec::new()
             }
         };
@@ -344,7 +345,7 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
-    use super::{DlsiteLibrary, DlsiteShop};
+    use super::{DlsiteLibrary, DlsiteSession, DlsiteShop};
     use crate::library::{GameLibrary, Label, LabelError, StartError};
     use crate::shop::{ShopStore, Title, candidates, default_program, listing, title_id};
 
@@ -612,11 +613,18 @@ mod tests {
         root
     }
 
+    /// A shop not signed in, whose session would be kept beside `root`.
+    fn shop(root: &std::path::Path) -> DlsiteShop {
+        let file = root.with_extension("session.json");
+        let _ = std::fs::remove_file(&file);
+        DlsiteShop::new(std::sync::Arc::new(DlsiteSession::open(file)))
+    }
+
     fn library(root: &std::path::Path) -> DlsiteLibrary {
         DlsiteLibrary::new(
             root.to_path_buf(),
             std::sync::Arc::new(ShopStore::in_memory("dlsite").unwrap()),
-            DlsiteShop::default(),
+            shop(root),
         )
     }
 
@@ -629,17 +637,23 @@ mod tests {
         let root = games("update");
         let wake = std::sync::Arc::new(tokio::sync::Notify::new());
         let library = library(&root).with_wake(wake.clone());
-        // Without the account nothing can be downloaded.
-        assert!(matches!(
-            library.update(&[]),
-            Err(UpdateError::Unavailable(_))
-        ));
+        // Before the user signs in through the panel nothing can be downloaded, and the
+        // list says so.
+        assert_eq!(library.update(&[]), Err(UpdateError::SignIn));
+        assert_eq!(library.listing().sign_in.as_deref(), Some("dlsite"));
         assert!(wake.notified().now_or_never().is_none());
 
-        *library.shop().account.lock().unwrap() = Some(crate::secrets::DlsiteAccount {
-            login_id: "id".into(),
-            password: "password".into(),
-        });
+        let cookie = crate::shop::cookies::Cookie {
+            name: "__DLsite_SID".into(),
+            value: "v".into(),
+            domain: ".dlsite.com".into(),
+            path: "/".into(),
+            expires: None,
+            secure: true,
+            http_only: true,
+        };
+        library.shop().session().keep(vec![cookie]).unwrap();
+        assert_eq!(library.listing().sign_in, None);
         assert_eq!(library.update(&[]), Ok(Update::Round));
         assert!(wake.notified().now_or_never().is_some());
         let _ = std::fs::remove_dir_all(root);
@@ -1014,7 +1028,7 @@ mod tests {
         let root = games("dates");
         let store = std::sync::Arc::new(ShopStore::in_memory("dlsite").unwrap());
         let library = |store: &std::sync::Arc<ShopStore>| {
-            DlsiteLibrary::new(root.clone(), store.clone(), DlsiteShop::default())
+            DlsiteLibrary::new(root.clone(), store.clone(), shop(&root))
         };
         let first = library(&store);
         // "One" was downloaded at the version of 2024-03-01.
@@ -1137,15 +1151,15 @@ mod tests {
             ]
         );
 
-        // Without the account nothing is read or downloaded, and the round says why.
-        library.refresh(None);
+        // Before the user signs in nothing is read or downloaded, and the round says why.
+        library.refresh();
         library.download();
         let round = library.round().unwrap();
         assert_eq!(round.doing, None);
         assert!(round.finished.is_some());
         assert_eq!(
             round.purchases.as_deref(),
-            Some("secrets.yaml has no DLsite account")
+            Some("DLsite needs signing in again through the panel")
         );
         assert_eq!(round.jobs, []);
         let _ = std::fs::remove_dir_all(root);

@@ -2,78 +2,19 @@
 //! `%LOCALAPPDATA%\windows-link\fanza-session.json`. DMM replaces its login cookies as
 //! they are used, so every cookie it sets is taken in and saved at once.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
-/// A cookie as the panel hands it over (`PUT /fanza/session`) and as it is kept.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cookie {
-    pub name: String,
-    pub value: String,
-    /// The site it belongs to, sent to its subdomains too (`dmm.co.jp`).
-    pub domain: String,
-    #[serde(default = "root_path")]
-    pub path: String,
-    /// Unix time; `None` lasts until DMM replaces it.
-    #[serde(default)]
-    pub expires: Option<i64>,
-    #[serde(default)]
-    pub secure: bool,
-    #[serde(default)]
-    pub http_only: bool,
-}
-
-fn root_path() -> String {
-    "/".to_owned()
-}
-
-#[derive(Serialize, Deserialize)]
-struct Saved {
-    cookies: Vec<Cookie>,
-}
+pub use crate::shop::cookies::{Cookie, load, save, well_formed};
+use crate::shop::cookies::{on_site, root_path};
 
 pub fn default_path() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
     base.join("windows-link").join("fanza-session.json")
 }
 
-/// The saved cookies, none when there is no file.
-pub fn load(path: &Path) -> Vec<Cookie> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Saved>(&text).ok())
-        .map(|saved| saved.cookies)
-        .unwrap_or_default()
-}
-
-pub fn save(path: &Path, cookies: &[Cookie]) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let text = serde_json::to_string(&Saved {
-        cookies: cookies.to_vec(),
-    })
-    .map_err(|err| err.to_string())?;
-    std::fs::write(path, text).map_err(|err| format!("{}: {err}", path.display()))
-}
-
-/// Whether a cookie can go into a `Cookie` header as it is: a name of plain characters,
-/// and a value without `;`, spaces or control characters.
-pub fn well_formed(cookie: &Cookie) -> bool {
-    let plain = |c: char| !c.is_control() && !c.is_whitespace() && c != ';';
-    !cookie.name.is_empty()
-        && cookie
-            .name
-            .chars()
-            .all(|c| plain(c) && c != '=' && c != ',')
-        && cookie.value.chars().all(plain)
-}
-
 /// Whether a cookie's domain is DMM's (`dmm.co.jp` or below it).
 pub fn is_dmm(domain: &str) -> bool {
-    let bare = domain.trim_start_matches('.').to_ascii_lowercase();
-    bare == "dmm.co.jp" || bare.ends_with(".dmm.co.jp")
+    on_site(domain, "dmm.co.jp")
 }
 
 /// Whether the cookies sign in to DMM: a login cookie that has not expired.

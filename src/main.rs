@@ -21,7 +21,7 @@ use windows_link::{
         service::DiscordIcons,
         token,
     },
-    dlsite::{self, DlsiteLibrary, DlsiteShop},
+    dlsite::{self, DlsiteLibrary, DlsiteShop, session::DlsiteSession},
     fanza::{self, FanzaLibrary, FanzaShop},
     hold::{Colors, HIGHLIGHTS, HOLDS, Holds},
     launch::windows::WindowsLauncher,
@@ -170,6 +170,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(client) = libraries.fanza_client {
         state = state.with_fanza(client, libraries.fanza_wake.clone());
     }
+    if let Some(session) = libraries.dlsite_session {
+        state = state.with_dlsite(session, libraries.dlsite_wake.clone());
+    }
     tokio::spawn(state.clone().run_refresher(changes));
     if !libraries.dlsite.is_empty() {
         tokio::spawn(refresh_dlsite(
@@ -280,11 +283,12 @@ fn discord(config: &config::Config, changes: Arc<Notify>) -> Arc<dyn Discord> {
 }
 
 /// Library buttons by ID with their libraries, the shops' libraries among them, and
-/// FANZA's sign-in when a button needs it.
+/// the shops' sign-ins when a button needs them.
 struct Libraries {
     buttons: Vec<(String, Arc<dyn GameLibrary>)>,
     dlsite: Vec<Arc<DlsiteLibrary>>,
     fanza: Vec<Arc<FanzaLibrary>>,
+    dlsite_session: Option<Arc<DlsiteSession>>,
     fanza_client: Option<Arc<fanza::Client>>,
     /// Wake each shop's round of downloads before its time (a library update, a sign-in).
     dlsite_wake: Arc<Notify>,
@@ -295,24 +299,18 @@ struct Libraries {
 const SHOP_REFRESH: std::time::Duration = std::time::Duration::from_hours(6);
 
 /// Identify the DLsite games now and every `SHOP_REFRESH`, or at once when `wake` is
-/// notified (a library update), with the account in `secrets.yaml` when there is one,
-/// let the pictures be read again, then download the games bought but not there yet and
-/// the updates (the next round waits for them).
+/// notified (the user signed in through the panel, a library update), with the
+/// purchases while the sign-in lasts, let the pictures be read again, then download the
+/// games bought but not there yet and the updates (the next round waits for them).
 async fn refresh_dlsite(libraries: Vec<Arc<DlsiteLibrary>>, state: AppState, wake: Arc<Notify>) {
-    let account = match secrets::load(&secrets::default_path()) {
-        Ok(secrets) => secrets.dlsite,
-        Err(reason) => {
-            error!(%reason, "DLsite games are identified without the account");
-            None
-        }
-    };
     loop {
         for library in &libraries {
             let library = Arc::clone(library);
-            let account = account.clone();
-            let _ = tokio::task::spawn_blocking(move || library.refresh(account.as_ref())).await;
+            let _ = tokio::task::spawn_blocking(move || library.refresh()).await;
         }
         state.forget_pictures();
+        // A sign-in that ended shows on the button now.
+        state.refresh().await;
         for library in &libraries {
             let library = Arc::clone(library);
             let _ = tokio::task::spawn_blocking(move || library.download()).await;
@@ -355,6 +353,7 @@ fn libraries(
 ) -> Result<Libraries, Box<dyn std::error::Error>> {
     let mut steam: Option<Arc<dyn GameLibrary>> = None;
     let mut dlsite_store = None;
+    let mut dlsite_session: Option<Arc<DlsiteSession>> = None;
     let mut dlsite = Vec::new();
     let mut fanza_store = None;
     let mut fanza_client: Option<Arc<fanza::Client>> = None;
@@ -376,8 +375,11 @@ fn libraries(
                 let root = root
                     .clone()
                     .unwrap_or_else(|| std::path::PathBuf::from(dlsite::DEFAULT_ROOT));
+                let session = Arc::clone(dlsite_session.get_or_insert_with(|| {
+                    Arc::new(DlsiteSession::open(dlsite::session::default_path()))
+                }));
                 let library = Arc::new(
-                    DlsiteLibrary::new(root, store, DlsiteShop::default())
+                    DlsiteLibrary::new(root, store, DlsiteShop::new(session))
                         .with_wake(Arc::clone(&dlsite_wake)),
                 );
                 dlsite.push(Arc::clone(&library));
@@ -412,6 +414,7 @@ fn libraries(
         buttons: out,
         dlsite,
         fanza,
+        dlsite_session,
         fanza_client,
         dlsite_wake,
         fanza_wake,

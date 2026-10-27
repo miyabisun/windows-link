@@ -17,7 +17,7 @@ Each button does one thing:
 | `app.launch` | opens a program, shortcut, URL or Store app, or brings it to the front while it runs | whether it runs |
 | `steam.game` | starts a Steam game, or closes it while it runs | whether it runs |
 | `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
-| `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
+| `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, whether pictures are store art (`cover`) or shown whole (`whole`), and `sign_in: "dlsite"` while DLsite needs signing in through the panel |
 | `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
 
 A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`), and `"pages": true` for DLsite, whose games have pages in the shop (`POST …/page`; the listing gives each game's `page`).
@@ -68,7 +68,7 @@ The server reads these environment variables:
 | `LOG_LEVEL` | `info` | `off`, `error`, `warn`, `info`, `debug` or `trace` |
 | `WINDOWS_LINK_CONFIG` | `%LOCALAPPDATA%\windows-link\config.yaml` | configuration file |
 | `WINDOWS_LINK_UPDATE_URL` | `https://github.com/miyabisun/windows-link` | the repository [updates](#updates) come from (its web address, not the API) |
-| `WINDOWS_LINK_SECRETS` | `%LOCALAPPDATA%\windows-link\secrets.yaml` | credentials for outside services ([Discord](#discord), [Steam](#steam-library), [DLsite](#dlsite-library)) |
+| `WINDOWS_LINK_SECRETS` | `%LOCALAPPDATA%\windows-link\secrets.yaml` | credentials for outside services ([Discord](#discord), [Steam](#steam-library)) |
 
 The release build has no console window. When it is started without a terminal (for
 example at logon), logs go to `%LOCALAPPDATA%\windows-link\windows-link.log`.
@@ -340,9 +340,9 @@ The answer counts both: `{"updates": 3, "installs": 24}`.
 
 A `dlsite.library` button gives a panel the DLsite games in the folders DLsiteNest makes,
 `<maker>\<title>` under `D:\DLsiteNest\Game`, leaving out the `<title>.bak` copies
-DLsiteNest keeps of updated games; DLsiteNest itself is not needed. With a DLsite account,
-windows-link also downloads the games bought but not there yet and keeps every game up to
-date ([Downloads and updates](#downloads-and-updates)). For
+DLsiteNest keeps of updated games; DLsiteNest itself is not needed. Once you sign in to
+DLsite through the panel, windows-link also downloads the games bought but not there yet
+and keeps every game up to date ([Downloads and updates](#downloads-and-updates)). For
 example in `desktops/アダルト.yaml`:
 
 ```yaml
@@ -369,7 +369,7 @@ panel to sort by. A game known by its `RJ…` work ID has its DLsite page as `pa
 state says `"pictures": "whole"`, as both are shown whole.
 
 Some games ask for a license key (serial number) when they first start. `GET …/keys` reads it
-from DLsite each time it is asked (with the account in `secrets.yaml`), so the keys are kept
+from DLsite each time it is asked (while the panel's sign-in lasts), so the keys are kept
 nowhere on this PC and never logged; the panel shows them with a copy button.
 
 - **Programs**: the `.exe` files in the game's folder, or else in the folders right below
@@ -389,24 +389,25 @@ nowhere on this PC and never logged; the panel shows them with a copy button.
   folder, found in this order:
   1. the folder's row in `dlsite_games` (a row added by hand names a work it cannot find);
   2. DLsiteNest's own records (`%APPDATA%\DLsiteNest`), which name each work's folder;
-  3. when `secrets.yaml` has a DLsite account, the purchase with the same title (the only
+  3. while signed in to DLsite, the purchase with the same title (the only
      one, or the one by the same maker), first as written and then without sale text such
      as `【30%OFF!!】` or `✅…特典✅`;
   4. the maker's only purchase left, when the game is the maker's only one left.
 
   Pictures come from the purchases, or from DLsite's public product information for works
-  known only through DLsiteNest. The account is also what downloading and updating games
-  uses. Put it in `secrets.yaml` (a login ID and password; signing in through Google
-  or other services is not supported) and restart windows-link:
-
-  ```yaml
-  dlsite:
-    login_id: you@example.com
-    password: your-password
-  ```
-
-  The log says how many purchases were read and games identified, which are not, or why
-  signing in failed (such as DLsite asking for a CAPTCHA, which windows-link does not answer).
+  known only through DLsiteNest. The log says how many purchases were read and games
+  identified, which are not, or why the purchases could not be read.
+- **Signing in**: DLsite's login page checks for bots (a Cloudflare check since
+  2026-10-18), so windows-link never signs in with a password; a `dlsite:` section left in
+  `secrets.yaml` is not read. While it has no sign-in, or DLsite no longer takes it, the
+  button's state and the listing say `sign_in: "dlsite"`, and the panel offers a login
+  window where you sign in yourself. The panel hands that window's DLsite cookies to
+  windows-link (`PUT /dlsite/session`), which keeps them in
+  `%LOCALAPPDATA%\windows-link\dlsite-session.json` once DLsite Play takes them. Each use
+  checks DLsite Play's authorization first; when it has lapsed, windows-link goes through
+  DLsite's login once, as DLsite Play does, and saves the cookies DLsite changed. When that
+  stops at the login page, the panel asks you to sign in again. The window is a private one
+  of its own, so a browser's sign-in is neither touched nor read.
 
 ### Downloads and updates
 
@@ -440,7 +441,7 @@ up; the panel's list and the log show how it goes.
 - **How a round goes**: `GET /buttons/{id}/library/update` answers for the round under way,
   else the last one: `doing` (`purchases` while reading them, `downloads`, `null` between
   rounds), `started` and `finished` (Unix seconds), `purchases` (why they could not be
-  read, such as `secrets.yaml has no DLsite account`), and `jobs`, the games it downloads
+  read, such as `DLsite needs signing in again through the panel`), and `jobs`, the games it downloads
   or updates in order, each `{id, name, status}` with `status` as in the list, or `完了`
   once done. FANZA's rounds answer the same way.
 
@@ -527,7 +528,7 @@ Discord's CDN.
 | `POST /buttons/{id}/wheel` | `{"x": …, "y": …, "notches": …}`: turn the [mouse board](#mouse-board)'s wheel over an `app.launch` button's running `process` (`x`, `y` are fractions of its window, `notches` 1–20 either way, negative scrolls down); `204`. `409 user_operating` while an `automation.hold` button is on, `409 not_scrollable` for other buttons, `400 invalid_wheel`, `409 no_mouse`, `409 no_window`, `409 covered` (another window is over that point), `500 mouse` |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, or a redirect to it on the web, when `icon` is true |
 | `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, status, updated, bought, page, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null, "sign_in": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `status` how its download goes; `updated` and `bought` when its latest version came out and when it was bought, in Unix seconds, when the shop says; `page` its page in the shop; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now, `sign_in` the shop to sign in to through the panel) |
-| `POST /buttons/{id}/library/update` | bring a library button's games up to date, leaving out its `hide` labels: Steam updates its games and shows its install screen for those not installed, answering `{"updates": n, "installs": n}` ([Updating the library](#updating-the-library)); DLsite and FANZA start their round of downloads and updates now, or right after the one under way (`202 {"round": true}`; the listing shows how each game goes). `409 sign_in` while FANZA needs signing in, `409 update_unavailable` with the reason (Steam not running or not accepting remote control, no DLsite account) |
+| `POST /buttons/{id}/library/update` | bring a library button's games up to date, leaving out its `hide` labels: Steam updates its games and shows its install screen for those not installed, answering `{"updates": n, "installs": n}` ([Updating the library](#updating-the-library)); DLsite and FANZA start their round of downloads and updates now, or right after the one under way (`202 {"round": true}`; the listing shows how each game goes). `409 sign_in` while DLsite or FANZA needs signing in, `409 update_unavailable` with the reason (Steam not running or not accepting remote control) |
 | `GET /buttons/{id}/library/update` | how a DLsite or FANZA library's round of downloads and updates goes: `{"doing": "downloads", "started": …, "finished": null, "purchases": null, "jobs": [{id, name, status}]}` ([Downloads and updates](#downloads-and-updates)); `404 no_rounds` for Steam's |
 | `POST /buttons/{id}/library/{item}/start` | start a game, or bring it to the front when it runs (`204`) |
 | `GET /buttons/{id}/library/{item}/image` | the game's picture (JPEG), or a redirect to it on the web |
@@ -548,6 +549,7 @@ Discord's CDN.
 | `POST /desktops/{id}/switch` | switch to a virtual desktop; returns the new `GET /desktops` body |
 | `POST /windows/{hwnd}/pin` | show a window on every virtual desktop (`hwnd` in decimal or `0x` hex) |
 | `GET /touch-monitors`, `PUT /touch-monitors/{id}` | see [Touch and the mouse cursor](#touch-and-the-mouse-cursor) |
+| `PUT /dlsite/session` | `{"cookies": [{name, value, domain, path, expires, secure, http_only}]}` from the panel's DLsite login window: keep DLsite's cookies once DLsite Play takes them, and read the purchases at once; returns `{"kept": n}` (`400 invalid_session` when there are none or DLsite Play does not take them, `404` without a DLsite library) |
 | `PUT /fanza/session` | `{"cookies": [{name, value, domain, path, expires, secure, http_only}]}` from the panel's FANZA login window: keep DMM's cookies and read the purchases at once; returns `{"kept": n}` (`400 invalid_session` without a login cookie, `404` without a FANZA library) |
 | `POST /power/sleep` | put the PC to sleep (answers `202` first) |
 | `GET /power`, `POST /power/rest`, `POST /power/wake` | see [Resting](#resting) |

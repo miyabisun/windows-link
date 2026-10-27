@@ -21,8 +21,6 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const LIMIT: u64 = 32 * 1024 * 1024;
 /// The redirects one request may take (DMM's sign-in takes three).
 const HOPS: usize = 10;
-/// As the panel's login window (Edge's `WebView2`) says, so DMM sees the same browser.
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FanzaError {
@@ -86,7 +84,7 @@ impl Client {
                 .timeout_global(Some(TIMEOUT))
                 .max_redirects(0)
                 .http_status_as_error(false)
-                .user_agent(USER_AGENT)
+                .user_agent(crate::shop::cookies::PANEL_USER_AGENT)
                 .build()
                 .into(),
         }
