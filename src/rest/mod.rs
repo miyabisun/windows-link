@@ -3,11 +3,12 @@
 //! the panel wakes them. Nothing is unplugged, unlike sleep: waking from sleep re-plugs
 //! the USB hubs, the panel's monitor and their devices, and turning a monitor's power
 //! off over DDC/CI re-plugs its built-in hub (both observed on 2026-10-26). The PC is
-//! muted while resting, unless it was muted already.
+//! muted while resting, unless it was muted already. Each rest, wake and restart while
+//! resting is logged, what went through as well as what did not.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     audio::Audio,
@@ -53,6 +54,10 @@ pub fn darkened(monitors: &[Monitor], keep: &str) -> Option<Vec<Monitor>> {
         .then(|| monitors.iter().filter(|m| m.id != keep).cloned().collect())
 }
 
+fn names<'a>(monitors: impl IntoIterator<Item = &'a Monitor>) -> Vec<&'a str> {
+    monitors.into_iter().map(|m| m.name.trim()).collect()
+}
+
 pub struct Rest {
     displays: Arc<dyn Displays>,
     screens: Arc<dyn Screens>,
@@ -92,7 +97,8 @@ impl Rest {
         if self.resting()? {
             return Ok(());
         }
-        let others = darkened(&self.monitors()?, keep).ok_or(RestError::UnknownMonitor)?;
+        let monitors = self.monitors()?;
+        let others = darkened(&monitors, keep).ok_or(RestError::UnknownMonitor)?;
         // A value still saved from a wake that could not put it back is the monitor's
         // own; reading now would save the 0 it was left at.
         let mut saved = self.store.brightness()?;
@@ -110,7 +116,19 @@ impl Rest {
             }
         }
         self.screens.cover(&others);
-        self.mute()
+        self.mute()?;
+        let darkened: Vec<String> = others
+            .iter()
+            .filter_map(|m| Some(format!("{}={}", m.name.trim(), saved.get(&m.id)?)))
+            .collect();
+        info!(
+            keep = monitors.iter().find(|m| m.id == keep).map_or(keep, |m| m.name.trim()),
+            ?darkened,
+            covered = ?names(&others),
+            muted = self.store.muted()?,
+            "resting"
+        );
+        Ok(())
     }
 
     /// Mute the PC unless it is muted already, remembering to unmute it on waking.
@@ -142,11 +160,15 @@ impl Rest {
         } else {
             self.monitors()?
         };
+        let mut restored = Vec::new();
         let mut unrestored = Vec::new();
         for (id, value) in &saved {
             let monitor = monitors.iter().find(|m| &m.id == id);
-            match monitor.map(|m| self.screens.set_brightness(m, *value)) {
-                Some(Ok(())) => self.store.forget(id)?,
+            match monitor.map(|m| self.put_back(m, *value)) {
+                Some(Ok(())) => {
+                    self.store.forget(id)?;
+                    restored.extend(monitor.map(|m| format!("{}={value}", m.name.trim())));
+                }
                 Some(Err(message)) => {
                     warn!(monitor = %id, %message, "cannot put the brightness back");
                     unrestored.push(monitor.map_or(id.as_str(), |m| m.name.trim()).to_owned());
@@ -162,11 +184,25 @@ impl Rest {
             }
         }
         self.store.stop()?;
+        restored.sort();
+        unrestored.sort();
+        info!(?restored, ?unrestored, muted = self.store.muted()?, "woke");
         if unrestored.is_empty() {
             Ok(())
         } else {
-            unrestored.sort();
             Err(RestError::Unrestored(unrestored))
+        }
+    }
+
+    /// Set `value` and read it back: a monitor may take the command over DDC/CI and keep
+    /// its own brightness. A monitor that answers with the value may still stay dark.
+    fn put_back(&self, monitor: &Monitor, value: u32) -> Result<(), String> {
+        self.screens.set_brightness(monitor, value)?;
+        let name = monitor.name.trim();
+        match self.screens.brightness(monitor) {
+            Some(read) if read == value => Ok(()),
+            Some(read) => Err(format!("{name} reads {read} after being set to {value}")),
+            None => Err(format!("{name} does not answer after being set to {value}")),
         }
     }
 
@@ -181,6 +217,7 @@ impl Rest {
         match darkened(&self.monitors()?, &keep) {
             Some(others) => {
                 self.screens.cover(&others);
+                info!(covered = ?names(&others), "covered the monitors again after a restart");
                 Ok(())
             }
             None => self.wake_now(),
@@ -221,11 +258,12 @@ mod tests {
     }
 
     /// Monitors' brightness by id (`None`: no DDC/CI), the ids that refuse a new value,
-    /// and the ids covered.
+    /// the ids that accept one and keep their own, and the ids covered.
     #[derive(Default)]
     struct FakeScreens {
         brightness: Mutex<HashMap<String, Option<u32>>>,
         refuse: Mutex<Vec<String>>,
+        ignore: Mutex<Vec<String>>,
         covered: Mutex<Vec<String>>,
     }
 
@@ -242,6 +280,9 @@ mod tests {
         fn set_brightness(&self, monitor: &Monitor, value: u32) -> Result<(), String> {
             if self.refuse.lock().unwrap().contains(&monitor.id) {
                 return Err(format!("{} refused", monitor.id));
+            }
+            if self.ignore.lock().unwrap().contains(&monitor.id) {
+                return Ok(());
             }
             let mut all = self.brightness.lock().unwrap();
             match all.get_mut(&monitor.id) {
@@ -394,6 +435,29 @@ mod tests {
         rest.wake().unwrap();
         assert_eq!(screens.level("main"), Some(40));
         assert_eq!(screens.level("side"), Some(70));
+        assert!(rest.store.brightness().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_brightness_the_monitor_does_not_take_stays_saved_for_the_next_wake() {
+        let (rest, _, screens, _) = setup();
+        rest.rest("panel").unwrap();
+        // DDC/CI accepts the value, and the monitor reads 0 still.
+        screens.ignore.lock().unwrap().push("main".into());
+        assert_eq!(
+            rest.wake(),
+            Err(RestError::Unrestored(vec!["main name".into()]))
+        );
+        assert_eq!(screens.level("main"), Some(0));
+        assert_eq!(screens.level("side"), Some(70));
+        assert!(screens.covered().is_empty());
+        assert_eq!(
+            rest.store.brightness().unwrap(),
+            HashMap::from([("main".into(), 40)])
+        );
+        screens.ignore.lock().unwrap().clear();
+        rest.wake().unwrap();
+        assert_eq!(screens.level("main"), Some(40));
         assert!(rest.store.brightness().unwrap().is_empty());
     }
 
