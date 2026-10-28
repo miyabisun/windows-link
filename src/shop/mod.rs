@@ -660,6 +660,8 @@ fn program_path(folder: &Path, program: &str) -> PathBuf {
 const WAITING: &str = "ダウンロード待ち";
 /// A game this round downloaded or updated.
 const DONE: &str = "完了";
+/// Left beside a download whose archive did not unpack, saying why.
+const UNPACK_FAILED: &str = "unpack-failed.txt";
 
 /// The work a game folder is, with its main picture when known.
 #[derive(Clone, Debug, PartialEq)]
@@ -1066,12 +1068,24 @@ impl<S: Shop> ShopLibrary<S> {
         let first = files
             .first()
             .ok_or_else(|| format!("{} gave no files", self.shop.name()))?;
-        let placed = download::unpack(first, &out).and_then(|()| {
+        if let Err(reason) = download::unpack(first, &out) {
+            // An archive that fails a second time is damaged (cut off by a full or
+            // failing disk) and would go on failing: the next try fetches it afresh. Once
+            // is kept, for a failure that passes (a disk full while unpacking).
+            let failed_before = staging.join(UNPACK_FAILED);
+            if failed_before.exists() {
+                let _ = std::fs::remove_dir_all(&staging);
+            } else {
+                let _ = std::fs::write(&failed_before, &reason);
+            }
+            return Err(reason);
+        }
+        let placed = (|| -> Result<PathBuf, String> {
             let target = folder.map_or_else(|| self.new_folder(work), Path::to_path_buf);
             download::place(&download::content_root(&out, &target), &target)
                 .map_err(|err| format!("{}: {err}", target.display()))?;
             Ok(target)
-        });
+        })();
         match placed {
             Ok(target) => {
                 self.store

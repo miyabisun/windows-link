@@ -428,16 +428,19 @@ up; the panel's list and the log show how it goes.
   after the work; that folder is left out. The download waits in `<root>\.windows-link\<ID>`
   (not listed) until it is unpacked and in place, so a stopped download goes on next time.
   ZIPs are unpacked with Windows' own `tar.exe` (names without the UTF-8 mark read as
-  UTF-8, as DLsite writes them, else as CP932); RARs, which DLsite uses for works split
-  into parts, with UnRAR.
+  UTF-8, as DLsite writes them, else as CP932); a ZIP mixing both, which `tar.exe` cannot
+  read either way, is unpacked by windows-link itself, each name read on its own. RARs,
+  which DLsite uses for works split into parts, with UnRAR.
 - **Updates**: a game's version is DLsite's `upgrade_date` (else its release date), kept in
   `dlsite_games.version`. A folder windows-link filled is updated when DLsite has a newer
   version; a folder DLsiteNest filled is taken as current when it changed after the latest
   version came out, and updated otherwise. An update is laid over the folder: new files
   are added, files are replaced except saves (anything under a folder or named with
   `save` in it), and files the update lacks stay.
-- **Failures** (DLsite refusing, a full disk, an archive that does not unpack) are logged,
-  shown as the game's `status`, and tried again in the next round.
+- **Failures** (DLsite refusing, a full or failing disk, an archive that does not unpack) are
+  logged, shown as the game's `status`, and tried again in the next round. An archive that
+  does not unpack twice in a row is dropped, so the next try fetches it afresh rather than
+  going on from a damaged file.
 - **How a round goes**: `GET /buttons/{id}/library/update` answers for the round under way,
   else the last one: `doing` (`purchases` while reading them, `downloads`, `null` between
   rounds), `started` and `finished` (Unix seconds), `purchases` (why they could not be

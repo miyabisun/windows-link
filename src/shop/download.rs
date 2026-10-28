@@ -179,7 +179,8 @@ fn is_rar(first: &Path) -> bool {
 /// else (a ZIP, also a self-extracting one) goes through Windows' own `tar.exe`
 /// (libarchive), without a console window. Names in a ZIP without the UTF-8 mark are
 /// read as UTF-8 (DLsite's own archives write them so), else as CP932 (older Japanese
-/// archives). (`tar.exe` reads only the first part of a split RAR and says nothing.)
+/// archives); a ZIP mixing both, which `tar.exe` cannot read either way, is unpacked
+/// here (`unpack_zip`). (`tar.exe` reads only the first part of a split RAR and says nothing.)
 pub fn unpack(first: &Path, out: &Path) -> Result<(), String> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::fs::create_dir_all(out).map_err(|err| format!("{}: {err}", out.display()))?;
@@ -209,10 +210,79 @@ pub fn unpack(first: &Path, out: &Path) -> Result<(), String> {
             .trim()
             .clone_into(&mut said);
         if !said.contains("cannot be converted") {
-            break;
+            return Err(format!("cannot unpack {}: {said}", first.display()));
         }
     }
-    Err(format!("cannot unpack {}: {said}", first.display()))
+    // Names that fail both ways are mixed: read each on its own here.
+    let _ = std::fs::remove_dir_all(out);
+    std::fs::create_dir_all(out).map_err(|err| format!("{}: {err}", out.display()))?;
+    unpack_zip(first, out)
+}
+
+/// A ZIP entry's name: UTF-8 when it reads as such (as the UTF-8 mark says, or as
+/// DLsite writes unmarked names), else CP932 (older Japanese archives); `None` when it
+/// is neither.
+pub fn zip_name(raw: &[u8]) -> Option<String> {
+    use windows::Win32::Globalization::{MB_ERR_INVALID_CHARS, MultiByteToWideChar};
+    const CP932: u32 = 932;
+    if let Ok(name) = std::str::from_utf8(raw) {
+        return Some(name.to_owned());
+    }
+    // SAFETY: both buffers are slices the calls only read from or write into.
+    let size = unsafe { MultiByteToWideChar(CP932, MB_ERR_INVALID_CHARS, raw, None) };
+    let mut wide = vec![0; usize::try_from(size).ok().filter(|&n| n > 0)?];
+    // SAFETY: as above.
+    let size = unsafe { MultiByteToWideChar(CP932, MB_ERR_INVALID_CHARS, raw, Some(&mut wide)) };
+    String::from_utf16(wide.get(..usize::try_from(size).ok()?)?).ok()
+}
+
+/// Where an entry named `name` goes under `out`: `None` for the folder itself, an error
+/// for a name that would leave it (`..`, also as Windows reads `.. ` or `...`, which
+/// drops trailing dots and spaces; a drive).
+fn entry_path(out: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+    let mut path = out.to_path_buf();
+    let mut inside = false;
+    for part in name.split(['/', '\\']) {
+        let dots = part.trim_end_matches(['.', ' ']).is_empty();
+        match part {
+            "" | "." => {}
+            _ if dots || part.contains(':') => return Err(format!("{name} leaves the folder")),
+            _ => {
+                path.push(part);
+                inside = true;
+            }
+        }
+    }
+    Ok(inside.then_some(path))
+}
+
+/// Unpack a ZIP here, reading each name on its own and writing it as Unicode: `tar.exe`
+/// reads every name of an archive one way, so an archive mixing UTF-8 and CP932 names
+/// (DLsite's RJ01175290, 2026-10-28) fails both ways.
+fn unpack_zip(first: &Path, out: &Path) -> Result<(), String> {
+    let failed = |err: &dyn std::fmt::Display| format!("cannot unpack {}: {err}", first.display());
+    let file = std::fs::File::open(first).map_err(|err| failed(&err))?;
+    let mut archive =
+        zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(|err| failed(&err))?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|err| failed(&err))?;
+        let raw = entry.name_raw().to_vec();
+        let name = zip_name(&raw)
+            .ok_or_else(|| failed(&format!("a name in neither UTF-8 nor CP932: {raw:?}")))?;
+        let Some(path) = entry_path(out, &name).map_err(|err| failed(&err))? else {
+            continue;
+        };
+        let written = if entry.is_dir() {
+            std::fs::create_dir_all(&path)
+        } else {
+            path.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::File::create(&path))
+                .and_then(|mut file| std::io::copy(&mut entry, &mut file).map(|_| ()))
+        };
+        written.map_err(|err| failed(&format!("{}: {err}", path.display())))?;
+    }
+    Ok(())
 }
 
 /// Unpack a RAR, going through all its parts. `UnRAR` finds the next parts from the
@@ -339,7 +409,139 @@ pub fn fetch(
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{content_root, content_total, folder_name, has_rar_mark, is_save, place};
+    use super::{
+        content_root, content_total, entry_path, folder_name, has_rar_mark, is_save, place,
+        unpack_zip, zip_name,
+    };
+
+    /// A ZIP of stored (uncompressed) files whose names are the bytes given, without the
+    /// UTF-8 mark, as Japanese archivers write them.
+    fn stored_zip(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for &byte in data {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 0 {
+                        crc >> 1
+                    } else {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    };
+                }
+            }
+            !crc
+        }
+        let n16 = |n: usize| u16::try_from(n).unwrap().to_le_bytes();
+        let n32 = |n: usize| u32::try_from(n).unwrap().to_le_bytes();
+        let (mut zip, mut central) = (Vec::new(), Vec::new());
+        for (name, data) in entries {
+            let offset = zip.len();
+            let crc = crc32(data).to_le_bytes();
+            zip.extend(0x0403_4b50_u32.to_le_bytes());
+            // Version 2.0, no flags, stored, no time.
+            zip.extend([20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            zip.extend(crc);
+            zip.extend(n32(data.len()));
+            zip.extend(n32(data.len()));
+            zip.extend(n16(name.len()));
+            zip.extend([0, 0]);
+            zip.extend(*name);
+            zip.extend(*data);
+            central.extend(0x0201_4b50_u32.to_le_bytes());
+            central.extend([20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            central.extend(crc);
+            central.extend(n32(data.len()));
+            central.extend(n32(data.len()));
+            central.extend(n16(name.len()));
+            // No extra field or comment, disk 0, no attributes.
+            central.extend([0; 12]);
+            central.extend(n32(offset));
+            central.extend(*name);
+        }
+        let start = zip.len();
+        zip.extend(&central);
+        zip.extend(0x0605_4b50_u32.to_le_bytes());
+        zip.extend([0, 0, 0, 0]);
+        zip.extend(n16(entries.len()));
+        zip.extend(n16(entries.len()));
+        zip.extend(n32(central.len()));
+        zip.extend(n32(start));
+        zip.extend([0, 0]);
+        zip
+    }
+
+    #[test]
+    fn zip_names_read_as_utf8_else_as_cp932() {
+        assert_eq!(
+            zip_name("遊び♡/a.txt".as_bytes()).as_deref(),
+            Some("遊び♡/a.txt")
+        );
+        // ゲーム in CP932.
+        assert_eq!(
+            zip_name(&[0x83, 0x51, 0x81, 0x5B, 0x83, 0x80]).as_deref(),
+            Some("ゲーム")
+        );
+        assert_eq!(zip_name(&[0x83, 0xFF]), None);
+    }
+
+    #[test]
+    fn an_entry_stays_inside_the_folder() {
+        let out = Path::new(r"C:\out");
+        assert_eq!(
+            entry_path(out, "Game/data\\a.txt"),
+            Ok(Some(PathBuf::from(r"C:\out\Game\data\a.txt")))
+        );
+        assert_eq!(entry_path(out, "./"), Ok(None));
+        assert!(entry_path(out, "../evil.txt").is_err());
+        assert!(entry_path(out, "Game/../../evil.txt").is_err());
+        assert!(entry_path(out, "C:/Windows/evil.txt").is_err());
+        // Windows drops trailing dots and spaces, so these would be `..` too.
+        assert!(entry_path(out, ".. /evil.txt").is_err());
+        assert!(entry_path(out, ".../evil.txt").is_err());
+        assert_eq!(
+            entry_path(out, "Ver1.0./a"),
+            Ok(Some(PathBuf::from(r"C:\out\Ver1.0.\a")))
+        );
+    }
+
+    #[test]
+    fn a_zip_mixing_utf8_and_cp932_names_unpacks() {
+        let dir = std::env::temp_dir().join(format!("windows-link-unzip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("game.zip");
+        std::fs::write(
+            &zip,
+            stored_zip(&[
+                ("遊び♡/".as_bytes(), b""),
+                ("遊び♡/readme.txt".as_bytes(), b"hi"),
+                (
+                    &[0x83, 0x51, 0x81, 0x5B, 0x83, 0x80, b'.', b't', b'x', b't'],
+                    b"cp932",
+                ),
+            ]),
+        )
+        .unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        // tar.exe reads them all one way and fails both ways; each is read on its own.
+        super::unpack(&zip, &out).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.join("遊び♡").join("readme.txt")).unwrap(),
+            "hi"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("ゲーム.txt")).unwrap(),
+            "cp932"
+        );
+
+        // A name leaving the folder stops the unpacking and writes nothing outside.
+        let evil = dir.join("evil.zip");
+        std::fs::write(&evil, stored_zip(&[(b"../evil.txt", b"x")])).unwrap();
+        assert!(unpack_zip(&evil, &out).is_err());
+        assert!(!dir.join("evil.txt").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn rar_archives_are_told_by_their_mark_even_behind_a_self_extracting_program() {
