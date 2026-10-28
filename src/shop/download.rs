@@ -471,6 +471,13 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_that_cannot_be_read_is_an_error_not_an_empty_one() {
+        let missing =
+            std::env::temp_dir().join(format!("windows-link-missing-{}", std::process::id()));
+        assert!(super::super::file_names(&missing).is_err());
+    }
+
+    #[test]
     fn zip_names_read_as_utf8_else_as_cp932() {
         assert_eq!(
             zip_name("遊び♡/a.txt".as_bytes()).as_deref(),

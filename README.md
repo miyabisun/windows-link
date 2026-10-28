@@ -444,7 +444,9 @@ up; the panel's list and the log show how it goes.
 - **How a round goes**: `GET /buttons/{id}/library/update` answers for the round under way,
   else the last one: `doing` (`purchases` while reading them, `downloads`, `null` between
   rounds), `started` and `finished` (Unix seconds), `purchases` (why they could not be
-  read, such as `DLsite needs signing in again through the panel`), and `jobs`, the games it downloads
+  read, such as `DLsite needs signing in again through the panel`), `folder` (why the games'
+  folder could not be read, such as a disk that dropped off; nothing is downloaded then, as
+  every game would look missing), and `jobs`, the games it downloads
   or updates in order, each `{id, name, status}` with `status` as in the list, or `完了`
   once done. FANZA's rounds answer the same way.
 

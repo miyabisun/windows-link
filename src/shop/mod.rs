@@ -580,25 +580,26 @@ impl ShopStore {
     }
 }
 
-fn file_names(dir: &Path) -> (Vec<String>, Vec<String>) {
+fn file_names(dir: &Path) -> std::io::Result<(Vec<String>, Vec<String>)> {
     let mut files = Vec::new();
     let mut folders = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        match entry.file_type() {
-            Ok(kind) if kind.is_dir() => folders.push(name),
-            Ok(_) => files.push(name),
-            Err(_) => {}
+        if entry.file_type()?.is_dir() {
+            folders.push(name);
+        } else {
+            files.push(name);
         }
     }
     files.sort();
     folders.sort();
-    (files, folders)
+    Ok((files, folders))
 }
 
 /// The programs that may start the game in `folder` (`candidates`).
 fn programs(folder: &Path) -> Vec<String> {
-    let (top, below) = file_names(folder);
+    let (top, below) = file_names(folder).unwrap_or_default();
     let below: Vec<(String, Vec<String>)> =
         if top.iter().any(|f| f.to_lowercase().ends_with(".exe")) {
             Vec::new()
@@ -606,7 +607,7 @@ fn programs(folder: &Path) -> Vec<String> {
             below
                 .into_iter()
                 .map(|sub| {
-                    let files = file_names(&folder.join(&sub)).0;
+                    let files = file_names(&folder.join(&sub)).unwrap_or_default().0;
                     (sub, files)
                 })
                 .collect()
@@ -619,11 +620,14 @@ pub fn scan(root: &Path) -> Result<Vec<(Title, Vec<String>)>, String> {
     if !root.is_dir() {
         return Err(format!("{} does not exist", root.display()));
     }
+    // A folder that cannot be read (a disk that dropped off) fails the reading: taken
+    // as empty, every game in it would look missing and be downloaded again.
+    let read = |dir: &Path| file_names(dir).map_err(|err| format!("{}: {err}", dir.display()));
     let mut games = Vec::new();
-    let (_, makers) = file_names(root);
+    let (_, makers) = read(root)?;
     // `.windows-link` holds downloads in progress.
     for maker in makers.into_iter().filter(|maker| !maker.starts_with('.')) {
-        let (_, names) = file_names(&root.join(&maker));
+        let (_, names) = read(&root.join(&maker))?;
         for name in names {
             // DLsiteNest keeps the previous copy of an updated game as `<title>.bak`.
             if name.to_lowercase().ends_with(".bak") {
@@ -968,8 +972,13 @@ impl<S: Shop> ShopLibrary<S> {
             return;
         }
         let purchases = self.purchases();
-        let Ok(games) = self.rescan() else {
-            return;
+        let games = match self.rescan() {
+            Ok(games) => games,
+            Err(reason) => {
+                tracing::warn!(shop = self.shop.name(), %reason, "cannot read the games folder; nothing is downloaded");
+                self.round_state().folder = Some(reason);
+                return;
+            }
         };
         let records = self.store.games().unwrap_or_default();
         let versions = self.store.versions().unwrap_or_default();

@@ -1975,6 +1975,7 @@ buttons:
                 "started": 100,
                 "finished": null,
                 "purchases": "DLsite's login page: http status: 403",
+                "folder": null,
                 "jobs": [{"id": "1", "name": "One", "status": "完了"}]
             })
         );

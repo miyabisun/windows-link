@@ -1166,6 +1166,38 @@ mod tests {
     }
 
     #[test]
+    fn a_round_that_cannot_read_the_games_folder_downloads_nothing_and_says_why() {
+        use super::play::Work;
+
+        let root = games("unreadable");
+        let library = library(&root);
+        let cookie = crate::shop::cookies::Cookie {
+            name: "__DLsite_SID".into(),
+            value: "v".into(),
+            domain: "dlsite.com".into(),
+            path: "/".into(),
+            expires: None,
+            secure: true,
+            http_only: true,
+        };
+        library.shop().session().keep(vec![cookie]).unwrap();
+        library.set_purchases(&[Work {
+            id: "RJ7".into(),
+            name: "Coming".into(),
+            kind: "RPG".into(),
+            windows: true,
+            ..Work::default()
+        }]);
+        // The games' drive is gone (a disk that dropped off): nothing is planned, as
+        // every game would look missing.
+        std::fs::remove_dir_all(&root).unwrap();
+        library.download();
+        let round = library.round().unwrap();
+        assert_eq!(round.jobs, []);
+        assert!(round.folder.unwrap().contains("does not exist"));
+    }
+
+    #[test]
     fn labels_are_kept_and_the_fixed_ones_stay() {
         let root = games("labels");
         let library = library(&root);

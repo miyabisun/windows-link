@@ -125,6 +125,8 @@ pub struct Round {
     pub finished: Option<i64>,
     /// Why the purchases could not be read, when they could not.
     pub purchases: Option<String>,
+    /// Why the games' folder could not be read, which keeps the round from downloading.
+    pub folder: Option<String>,
     /// The games it downloads or updates, in order.
     pub jobs: Vec<Job>,
 }
@@ -529,6 +531,7 @@ pub mod fake {
                 started: Some(100),
                 finished: None,
                 purchases: Some("DLsite's login page: http status: 403".into()),
+                folder: None,
                 jobs: vec![Job {
                     id: "1".into(),
                     name: "One".into(),
