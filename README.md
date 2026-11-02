@@ -671,9 +671,9 @@ and wake this PC. The PC connects out, so no inbound port is opened.
 
 ```yaml
 home_link:
-  url: ws://192.168.1.100:5011/api/pcs/connect   # home-link's WebSocket for PCs (ws:// only)
-  name: ゲームPC                                 # the name in home-link, 1 to 100 characters
-  keep: mon-3614886cb9937180                     # the monitor kept lit: an id from GET /touch-monitors
+  url: ws://home-link.example:5011/api/pcs/connect   # home-link's WebSocket for PCs (ws:// only)
+  name: 書斎                                        # the name in home-link, 1 to 100 characters
+  keep: mon-0123456789abcdef                        # the monitor kept lit: an id from GET /touch-monitors
 ```
 
 - home-link's `sleep` [rests](#resting) with `keep` lit, and its `wake` wakes; each answer
