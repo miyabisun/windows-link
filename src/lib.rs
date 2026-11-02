@@ -8,6 +8,7 @@ pub mod discord;
 pub mod dlsite;
 pub mod fanza;
 pub mod hold;
+pub mod home_link;
 pub mod icons;
 pub mod launch;
 pub mod library;

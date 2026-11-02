@@ -20,9 +20,23 @@ pub struct Config {
     /// Shared buttons from `config.yaml`, then each desktop file's buttons.
     #[serde(default)]
     pub buttons: Vec<ButtonConfig>,
+    /// Stay connected to home-link, which can then rest and wake this PC.
+    #[serde(default)]
+    pub home_link: Option<HomeLink>,
     /// Names of the desktops that have a file in `desktops/`, sorted.
     #[serde(skip)]
     pub desktops: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeLink {
+    /// home-link's WebSocket for PCs, `ws://<host>:<port>/api/pcs/connect`.
+    pub url: String,
+    /// The name this PC goes by in home-link, 1 to 100 characters.
+    pub name: String,
+    /// The monitor kept lit while resting: an id from `GET /touch-monitors`.
+    pub keep: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,6 +385,27 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             }
         }
     }
+    config.home_link.as_ref().map_or(Ok(()), validate_home_link)
+}
+
+fn validate_home_link(link: &HomeLink) -> Result<(), ConfigError> {
+    // No TLS is built in, so only ws://.
+    if !link.url.starts_with("ws://") {
+        return Err(ConfigError(format!(
+            "home_link: url {:?} must start with ws://",
+            link.url
+        )));
+    }
+    if !(1..=100).contains(&link.name.chars().count()) {
+        return Err(ConfigError(
+            "home_link: name must be 1 to 100 characters".into(),
+        ));
+    }
+    if link.keep.is_empty() {
+        return Err(ConfigError(
+            "home_link: keep must be a monitor id from GET /touch-monitors".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -415,6 +450,30 @@ buttons:
     fn empty_text_is_an_empty_config() {
         let config = parse("{}").unwrap();
         assert!(config.buttons.is_empty());
+        assert!(config.home_link.is_none());
+    }
+
+    #[test]
+    fn home_link_needs_a_websocket_url_a_name_and_a_monitor() {
+        let link = |url: &str, name: &str, keep: &str| {
+            parse(&format!(
+                "home_link:\n  url: {url}\n  name: \"{name}\"\n  keep: \"{keep}\"\n"
+            ))
+        };
+        let url = "ws://192.168.1.100:5011/api/pcs/connect";
+        let config = link(url, "ゲームPC", "mon-1").unwrap();
+        let home_link = config.home_link.unwrap();
+        assert_eq!(
+            (home_link.url.as_str(), home_link.name.as_str()),
+            (url, "ゲームPC")
+        );
+        assert_eq!(home_link.keep, "mon-1");
+        assert!(link(&"x".repeat(100), "a", "m").is_err(), "not a ws URL");
+        assert!(link("http://h:5011/api/pcs/connect", "a", "m").is_err());
+        assert!(link(url, "", "m").is_err(), "an empty name");
+        assert!(link(url, &"名".repeat(100), "m").is_ok());
+        assert!(link(url, &"名".repeat(101), "m").is_err());
+        assert!(link(url, "a", "").is_err(), "no monitor to keep");
     }
 
     #[test]

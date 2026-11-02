@@ -19,6 +19,8 @@ use crate::{
 };
 
 pub mod api;
+#[cfg(test)]
+pub mod fake;
 pub mod store;
 pub mod windows;
 

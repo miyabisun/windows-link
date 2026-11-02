@@ -24,6 +24,7 @@ use windows_link::{
     dlsite::{self, DlsiteLibrary, DlsiteShop, session::DlsiteSession},
     fanza::{self, FanzaLibrary, FanzaShop},
     hold::{Colors, HIGHLIGHTS, HOLDS, Holds},
+    home_link,
     launch::windows::WindowsLauncher,
     library::{GameLibrary, Pins},
     logging,
@@ -126,8 +127,9 @@ fn run_server(console: bool) -> ExitCode {
 
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config::default_path();
-    let config = config::load(&config_path)?;
+    let mut config = config::load(&config_path)?;
     info!(path = %config_path.display(), buttons = config.buttons.len(), "config loaded");
+    let home_link = config.home_link.take();
 
     // Bind first: an instance that cannot get the port exits before starting anything.
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port::from_env()?));
@@ -201,7 +203,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         error!(%err, "touch cursor keeper is unavailable");
     }
     let touch = TouchState::new(Arc::new(WindowsDisplays), store, keep);
-    let rest = rest(&database, audio)?;
+    let rest = rest(&database, audio, home_link)?;
 
     let updater = Arc::new(Updater::from_env());
     if let Some(exe) = updater.installed_exe() {
@@ -227,8 +229,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Resting, picked up again when the server restarts while resting (an update).
-fn rest(database: &std::path::Path, audio: Arc<dyn Audio>) -> rusqlite::Result<Arc<Rest>> {
+/// Resting, picked up again when the server restarts while resting (an update), and
+/// home-link's line to it when configured.
+fn rest(
+    database: &std::path::Path,
+    audio: Arc<dyn Audio>,
+    home_link: Option<config::HomeLink>,
+) -> rusqlite::Result<Arc<Rest>> {
     let rest = Arc::new(Rest::new(
         Arc::new(WindowsDisplays),
         Arc::new(WindowsScreens::start()),
@@ -237,6 +244,9 @@ fn rest(database: &std::path::Path, audio: Arc<dyn Audio>) -> rusqlite::Result<A
     ));
     if let Err(err) = rest.resume() {
         error!(?err, "cannot resume resting");
+    }
+    if let Some(link) = home_link {
+        tokio::spawn(home_link::run(link, rest.clone()));
     }
     Ok(rest)
 }

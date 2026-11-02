@@ -27,7 +27,8 @@ A library button's state also says `"rounds": true` for DLsite and FANZA, whose 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
 Windows virtual desktops, darkens every monitor but the panel's and mutes the PC while it
-rests (see [Resting](#resting)), and updates itself from GitHub Releases (see [Updates](#updates)).
+rests (see [Resting](#resting)), stays connected to [home-link](#home-link) so it can rest
+and wake the PC too, and updates itself from GitHub Releases (see [Updates](#updates)).
 
 ## Requirements
 
@@ -662,6 +663,29 @@ a DisplayPort one may drop out of Windows altogether.
 - If the server is not running while a monitor is still dark, set its brightness again with
   the monitor's own buttons.
 
+## home-link
+
+With `home_link` in `config.yaml`, the server keeps a WebSocket open to
+[home-link](https://github.com/miyabisun/home-link), whose screen, API and MCP can then rest
+and wake this PC. The PC connects out, so no inbound port is opened.
+
+```yaml
+home_link:
+  url: ws://192.168.1.100:5011/api/pcs/connect   # home-link's WebSocket for PCs (ws:// only)
+  name: ゲームPC                                 # the name in home-link, 1 to 100 characters
+  keep: mon-3614886cb9937180                     # the monitor kept lit: an id from GET /touch-monitors
+```
+
+- home-link's `sleep` [rests](#resting) with `keep` lit, and its `wake` wakes; each answer
+  says whether resting afterwards, or why not (`keep` not connected, a brightness that could
+  not be put back), and home-link shows it. The PC is never put to sleep.
+- Resting started or ended on the panel is told to home-link within 2 seconds.
+- A dropped connection is opened again after 1 second, waiting twice as long after each
+  failure in a row, up to a minute. One that hears nothing from home-link for a minute (it
+  pings every 20 seconds) counts as dropped. Connecting, dropping and each command are written
+  to `windows-link.log`.
+- Without `home_link` nothing connects. Restart the server after changing it.
+
 ## Start at logon
 
 Register a Task Scheduler task that starts the [installed](#install) exe when you sign
@@ -730,6 +754,11 @@ PC, so do not allow inbound connections:
   New-NetFirewallRule -DisplayName "windows-link (block inbound)" -Direction Inbound `
     -Program "$env:LOCALAPPDATA\Programs\windows-link\windows-link.exe" -Action Block
   ```
+
+With [home-link](#home-link) configured, the server also connects out to home-link and takes
+its sleep and wake over that connection; inbound connections stay blocked. home-link has no
+authentication either, so a device on the network that can reach home-link can rest and wake
+the PC through it.
 
 Accepted risk: a web page open in a browser on the same PC can send requests to
 `http://127.0.0.1:4730` and press buttons. This was a deliberate choice for a personal
