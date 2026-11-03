@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast, watch};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -241,6 +241,19 @@ impl AppState {
             })
             .to_string(),
         );
+    }
+
+    /// Push `{"type": "power", "resting": …}` on `/events` whenever resting starts or
+    /// ends, so the panel also follows a rest or wake from home-link.
+    pub async fn run_resting(self, mut resting: watch::Receiver<bool>) {
+        while resting.changed().await.is_ok() {
+            let now = *resting.borrow_and_update();
+            let _ordering = self.hub.last.lock().await;
+            let _ = self
+                .hub
+                .events
+                .send(json!({ "type": "power", "resting": now }).to_string());
+        }
     }
 
     /// Re-read every button, broadcast the ones that changed, and return all of them.
@@ -1468,7 +1481,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use futures_util::StreamExt;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tower::ServiceExt;
 
     use super::{AppState, app};
@@ -1649,6 +1662,29 @@ buttons:
         assert_eq!(change["type"], "desktops");
         assert_eq!(change["reason"], "changed");
         assert_eq!(change["desktops"][1]["current"], true);
+    }
+
+    #[tokio::test]
+    async fn events_push_when_resting_starts_and_ends() {
+        let (state, _) = state();
+        let (resting, changes) = tokio::sync::watch::channel(false);
+        tokio::spawn(state.clone().run_resting(changes));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app(state)).await });
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/events"))
+            .await
+            .unwrap();
+        let mut next = async || -> Value {
+            let text = socket.next().await.unwrap().unwrap();
+            serde_json::from_str(text.to_text().unwrap()).unwrap()
+        };
+        assert_eq!(next().await["type"], "snapshot");
+        resting.send(true).unwrap();
+        assert_eq!(next().await, json!({ "type": "power", "resting": true }));
+        resting.send(false).unwrap();
+        assert_eq!(next().await, json!({ "type": "power", "resting": false }));
     }
 
     const LIBRARY: &str = "buttons:\n  - id: games\n    label: Games\n    type: steam.library\n    hide: [非表示]\n  - id: other\n    label: Other\n    type: app.launch\n    target: a.exe\n";

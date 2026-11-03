@@ -561,7 +561,7 @@ Discord's CDN.
 | `GET /power`, `POST /power/rest`, `POST /power/wake` | see [Resting](#resting) |
 | `GET /version` | `{"version": "0.1.0"}` |
 | `POST /update/check` | check for an update now (see [Updates](#updates)) |
-| `GET /events` | WebSocket: one `snapshot` message, then `button` and `desktops` messages as things change (below) |
+| `GET /events` | WebSocket: one `snapshot` message, then `button`, `desktops` and `power` messages as things change (below) |
 
 Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_unavailable`,
 `409 not_running`, `500 audio`, `409 no_window`, `500 launch`, `409 not_pressable` (a library button),
@@ -579,6 +579,8 @@ Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_
   changes (`changed`), or a desktop is `created`, `removed`, `renamed` or `moved`, and
   `reconnected` after Explorer restarts. Switching with `Win + Ctrl + →` or the
   API both produce `changed`.
+- `{"type":"power","resting":true}` when [resting](#resting) starts or ends, from the
+  panel or [home-link](#home-link)
 
 State changes made outside the server, such as choosing another output in the Windows
 sound settings or moving a slider in the volume mixer, are picked up through Windows
@@ -679,7 +681,8 @@ home_link:
 - home-link's `sleep` [rests](#resting) with `keep` lit, and its `wake` wakes; each answer
   says whether resting afterwards, or why not (`keep` not connected, a brightness that could
   not be put back), and home-link shows it. The PC is never put to sleep.
-- Resting started or ended on the panel is told to home-link within 2 seconds.
+- Resting started or ended on the panel is told to home-link, and resting started or ended
+  from home-link is told to the panel on `/events`.
 - A dropped connection is opened again after 1 second, waiting twice as long after each
   failure in a row, up to a minute. One that hears nothing from home-link for a minute (it
   pings every 20 seconds) counts as dropped. Connecting, dropping and each command are written

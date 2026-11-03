@@ -204,6 +204,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     }
     let touch = TouchState::new(Arc::new(WindowsDisplays), store, keep);
     let rest = rest(&database, audio, home_link)?;
+    tokio::spawn(state.clone().run_resting(rest.subscribe()));
 
     let updater = Arc::new(Updater::from_env());
     if let Some(exe) = updater.installed_exe() {

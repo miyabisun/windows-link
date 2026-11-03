@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::{
@@ -80,6 +81,8 @@ pub struct Rest {
     /// Resting and waking one at a time, so neither sees the other half done.
     busy: Mutex<()>,
     retry_waits: Vec<Duration>,
+    /// Whether resting, for whoever follows it (the panel's `/events`, home-link).
+    changes: watch::Sender<bool>,
 }
 
 impl Rest {
@@ -89,6 +92,7 @@ impl Rest {
         audio: Arc<dyn Audio>,
         store: RestStore,
     ) -> Self {
+        let resting = matches!(store.keep(), Ok(Some(_)));
         Self {
             displays,
             screens,
@@ -96,7 +100,18 @@ impl Rest {
             store,
             busy: Mutex::new(()),
             retry_waits: RETRY_WAITS.to_vec(),
+            changes: watch::Sender::new(resting),
         }
+    }
+
+    /// Whether resting, now and after each time resting starts or ends.
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.changes.subscribe()
+    }
+
+    fn tell(&self, resting: bool) {
+        self.changes
+            .send_if_modified(|told| std::mem::replace(told, resting) != resting);
     }
 
     fn monitors(&self) -> Result<Vec<Monitor>, RestError> {
@@ -125,6 +140,7 @@ impl Rest {
             .collect();
         // Saved before anything is dimmed, so no monitor is left at 0 without its value.
         self.store.start(keep, &read)?;
+        self.tell(true);
         saved.extend(read);
         for monitor in others.iter().filter(|m| saved.contains_key(&m.id)) {
             if let Err(message) = self.screens.set_brightness(monitor, 0) {
@@ -200,6 +216,7 @@ impl Rest {
             }
         }
         self.store.stop()?;
+        self.tell(false);
         restored.sort();
         unrestored.sort();
         info!(?restored, ?unrestored, muted = self.store.muted()?, "woke");
@@ -586,5 +603,24 @@ mod tests {
         rest.resume().unwrap();
         assert!(screens.covered().is_empty());
         assert!(!rest.resting().unwrap());
+    }
+
+    #[test]
+    fn tells_subscribers_when_resting_starts_and_ends() {
+        let (rest, displays, screens, audio) = setup();
+        let mut changes = rest.subscribe();
+        assert!(!*changes.borrow_and_update());
+        rest.rest("panel").unwrap();
+        assert!(*changes.borrow_and_update());
+        rest.rest("panel").unwrap();
+        assert!(
+            !changes.has_changed().unwrap(),
+            "resting again changes nothing"
+        );
+        rest.wake().unwrap();
+        assert!(!*changes.borrow_and_update());
+        rest.rest("panel").unwrap();
+        let restarted = Rest::new(displays, screens, audio, rest.store);
+        assert!(*restarted.subscribe().borrow(), "restarted while resting");
     }
 }

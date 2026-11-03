@@ -3,14 +3,11 @@
 //! The PC connects out, so nothing is opened for inbound connections. Messages follow
 //! home-link's README ("PC").
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time::Instant};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tracing::{info, warn};
 
@@ -24,9 +21,6 @@ const STEADY: Duration = Duration::from_mins(1);
 /// home-link pings every 20 seconds; this long without a word means the line is gone
 /// even if no close came (a dropped network).
 const SILENCE: Duration = Duration::from_mins(1);
-// ponytail: resting is read on a timer rather than announced by `Rest`; a watch channel
-// if 2 seconds late in home-link ever matters.
-const POLL: Duration = Duration::from_secs(2);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -69,13 +63,13 @@ fn command(text: &str) -> Option<(Value, String)> {
 /// Say hello, then answer commands and tell home-link when resting starts or ends
 /// otherwise (the panel), until the connection ends; returns why it ended.
 async fn session(mut socket: Socket, link: &HomeLink, rest: &Arc<Rest>) -> String {
-    let mut told = rest.resting().unwrap_or_default();
+    let mut changes = rest.subscribe();
+    let mut told = *changes.borrow_and_update();
     let hello = json!({ "type": "hello", "name": link.name, "sleeping": told });
     if let Err(err) = socket.send(Message::text(hello.to_string())).await {
         return err.to_string();
     }
     let mut heard = Instant::now();
-    let mut poll = tokio::time::interval(POLL);
     loop {
         let reply = tokio::select! {
             message = socket.next() => {
@@ -100,16 +94,17 @@ async fn session(mut socket: Socket, link: &HomeLink, rest: &Arc<Rest>) -> Strin
                 }
                 result(&id, done, &link.keep)
             }
-            _ = poll.tick() => {
-                if heard.elapsed() >= SILENCE {
-                    return "home-link went silent".into();
-                }
-                let now = rest.resting().unwrap_or(told);
+            // `rest` outlives the session, so this only ends with a change.
+            _ = changes.changed() => {
+                let now = *changes.borrow_and_update();
                 if now == told {
                     continue;
                 }
                 told = now;
                 json!({ "type": "state", "sleeping": now })
+            }
+            () = tokio::time::sleep_until(heard + SILENCE) => {
+                return "home-link went silent".into();
             }
         };
         if let Err(err) = socket.send(Message::text(reply.to_string())).await {
