@@ -14,6 +14,8 @@
     reason = "a cursor is at most 256 pixels square: its numbers fit f32 exactly"
 )]
 
+use std::sync::LazyLock;
+
 use serde::{Deserialize, Serialize};
 
 pub mod windows;
@@ -74,6 +76,12 @@ const ARROW: [(f32, f32); 9] = [
     (3.5, 29.3),
     (0.1, 28.6),
 ];
+/// The corners of `ARROW` rounded off as the tip reads round, and how far along each
+/// side the rounding starts (the user's of 2026-11-03: 「右下と左下、カクカクしすぎ」):
+/// the right point's lower corner and both corners of the foot.
+const ROUNDED: [(usize, f32); 3] = [(5, 3.5), (7, 3.5), (8, 3.5)];
+/// `ARROW` with `ROUNDED` rounded, as drawn.
+static OUTLINE: LazyLock<Vec<(f32, f32)>> = LazyLock::new(|| rounded(&ARROW, &ROUNDED));
 /// Where the fill is, inside the white rim: the rim is wider along the slanting top
 /// and under the right point than along the left edge.
 const FILL: [(f32, f32); 7] = [
@@ -182,7 +190,7 @@ fn pixel(size: u32, (column, row): (u32, u32), palette: Palette) -> [u8; 4] {
 /// is: the navy edge (`edge` wide, in those units), the white rim, the fill, or the
 /// shadow; `None` off them all.
 fn colour(across: f32, down: f32, palette: Palette, edge: f32) -> Option<([f32; 3], f32)> {
-    let depth = -distance(&ARROW, across, down);
+    let depth = -distance(&OUTLINE, across, down);
     if depth > 0.0 {
         if depth < edge {
             return Some((NAVY, 1.0));
@@ -202,7 +210,7 @@ fn colour(across: f32, down: f32, palette: Palette, edge: f32) -> Option<([f32; 
             1.0,
         ));
     }
-    (distance(&ARROW, across - SHADOW.0, down - SHADOW.1) < 0.0).then_some((SHADE, SHADOW_ALPHA))
+    (distance(&OUTLINE, across - SHADOW.0, down - SHADOW.1) < 0.0).then_some((SHADE, SHADOW_ALPHA))
 }
 
 /// The fill at (`across`, `down`), as fitted to the game's: its hue turns from the
@@ -234,6 +242,41 @@ fn hsv(hue: f32, saturation: f32) -> [f32; 3] {
         4 => [rising, low, full],
         _ => [full, low, falling],
     }
+}
+
+/// `outline` with each of `corners` (its index, and how far along each side the curve
+/// starts, at most halfway) replaced by a curve, as a few short sides.
+fn rounded(outline: &[(f32, f32)], corners: &[(usize, f32)]) -> Vec<(f32, f32)> {
+    const STEPS: u32 = 6;
+    let len = outline.len();
+    let mut out = Vec::new();
+    for (index, &at) in outline.iter().enumerate() {
+        let Some(&(_, reach)) = corners.iter().find(|(corner, _)| *corner == index) else {
+            out.push(at);
+            continue;
+        };
+        let toward = |(across, down): (f32, f32)| {
+            let part = (reach / (across - at.0).hypot(down - at.1)).min(0.5);
+            (
+                (across - at.0).mul_add(part, at.0),
+                (down - at.1).mul_add(part, at.1),
+            )
+        };
+        let (from, to) = (
+            toward(outline[(index + len - 1) % len]),
+            toward(outline[(index + 1) % len]),
+        );
+        // A quadratic curve from `from` to `to`, pulled toward the corner.
+        out.extend((0..=STEPS).map(|step| {
+            let t = step as f32 / STEPS as f32;
+            let (a, b, c) = ((1.0 - t) * (1.0 - t), 2.0 * t * (1.0 - t), t * t);
+            (
+                c.mul_add(to.0, a.mul_add(from.0, b * at.0)),
+                c.mul_add(to.1, a.mul_add(from.1, b * at.1)),
+            )
+        }));
+    }
+    out
 }
 
 /// How far (`across`, `down`) lies from `outline`, negative inside it.
@@ -380,6 +423,33 @@ mod tests {
             "{:?}",
             at((2, 2))
         );
+    }
+
+    /// The right point's lower corner and both corners of the foot are rounded like the
+    /// tip, not square: a dot just inside each corner is clear of the arrow (the user's
+    /// of 2026-11-03: 「右下と左下、カクカクしすぎ」).
+    #[test]
+    fn the_lower_corners_are_rounded() {
+        let size = 128;
+        let picture = picture(size, Palette::Blue);
+        for corner in [5, 7, 8] {
+            let (at, len) = (ARROW[corner], ARROW.len());
+            let toward = |(across, down): (f32, f32)| {
+                let far = (across - at.0).hypot(down - at.1);
+                ((across - at.0) / far, (down - at.1) / far)
+            };
+            let (before, after) = (
+                toward(ARROW[(corner + len - 1) % len]),
+                toward(ARROW[(corner + 1) % len]),
+            );
+            let inward = (before.0 + after.0, before.1 + after.1);
+            let reach = 0.25 / inward.0.hypot(inward.1);
+            let probe = (inward.0.mul_add(reach, at.0), inward.1.mul_add(reach, at.1));
+            let pixel =
+                |unit: f32| usize::try_from(to_byte_range((unit * 4.0).floor(), 127.0)).unwrap();
+            let dot = picture[pixel(probe.1) * 128 + pixel(probe.0)];
+            assert!(dot[3] < 128, "corner {corner} at {probe:?}: {dot:?}");
+        }
     }
 
     /// From the left edge in: the navy edge, the white rim, then the fill.
