@@ -9,7 +9,7 @@ use crate::{
     config::{ButtonConfig, ButtonSpec, Config},
     discord::ServerIcons,
     launch::{Launcher, Processes, Program, is_running},
-    library::{Pictures, Pin, Pinned},
+    library::{Pin, Pinned},
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -65,7 +65,6 @@ pub enum ButtonState {
     },
     /// A game library the panel opens (`GET /buttons/{id}/library`) instead of
     /// pressing; `pins` are the games pinned to the button's tab, in order,
-    /// `pictures` says whether the games' pictures are store art or program icons,
     /// `license_keys` whether a game's license keys can be read (`GET …/keys`),
     /// `sign_in` the shop the user has to sign in to through the panel, when so,
     /// `rounds` whether the library downloads in rounds that say how they go
@@ -73,7 +72,6 @@ pub enum ButtonState {
     /// (`POST …/page`).
     Library {
         pins: Vec<Pin>,
-        pictures: Pictures,
         license_keys: bool,
         sign_in: Option<String>,
         rounds: bool,
@@ -255,7 +253,6 @@ fn library_state(button: &ButtonConfig, readings: &Readings<'_>) -> ButtonState 
     let spec = &button.spec;
     ButtonState::Library {
         pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
-        pictures: spec.pictures().unwrap_or_default(),
         license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
         sign_in: readings.sign_ins.get(&button.id).cloned(),
         rounds: !matches!(spec, ButtonSpec::SteamLibrary { .. }),
@@ -549,7 +546,7 @@ mod tests {
         buttons::AudioSnapshot,
         config,
         launch::{Launcher, Processes, Program, fake::FakeLauncher},
-        library::{Pictures, Pin, Pinned},
+        library::{Pin, Pinned},
     };
 
     static NO_PROCESSES: std::sync::LazyLock<Processes> = std::sync::LazyLock::new(Processes::new);
@@ -580,7 +577,6 @@ mod tests {
     #[test]
     fn a_fanza_library_shows_its_icon_and_when_it_needs_signing_in() {
         use super::{FANZA_ICON, icon_url};
-        use crate::library::Pictures;
 
         let config = config::parse(
             "buttons:
@@ -608,7 +604,6 @@ mod tests {
             state(&sign_ins),
             ButtonState::Library {
                 pins: vec![],
-                pictures: Pictures::Whole,
                 license_keys: false,
                 sign_in: Some("fanza".into()),
                 rounds: true,
@@ -1130,7 +1125,6 @@ buttons:
             view(&config, &config.buttons[0], &readings, &audio).state,
             ButtonState::Library {
                 pins: vec![pinned],
-                pictures: Pictures::Cover,
                 license_keys: false,
                 sign_in: None,
                 rounds: false,
@@ -1141,7 +1135,6 @@ buttons:
             view(&config, &config.buttons[1], &readings, &audio).state,
             ButtonState::Library {
                 pins: vec![],
-                pictures: Pictures::Whole,
                 license_keys: true,
                 sign_in: None,
                 rounds: true,

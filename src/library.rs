@@ -34,16 +34,6 @@ pub struct Item {
     pub page: Option<String>,
 }
 
-/// How the items' pictures are shown: wide store art filling a tile, or pictures of any
-/// shape (DLsite's 4:3 art, program icons) shown whole.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Pictures {
-    #[default]
-    Cover,
-    Whole,
-}
-
 /// A group of items, such as a Steam collection. Items name their labels by `id`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Label {

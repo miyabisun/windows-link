@@ -9,8 +9,6 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::library::Pictures;
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -170,16 +168,6 @@ pub enum ButtonSpec {
 }
 
 impl ButtonSpec {
-    /// How a library button's pictures are shown: Steam's wide art fills a tile, DLsite's
-    /// and FANZA's pictures and icons are shown whole.
-    pub fn pictures(&self) -> Option<Pictures> {
-        match self {
-            Self::SteamLibrary { .. } => Some(Pictures::Cover),
-            Self::DlsiteLibrary { .. } | Self::FanzaLibrary { .. } => Some(Pictures::Whole),
-            _ => None,
-        }
-    }
-
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::OutputToggle { .. } => "audio.output_toggle",
@@ -684,10 +672,6 @@ buttons:
             ButtonSpec::FanzaLibrary { root: Some(root), .. } if root == std::path::Path::new("E:/fanza")
         ));
         assert_eq!(config.buttons[0].spec.type_name(), "fanza.library");
-        assert_eq!(
-            config.buttons[0].spec.pictures(),
-            Some(crate::library::Pictures::Whole)
-        );
     }
 
     #[test]

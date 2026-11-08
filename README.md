@@ -16,8 +16,8 @@ Each button does one thing:
 | `discord.server` | brings Discord to the front showing one server, starting Discord if needed | whether Discord runs; the button shows the server's icon |
 | `app.launch` | opens a program, shortcut, URL or Store app, or brings it to the front while it runs | whether it runs |
 | `steam.game` | starts a Steam game, or closes it while it runs | whether it runs |
-| `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button, and whether pictures are store art (`cover`) or shown whole (`whole`) |
-| `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, whether pictures are store art (`cover`) or shown whole (`whole`), and `sign_in: "dlsite"` while DLsite needs signing in through the panel |
+| `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button |
+| `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and `sign_in: "dlsite"` while DLsite needs signing in through the panel |
 | `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
 
 A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`), and `"pages": true` for DLsite, whose games have pages in the shop (`POST …/page`; the listing gives each game's `page`).
@@ -366,8 +366,7 @@ else the version in its folder), and `bought`, when it was bought (kept in
 `dlsite_bought` each time the purchases are read, so it stays while they cannot be), for a
 panel to sort by. A game known by its `RJ…` work ID has its DLsite page as `page`;
 `POST …/page` opens it in the default browser. Its picture is the work's art on DLsite
-(`image` in the listing), or its program's icon until the work is known; the button's
-state says `"pictures": "whole"`, as both are shown whole.
+(`image` in the listing), or its program's icon until the work is known.
 
 Some games ask for a license key (serial number) when they first start. `GET …/keys` reads it
 from DLsite each time it is asked (while the panel's sign-in lasts), so the keys are kept
