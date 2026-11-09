@@ -436,12 +436,13 @@ up; the panel's list and the log show how it goes.
   version; a folder DLsiteNest filled is taken as current when it changed after the latest
   version came out, and updated otherwise. An update is laid over the folder: new files
   are added, files are replaced except saves (anything under a folder or named with
-  `save` in it), and files the update lacks stay.
+  `save` in it), and files the update lacks stay. Read-only, hidden and system files are
+  replaced too.
 - **Failures** (DLsite refusing, a full or failing disk, an archive that does not unpack) are
   logged, shown as the game's `status`, and tried again in the next round. An archive that
   does not unpack twice in a row is dropped, so the next try fetches it afresh rather than
   going on from a damaged file. An update that cannot replace a file in the game's folder
-  (read-only, or in use) keeps what it unpacked, and the next round of the same version
+  (one in use) keeps what it unpacked, and the next round of the same version
   only moves what is left, rather than unpacking the whole game again.
 - **How a round goes**: `GET /buttons/{id}/library/update` answers for the round under way,
   else the last one: `doing` (`purchases` while reading them, `downloads`, `null` between

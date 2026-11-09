@@ -135,7 +135,7 @@ const UNPACKED: &str = "unpacked.txt";
 
 /// Unpack the archive whose first file is `first`, downloaded into `staging`, into
 /// `<staging>\out` and put the game in place at `target` ([`place`]). When a file in the
-/// game's folder cannot be replaced (read-only, or in use), what is unpacked stays, and
+/// game's folder cannot be replaced (one in use), what is unpacked stays, and
 /// the next try of the same `version` moves what is left instead of writing the whole
 /// game onto the disk again every round (DLsite's RJ266483 did so four times a day,
 /// 2026-11).
@@ -178,10 +178,30 @@ fn merge(from: &Path, to: &Path, at: &Path) -> std::io::Result<()> {
         if entry.file_type()?.is_dir() {
             merge(&entry.path(), &dest, &path)?;
         } else if !(is_save(&path) && dest.exists()) {
-            std::fs::rename(entry.path(), &dest)?;
+            replace(&entry.path(), &dest)?;
         }
     }
     Ok(())
+}
+
+/// Move `from` to `to`, over a file there. A read-only, hidden or system file is not
+/// replaced by a rename (DLsite's RJ266483 ships such files, 2026-11): it is removed
+/// first. A file in use still fails.
+fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && to.is_file() => {
+            let mut permissions = std::fs::metadata(to)?.permissions();
+            #[allow(
+                clippy::permissions_set_readonly_false,
+                reason = "a Windows file attribute"
+            )]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(to, permissions)?;
+            std::fs::remove_file(to)?;
+            std::fs::rename(from, to)
+        }
+        moved => moved,
+    }
 }
 
 /// The start of a RAR archive (versions 4 and 5).
@@ -675,6 +695,16 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
+    /// Hold `path` open without sharing it, as a running game holds its files.
+    fn in_use(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
+    }
+
     #[test]
     fn an_update_that_cannot_be_put_in_place_is_not_unpacked_again() {
         let dir = temp("install");
@@ -685,30 +715,62 @@ mod tests {
         std::fs::write(&archive, &shipped).unwrap();
         let target = dir.join("Maker/Title");
         write(&target.join("Game.exe"), "v1");
-        // A file the update replaces cannot be replaced (read-only, or in use).
-        set_read_only(&target.join("Game.exe"), true);
+        // A file the update replaces is in use.
+        let running = in_use(&target.join("Game.exe"));
         assert!(install(&staging, &archive, "2", &target).is_err());
+        drop(running);
         assert_eq!(read(&target.join("Game.exe")).as_deref(), Some("v1"));
 
         // The next try of the same version moves what was unpacked; the archive is
         // not read again (unpacking this would fail).
         std::fs::write(&archive, "not an archive").unwrap();
-        set_read_only(&target.join("Game.exe"), false);
         install(&staging, &archive, "2", &target).unwrap();
         assert_eq!(read(&target.join("Game.exe")).as_deref(), Some("v2"));
         assert_eq!(read(&target.join("data/new.dat")).as_deref(), Some("v2"));
 
         // A newer version is unpacked afresh, not what was left of an older one.
         std::fs::write(&archive, &shipped).unwrap();
-        set_read_only(&target.join("Game.exe"), true);
+        let running = in_use(&target.join("Game.exe"));
         assert!(install(&staging, &archive, "2", &target).is_err());
-        set_read_only(&target.join("Game.exe"), false);
+        drop(running);
         std::fs::write(&archive, "not an archive").unwrap();
         assert!(
             install(&staging, &archive, "3", &target)
                 .unwrap_err()
                 .contains("cannot unpack")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_update_replaces_read_only_hidden_and_system_files() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const HIDDEN: u32 = 0x2;
+        const SYSTEM: u32 = 0x4;
+
+        let dir = temp("attributes");
+        let target = dir.join("Maker/Title");
+        write(&target.join("sample.jpg"), "v1");
+        set_read_only(&target.join("sample.jpg"), true);
+        // DLsite's RJ266483 ships some files hidden and system, so DLsiteNest wrote them so.
+        std::fs::create_dir_all(target.join("htmldata")).unwrap();
+        for (name, attributes) in [("hidden.jpg", HIDDEN), ("system.jpg", HIDDEN | SYSTEM)] {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .attributes(attributes)
+                .open(target.join("htmldata").join(name))
+                .unwrap();
+            std::io::Write::write_all(&mut file, b"v1").unwrap();
+        }
+        let update = dir.join("update");
+        for name in ["sample.jpg", "htmldata/hidden.jpg", "htmldata/system.jpg"] {
+            write(&update.join(name), "v2");
+        }
+        place(&update, &target).unwrap();
+        for name in ["sample.jpg", "htmldata/hidden.jpg", "htmldata/system.jpg"] {
+            assert_eq!(read(&target.join(name)).as_deref(), Some("v2"), "{name}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
