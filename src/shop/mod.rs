@@ -664,8 +664,6 @@ fn program_path(folder: &Path, program: &str) -> PathBuf {
 const WAITING: &str = "ダウンロード待ち";
 /// A game this round downloaded or updated.
 const DONE: &str = "完了";
-/// Left beside a download whose archive did not unpack, saying why.
-const UNPACK_FAILED: &str = "unpack-failed.txt";
 
 /// The work a game folder is, with its main picture when known.
 #[derive(Clone, Debug, PartialEq)]
@@ -1072,42 +1070,16 @@ impl<S: Shop> ShopLibrary<S> {
                 .insert(work.id.clone(), format!("{verb}中 {percent}%"));
         })?;
         self.progress().insert(work.id.clone(), "展開中".to_owned());
-        let out = staging.join("out");
-        let _ = std::fs::remove_dir_all(&out);
         let first = files
             .first()
             .ok_or_else(|| format!("{} gave no files", self.shop.name()))?;
-        if let Err(reason) = download::unpack(first, &out) {
-            // An archive that fails a second time is damaged (cut off by a full or
-            // failing disk) and would go on failing: the next try fetches it afresh. Once
-            // is kept, for a failure that passes (a disk full while unpacking).
-            let failed_before = staging.join(UNPACK_FAILED);
-            if failed_before.exists() {
-                let _ = std::fs::remove_dir_all(&staging);
-            } else {
-                let _ = std::fs::write(&failed_before, &reason);
-            }
-            return Err(reason);
-        }
-        let placed = (|| -> Result<PathBuf, String> {
-            let target = folder.map_or_else(|| self.new_folder(work), Path::to_path_buf);
-            download::place(&download::content_root(&out, &target), &target)
-                .map_err(|err| format!("{}: {err}", target.display()))?;
-            Ok(target)
-        })();
-        match placed {
-            Ok(target) => {
-                self.store
-                    .record_download(&work.id, &target, work.image.as_deref(), &work.version)
-                    .map_err(|err| err.to_string())?;
-                let _ = std::fs::remove_dir_all(&staging);
-                Ok(target)
-            }
-            Err(reason) => {
-                let _ = std::fs::remove_dir_all(&out);
-                Err(reason)
-            }
-        }
+        let target = folder.map_or_else(|| self.new_folder(work), Path::to_path_buf);
+        download::install(&staging, first, &work.version, &target)?;
+        self.store
+            .record_download(&work.id, &target, work.image.as_deref(), &work.version)
+            .map_err(|err| err.to_string())?;
+        let _ = std::fs::remove_dir_all(&staging);
+        Ok(target)
     }
 
     /// Where a new game goes: `<root>\<maker>\<title>`, or with its work ID after the

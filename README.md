@@ -440,7 +440,9 @@ up; the panel's list and the log show how it goes.
 - **Failures** (DLsite refusing, a full or failing disk, an archive that does not unpack) are
   logged, shown as the game's `status`, and tried again in the next round. An archive that
   does not unpack twice in a row is dropped, so the next try fetches it afresh rather than
-  going on from a damaged file.
+  going on from a damaged file. An update that cannot replace a file in the game's folder
+  (read-only, or in use) keeps what it unpacked, and the next round of the same version
+  only moves what is left, rather than unpacking the whole game again.
 - **How a round goes**: `GET /buttons/{id}/library/update` answers for the round under way,
   else the last one: `doing` (`purchases` while reading them, `downloads`, `null` between
   rounds), `started` and `finished` (Unix seconds), `purchases` (why they could not be

@@ -128,6 +128,46 @@ pub fn place(root: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::remove_dir_all(root)
 }
 
+/// Left beside a download whose archive did not unpack, saying why.
+const UNPACK_FAILED: &str = "unpack-failed.txt";
+/// Left beside a download whose archive unpacked into `out`, holding its version.
+const UNPACKED: &str = "unpacked.txt";
+
+/// Unpack the archive whose first file is `first`, downloaded into `staging`, into
+/// `<staging>\out` and put the game in place at `target` ([`place`]). When a file in the
+/// game's folder cannot be replaced (read-only, or in use), what is unpacked stays, and
+/// the next try of the same `version` moves what is left instead of writing the whole
+/// game onto the disk again every round (DLsite's RJ266483 did so four times a day,
+/// 2026-11).
+pub fn install(staging: &Path, first: &Path, version: &str, target: &Path) -> Result<(), String> {
+    let out = staging.join("out");
+    let unpacked = staging.join(UNPACKED);
+    if std::fs::read_to_string(&unpacked).ok().as_deref() != Some(version) || !out.is_dir() {
+        unpack_once(staging, first, &out)?;
+        let _ = std::fs::write(&unpacked, version);
+    }
+    place(&content_root(&out, target), target).map_err(|err| format!("{}: {err}", target.display()))
+}
+
+/// Unpack `first` into a fresh `out`, dropping the download when it fails twice in a row.
+fn unpack_once(staging: &Path, first: &Path, out: &Path) -> Result<(), String> {
+    let _ = std::fs::remove_file(staging.join(UNPACKED));
+    let _ = std::fs::remove_dir_all(out);
+    if let Err(reason) = unpack(first, out) {
+        // An archive that fails a second time is damaged (cut off by a full or
+        // failing disk) and would go on failing: the next try fetches it afresh. Once
+        // is kept, for a failure that passes (a disk full while unpacking).
+        let failed_before = staging.join(UNPACK_FAILED);
+        if failed_before.exists() {
+            let _ = std::fs::remove_dir_all(staging);
+        } else {
+            let _ = std::fs::write(&failed_before, &reason);
+        }
+        return Err(reason);
+    }
+    Ok(())
+}
+
 /// Move the files under `from` over `to`; `at` is where `from` is in the game.
 fn merge(from: &Path, to: &Path, at: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
@@ -410,8 +450,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        content_root, content_total, entry_path, folder_name, has_rar_mark, is_save, place,
-        unpack_zip, zip_name,
+        content_root, content_total, entry_path, folder_name, has_rar_mark, install, is_save,
+        place, unpack_zip, zip_name,
     };
 
     /// A ZIP of stored (uncompressed) files whose names are the bytes given, without the
@@ -626,6 +666,49 @@ mod tests {
         assert_eq!(content_root(&out, &dir.join("old")), out);
         write(&out.join("readme.txt"), "");
         assert_eq!(content_root(&out, &dir.join("new")), out);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn set_read_only(path: &Path, on: bool) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(on);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn an_update_that_cannot_be_put_in_place_is_not_unpacked_again() {
+        let dir = temp("install");
+        let staging = dir.join(".windows-link/RJ1");
+        let archive = staging.join("RJ1.zip");
+        let shipped = stored_zip(&[(b"Game.exe", b"v2"), (b"data/new.dat", b"v2")]);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(&archive, &shipped).unwrap();
+        let target = dir.join("Maker/Title");
+        write(&target.join("Game.exe"), "v1");
+        // A file the update replaces cannot be replaced (read-only, or in use).
+        set_read_only(&target.join("Game.exe"), true);
+        assert!(install(&staging, &archive, "2", &target).is_err());
+        assert_eq!(read(&target.join("Game.exe")).as_deref(), Some("v1"));
+
+        // The next try of the same version moves what was unpacked; the archive is
+        // not read again (unpacking this would fail).
+        std::fs::write(&archive, "not an archive").unwrap();
+        set_read_only(&target.join("Game.exe"), false);
+        install(&staging, &archive, "2", &target).unwrap();
+        assert_eq!(read(&target.join("Game.exe")).as_deref(), Some("v2"));
+        assert_eq!(read(&target.join("data/new.dat")).as_deref(), Some("v2"));
+
+        // A newer version is unpacked afresh, not what was left of an older one.
+        std::fs::write(&archive, &shipped).unwrap();
+        set_read_only(&target.join("Game.exe"), true);
+        assert!(install(&staging, &archive, "2", &target).is_err());
+        set_read_only(&target.join("Game.exe"), false);
+        std::fs::write(&archive, "not an archive").unwrap();
+        assert!(
+            install(&staging, &archive, "3", &target)
+                .unwrap_err()
+                .contains("cannot unpack")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
