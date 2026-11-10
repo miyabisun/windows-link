@@ -166,7 +166,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         state = state.with_arrow(Arc::new(cursor::windows::WindowsArrow(data_dir())));
     }
     let state = serve_libraries(state, libraries);
-    tokio::spawn(state.clone().run_refresher(changes));
+    tokio::spawn(state.clone().run_refresher(changes.clone()));
+    // Read once at start: the cursor is put as the buttons say, and the programs running
+    // are watched for their exit, before any panel connects.
+    changes.notify_one();
     let runtime = tokio::runtime::Handle::current();
     let publisher = state.clone();
     desktop_watch(move |reason| {

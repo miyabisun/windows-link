@@ -154,7 +154,7 @@ pub struct AudioSnapshot {
     pub default_output: Option<String>,
     /// The apps with sound on any connected output and the default output's volume,
     /// each read when the first button asks and shared by the rest: asking Windows
-    /// costs milliseconds, and the buttons are read every second.
+    /// costs milliseconds.
     apps: OnceCell<AudioResult<Vec<AppSound>>>,
     master: OnceCell<AudioResult<Master>>,
 }
@@ -844,7 +844,7 @@ mod tests {
                 },
             ]
         );
-        // Each reading asks Windows across processes, every second.
+        // Each reading asks Windows across processes.
         assert_eq!(audio.state.lock().unwrap().reads, 2, "readings");
     }
 

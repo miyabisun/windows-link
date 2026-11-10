@@ -411,8 +411,7 @@ fn worker(
 const ENDPOINTS_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// What the device enumerator says. Asking it costs milliseconds (it reads each
-/// endpoint's properties), and the buttons are read every second, so this is kept until
-/// Windows reports a change.
+/// endpoint's properties), so this is kept until Windows reports a change.
 struct Endpoints {
     read: Instant,
     devices: Vec<Device>,

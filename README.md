@@ -197,8 +197,10 @@ buttons:
   chosen on the panel
   (`PUT /buttons/{id}/color`): blue as the game's until one is chosen, red or green to
   stand out over a blue screen; toward its right point blue turns violet, red amber and
-  green teal. It is as big as the arrow Windows draws on the monitor the cursor is on (the
-  pointer size chosen in Windows' settings, at that monitor's DPI); turning it off brings the user's own cursors back. Only the arrow is replaced, and
+  green teal. The arrow is changed once, when the button is pressed or its colour chosen:
+  it is as big as the arrow Windows draws on the monitor the cursor is on at that moment
+  (the pointer size chosen in Windows' settings, at that monitor's DPI) and stays that
+  size on the other monitors. Turning it off brings the user's own cursors back. Only the arrow is replaced, and
   a program that draws a cursor of its own keeps it. Whether it is on and its colour are
   kept in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
 
@@ -382,7 +384,7 @@ nowhere on this PC and never logged; the panel shows them with a copy button.
   made, renamed and deleted like Steam's. They, the chosen programs and the start times are
   kept in `windows-link.db` by the game's ID: its DLsite work ID once known, so they stay
   when its folder is renamed, or else an ID made from its maker and title folders.
-- **Which work a game is**: at start and every 6 hours windows-link works out each game's
+- **Which work a game is**: at start and in each round windows-link works out each game's
   DLsite work (such as `RJ01464588`) and keeps it with the game's folder in the
   `dlsite_games` table of `windows-link.db` (`work_id`, `path` in lower case, `image`),
   one row per work, so it stays after DLsiteNest is uninstalled. Each work goes to one
@@ -411,9 +413,11 @@ nowhere on this PC and never logged; the panel shows them with a copy button.
 
 ### Downloads and updates
 
-After working out the games (at start, every 6 hours and when the panel asks for a
-[library update](#api)), windows-link downloads, one at a time, the purchased games that are not in the folder yet, then the updates. Nothing pops
-up; the panel's list and the log show how it goes.
+A round starts when the panel asks for a [library update](#api) and right after signing
+in, never on its own: at start the games are only worked out, so the list is right. In a
+round windows-link works out the games again and downloads, one at a time, the purchased
+games that are not in the folder yet, then the updates. Nothing pops up; the panel's list
+and the log show how it goes.
 
 - **Which games**: games (DLsite's game work types) that run on Windows. The AI-translated
   game data in other languages that comes with some purchases (`…ゲームデータ（AI翻訳）`),
@@ -457,8 +461,8 @@ up; the panel's list and the log show how it goes.
 
 A `fanza.library` button gives a panel the PC games bought on FANZA (DMM's adult shop; its
 library also lists games from DMM's all-ages shop), run the same way as the [DLsite
-library](#dlsite-library): windows-link reads the purchases at start, every 6 hours,
-right after signing in and when the panel asks for a library update, downloads the games not there yet into `<brand>\<title>` under
+library](#dlsite-library): windows-link reads the purchases at start, right after signing
+in and when the panel asks for a library update, and in the latter two downloads the games not there yet into `<brand>\<title>` under
 `D:\fanza`, and lists them with their package pictures. For example in
 `desktops/コミック.yaml`:
 
@@ -584,9 +588,15 @@ Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_
 - `{"type":"power","resting":true}` when [resting](#resting) starts or ends, from the
   panel or [home-link](#home-link)
 
-State changes made outside the server, such as choosing another output in the Windows
-sound settings or moving a slider in the volume mixer, are picked up through Windows
-device notifications and a one-second refresh and are pushed on `/events`.
+State changes made outside the server are pushed on `/events` when Windows tells of
+them; nothing is read on a timer. Windows tells of another output chosen, a device
+plugged in or out, the volume keys, a slider moved in the volume mixer and an app
+starting or ending its sound (audio notifications), of a top-level window coming or going
+(the shell's notice, as the taskbar hears it), and of a program a button shows as running
+exiting. It has no notice of a program starting that a program without administrator
+rights can take, so one that starts without showing a window (Steam started in the tray)
+shows as running the next time anything has the buttons read: another notice, a press,
+or a panel connecting.
 
 ## Virtual desktops
 

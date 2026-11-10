@@ -1,5 +1,5 @@
-//! The `cursor.highlight` buttons: while one is on, an arrow as big as Windows' stands
-//! in for the arrow cursor, so the cursor is easy to find over a busy screen. The arrow
+//! The `cursor.highlight` buttons: while one is on, an arrow as big as Windows' (on the
+//! monitor the cursor was on when it was pressed) stands in for the arrow cursor, so the cursor is easy to find over a busy screen. The arrow
 //! is drawn after Blue Archive's own cursor, in the colour chosen for the button on the
 //! panel, and handed to Windows as a cursor file (`.cur`).
 //!

@@ -134,8 +134,8 @@ pub mod windows {
     }
 
     /// The running processes by ID and lowercase file name, read from the system in one
-    /// call. It is read every second, and a `ToolHelp` snapshot, which maps its copy of
-    /// the list again for every process stepped to, took three times as long.
+    /// call: a `ToolHelp` snapshot, which maps its copy of the list again for every
+    /// process stepped to, took three times as long.
     pub(super) fn snapshot() -> Vec<(u32, String)> {
         // Kept between readings (the list is a few hundred kilobytes); `u64`s, so the
         // entries the system writes are aligned.
