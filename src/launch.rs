@@ -80,20 +80,19 @@ pub mod windows {
         ffi::OsStr,
         os::windows::ffi::{OsStrExt, OsStringExt},
         path::PathBuf,
+        sync::{Mutex, PoisonError},
     };
 
     use windows::{
+        Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation},
         Win32::{
-            Foundation::{CloseHandle, HWND, LPARAM, WPARAM},
+            Foundation::{CloseHandle, HWND, LPARAM, STATUS_INFO_LENGTH_MISMATCH, WPARAM},
             System::{
-                Diagnostics::ToolHelp::{
-                    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-                    TH32CS_SNAPPROCESS,
-                },
                 Threading::{
                     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
                     QueryFullProcessImageNameW,
                 },
+                WindowsProgramming::SYSTEM_PROCESS_INFORMATION,
             },
             UI::{
                 Input::KeyboardAndMouse::{
@@ -118,33 +117,65 @@ pub mod windows {
         text.encode_wide().chain(Some(0)).collect()
     }
 
+    /// The running processes by ID and lowercase file name, read from the system in one
+    /// call. It is read every second, and a `ToolHelp` snapshot, which maps its copy of
+    /// the list again for every process stepped to, took three times as long.
     fn snapshot() -> Vec<(u32, String)> {
+        // Kept between readings (the list is a few hundred kilobytes); `u64`s, so the
+        // entries the system writes are aligned.
+        static BUFFER: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let mut buffer = BUFFER.lock().unwrap_or_else(PoisonError::into_inner);
         let mut found = Vec::new();
-        // SAFETY: the snapshot handle is used only after it was created and is closed exactly once;
-        // `entry` is a live PROCESSENTRY32W whose dwSize says so, and only its NUL-terminated name
-        // is read.
-        unsafe {
-            let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-                return found;
+        let mut filled = 0;
+        // The list grows while it is asked for, so the size it needs is asked again.
+        for _ in 0..4 {
+            let size = u32::try_from(std::mem::size_of_val(buffer.as_slice())).unwrap_or(u32::MAX);
+            let mut needed = 0u32;
+            // SAFETY: the buffer is writable for the `size` bytes given, and `needed` is a live
+            // local the call writes into.
+            let status = unsafe {
+                NtQuerySystemInformation(
+                    SystemProcessInformation,
+                    buffer.as_mut_ptr().cast(),
+                    size,
+                    &raw mut needed,
+                )
             };
-            let mut entry = PROCESSENTRY32W {
-                dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>()).unwrap_or(0),
-                ..Default::default()
-            };
-            let mut ok = Process32FirstW(snap, &raw mut entry).is_ok();
-            while ok {
-                let len = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                found.push((
-                    entry.th32ProcessID,
-                    String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase(),
-                ));
-                ok = Process32NextW(snap, &raw mut entry).is_ok();
+            if status.is_ok() {
+                filled = needed as usize;
+                break;
             }
-            let _ = CloseHandle(snap);
+            if status != STATUS_INFO_LENGTH_MISMATCH {
+                break;
+            }
+            buffer.resize(needed as usize / 8 + 8192, 0);
+        }
+        let mut at = 0usize;
+        while at + std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>() <= filled {
+            // SAFETY: the entry lies within the `filled` bytes the system wrote, at an offset it
+            // gave (a multiple of 8, in a buffer of `u64`s), and is only read.
+            let info = unsafe {
+                &*buffer
+                    .as_ptr()
+                    .byte_add(at)
+                    .cast::<SYSTEM_PROCESS_INFORMATION>()
+            };
+            let name = info.ImageName;
+            // The idle process has no name.
+            if !name.Buffer.is_null() {
+                // SAFETY: the system points the name into the same buffer, `Length` bytes long.
+                let wide = unsafe {
+                    std::slice::from_raw_parts(name.Buffer.0, usize::from(name.Length) / 2)
+                };
+                found.push((
+                    u32::try_from(info.UniqueProcessId.0.addr()).unwrap_or(0),
+                    String::from_utf16_lossy(wide).to_lowercase(),
+                ));
+            }
+            if info.NextEntryOffset == 0 {
+                break;
+            }
+            at += info.NextEntryOffset as usize;
         }
         found
     }
@@ -374,6 +405,29 @@ pub mod windows {
                     .map_err(|err| format!("cannot list windows: {err}"))?;
             }
             Ok(search.asked)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn the_running_processes_are_listed_by_id_and_lowercase_file_name() {
+            let own = std::env::current_exe().unwrap();
+            let name = own.file_name().unwrap().to_string_lossy().to_lowercase();
+            let listed = super::snapshot();
+            assert!(
+                listed.contains(&(std::process::id(), name.clone())),
+                "{name} is not among {} processes",
+                listed.len()
+            );
+            // Windows' own, which have no file to name them after.
+            assert!(
+                listed
+                    .iter()
+                    .any(|(pid, name)| *pid == 4 && name == "system"),
+                "the System process"
+            );
+            assert!(super::pids_of(&name.to_uppercase()).contains(&std::process::id()));
         }
     }
 }

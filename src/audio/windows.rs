@@ -10,10 +10,17 @@
 )]
 
 use std::{
+    cell::RefCell,
     ffi::c_void,
     path::Path,
-    sync::{Arc, mpsc},
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::Notify;
@@ -44,7 +51,7 @@ use windows::{
     },
 };
 
-use super::{AppSound, Audio, AudioError, AudioResult, Device, Master};
+use super::{AppSound, Audio, AudioError, AudioResult, Device, Master, Outputs};
 
 /// Undocumented but long-stable interface used to change the default endpoint
 /// (the same one `SoundSwitch` and `AudioDeviceCmdlets` use). Only `SetDefaultEndpoint`
@@ -97,7 +104,7 @@ enum Command {
     SetAppMute(String, bool, Reply<usize>),
     Master(Reply<Master>),
     SetMaster(Option<f32>, Option<bool>, Reply<()>),
-    Apps(Reply<Vec<AppSound>>),
+    Apps(Outputs, Reply<Vec<AppSound>>),
 }
 
 pub struct WindowsAudio {
@@ -167,29 +174,40 @@ impl Audio for WindowsAudio {
         self.call(|reply| Command::SetMaster(volume, muted, reply))
     }
 
-    fn apps(&self) -> AudioResult<Vec<AppSound>> {
-        self.call(Command::Apps)
+    fn apps(&self, outputs: Outputs) -> AudioResult<Vec<AppSound>> {
+        self.call(|reply| Command::Apps(outputs, reply))
     }
 }
 
 #[implement(IMMNotificationClient)]
 struct ChangeNotifier {
-    changes: Arc<Notify>,
+    changes: Option<Arc<Notify>>,
+    /// Set so the worker reads the endpoints again (`ComState::endpoints`).
+    stale: Arc<AtomicBool>,
+}
+
+impl ChangeNotifier {
+    fn changed(&self) {
+        self.stale.store(true, Ordering::Release);
+        if let Some(changes) = &self.changes {
+            changes.notify_one();
+        }
+    }
 }
 
 impl IMMNotificationClient_Impl for ChangeNotifier_Impl {
     fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> windows::core::Result<()> {
-        self.changes.notify_one();
+        self.changed();
         Ok(())
     }
 
     fn OnDeviceAdded(&self, _: &PCWSTR) -> windows::core::Result<()> {
-        self.changes.notify_one();
+        self.changed();
         Ok(())
     }
 
     fn OnDeviceRemoved(&self, _: &PCWSTR) -> windows::core::Result<()> {
-        self.changes.notify_one();
+        self.changed();
         Ok(())
     }
 
@@ -200,7 +218,7 @@ impl IMMNotificationClient_Impl for ChangeNotifier_Impl {
         _: &PCWSTR,
     ) -> windows::core::Result<()> {
         if flow == eRender {
-            self.changes.notify_one();
+            self.changed();
         }
         Ok(())
     }
@@ -219,7 +237,8 @@ fn worker(
     changes: Option<Arc<Notify>>,
     ready: &mpsc::Sender<AudioResult<()>>,
 ) {
-    let setup = || -> AudioResult<(IMMDeviceEnumerator, Option<IMMNotificationClient>)> {
+    let stale = Arc::new(AtomicBool::new(true));
+    let setup = || -> AudioResult<(IMMDeviceEnumerator, IMMNotificationClient)> {
         // SAFETY: COM is initialised on this worker thread before any other call, every call goes
         // through interfaces COM just returned, and the notification client stays registered only
         // while `_client` keeps it alive for the rest of the worker.
@@ -230,16 +249,14 @@ fn worker(
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                     .map_err(|e| err("MMDeviceEnumerator", &e))?;
-            let client = match changes {
-                Some(changes) => {
-                    let client: IMMNotificationClient = ChangeNotifier { changes }.into();
-                    enumerator
-                        .RegisterEndpointNotificationCallback(&client)
-                        .map_err(|e| err("RegisterEndpointNotificationCallback", &e))?;
-                    Some(client)
-                }
-                None => None,
-            };
+            let client: IMMNotificationClient = ChangeNotifier {
+                changes,
+                stale: stale.clone(),
+            }
+            .into();
+            enumerator
+                .RegisterEndpointNotificationCallback(&client)
+                .map_err(|e| err("RegisterEndpointNotificationCallback", &e))?;
             Ok((enumerator, client))
         }
     };
@@ -253,35 +270,79 @@ fn worker(
             return;
         }
     };
-    let state = ComState { enumerator };
+    let com = ComState {
+        enumerator,
+        stale,
+        endpoints: RefCell::new(None),
+    };
     while let Ok(command) = commands.recv() {
         match command {
-            Command::Devices(reply) => drop(reply.send(state.devices())),
-            Command::DefaultOutput(reply) => drop(reply.send(state.default_output())),
-            Command::SetDefaultOutput(id, reply) => drop(reply.send(state.set_default_output(&id))),
-            Command::AppVolume(process, reply) => drop(reply.send(state.app_volume(&process))),
+            Command::Devices(reply) => drop(reply.send(com.devices())),
+            Command::DefaultOutput(reply) => drop(reply.send(com.default_output())),
+            Command::SetDefaultOutput(id, reply) => drop(reply.send(com.set_default_output(&id))),
+            Command::AppVolume(process, reply) => drop(reply.send(com.app_volume(&process))),
             Command::SetAppVolume(process, level, reply) => {
-                drop(reply.send(state.set_app_volume(&process, level)));
+                drop(reply.send(com.set_app_volume(&process, level)));
             }
-            Command::AppMuted(process, reply) => drop(reply.send(state.app_muted(&process))),
+            Command::AppMuted(process, reply) => drop(reply.send(com.app_muted(&process))),
             Command::SetAppMute(process, muted, reply) => {
-                drop(reply.send(state.set_app_mute(&process, muted)));
+                drop(reply.send(com.set_app_mute(&process, muted)));
             }
-            Command::Master(reply) => drop(reply.send(state.master())),
+            Command::Master(reply) => drop(reply.send(com.master())),
             Command::SetMaster(volume, muted, reply) => {
-                drop(reply.send(state.set_master(volume, muted)));
+                drop(reply.send(com.set_master(volume, muted)));
             }
-            Command::Apps(reply) => drop(reply.send(state.apps())),
+            Command::Apps(outputs, reply) => drop(reply.send(com.apps(outputs))),
         }
     }
 }
 
+/// The endpoints are read again at least this often, should a change go unreported.
+const ENDPOINTS_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// What the device enumerator says. Asking it costs milliseconds (it reads each
+/// endpoint's properties), and the buttons are read every second, so this is kept until
+/// Windows reports a change.
+struct Endpoints {
+    read: Instant,
+    devices: Vec<Device>,
+    /// The connected ones, whose sessions `sessions` looks through.
+    active: Vec<IMMDevice>,
+    /// The default output with its ID, else why there is none.
+    default: Result<(String, IMMDevice), AudioError>,
+}
+
 struct ComState {
     enumerator: IMMDeviceEnumerator,
+    /// Set by `ChangeNotifier` when Windows reports a change of the endpoints.
+    stale: Arc<AtomicBool>,
+    endpoints: RefCell<Option<Rc<Endpoints>>>,
 }
 
 impl ComState {
-    fn devices(&self) -> AudioResult<Vec<Device>> {
+    /// The endpoints, read again after a change (or `ENDPOINTS_MAX_AGE`).
+    fn endpoints(&self) -> AudioResult<Rc<Endpoints>> {
+        // Cleared before reading, so a change reported while reading is read next time.
+        let changed = self.stale.swap(false, Ordering::AcqRel);
+        if !changed
+            && let Some(kept) = self.endpoints.borrow().as_ref()
+            && kept.read.elapsed() < ENDPOINTS_MAX_AGE
+        {
+            return Ok(kept.clone());
+        }
+        self.endpoints.borrow_mut().take();
+        let read = Rc::new(self.read_endpoints()?);
+        *self.endpoints.borrow_mut() = Some(read.clone());
+        Ok(read)
+    }
+
+    /// Have the endpoints read again: one kept did not answer (its device went away, or
+    /// the audio service restarted).
+    fn forget_endpoints(&self) {
+        self.stale.store(true, Ordering::Release);
+    }
+
+    fn read_endpoints(&self) -> AudioResult<Endpoints> {
         // SAFETY: `enumerator` is a live COM object of this thread, and every call goes through
         // interfaces it returned; `device_id` and `friendly_name` only read the device they are
         // given.
@@ -291,7 +352,7 @@ impl ComState {
                 .EnumAudioEndpoints(eRender, DEVICE_STATE(DEVICE_STATEMASK_ALL))
                 .map_err(|e| err("EnumAudioEndpoints", &e))?;
             let count = collection.GetCount().map_err(|e| err("GetCount", &e))?;
-            let mut devices = Vec::new();
+            let (mut devices, mut active) = (Vec::new(), Vec::new());
             for index in 0..count {
                 let Ok(device) = collection.Item(index) else {
                     continue;
@@ -308,20 +369,41 @@ impl ComState {
                     name,
                     connected,
                 });
+                if connected {
+                    active.push(device);
+                }
             }
-            Ok(devices)
+            let default = match self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
+                Ok(device) => Ok((device_id(&device)?, device)),
+                Err(e) => Err(err("GetDefaultAudioEndpoint", &e)),
+            };
+            Ok(Endpoints {
+                read: Instant::now(),
+                devices,
+                active,
+                default,
+            })
         }
     }
 
+    fn devices(&self) -> AudioResult<Vec<Device>> {
+        Ok(self.endpoints()?.devices.clone())
+    }
+
     fn default_output(&self) -> AudioResult<Option<String>> {
-        // SAFETY: `enumerator` is a live COM object of this thread; `device_id` only reads the
-        // endpoint.
-        unsafe {
-            match self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) {
-                Ok(device) => device_id(&device).map(Some),
-                Err(_) => Ok(None),
-            }
-        }
+        Ok(self
+            .endpoints()?
+            .default
+            .as_ref()
+            .ok()
+            .map(|(id, _)| id.clone()))
+    }
+
+    /// The default output, from the endpoints kept.
+    fn default_device(&self) -> AudioResult<IMMDevice> {
+        let endpoints = self.endpoints()?;
+        let (_, device) = endpoints.default.as_ref().map_err(Clone::clone)?;
+        Ok(device.clone())
     }
 
     fn set_default_output(&self, id: &str) -> AudioResult<()> {
@@ -351,20 +433,20 @@ impl ComState {
                     .map_err(|e| err("SetDefaultEndpoint", &e))?;
             }
         }
+        // Read at once by the press that asked, before Windows reports the change.
+        self.forget_endpoints();
         Ok(())
     }
 
     /// The default output's volume control.
     fn endpoint_volume(&self) -> AudioResult<IAudioEndpointVolume> {
-        // SAFETY: `enumerator` is a live COM object of this thread; `Activate` takes no activation
+        let device = self.default_device()?;
+        // SAFETY: `device` is a live COM object of this thread; `Activate` takes no activation
         // parameters.
-        unsafe {
-            self.enumerator
-                .GetDefaultAudioEndpoint(eRender, eConsole)
-                .map_err(|e| err("GetDefaultAudioEndpoint", &e))?
-                .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-                .map_err(|e| err("IAudioEndpointVolume", &e))
-        }
+        unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }.map_err(|e| {
+            self.forget_endpoints();
+            err("IAudioEndpointVolume", &e)
+        })
     }
 
     fn master(&self) -> AudioResult<Master> {
@@ -402,98 +484,43 @@ impl ComState {
         Ok(())
     }
 
-    /// The apps with a live session on the default output, one per program (the first
-    /// session's volume, muted while all its sessions are), by name. A program's name is
-    /// its file name without `.exe`.
-    fn apps(&self) -> AudioResult<Vec<AppSound>> {
-        let mut apps: Vec<AppSound> = Vec::new();
-        // SAFETY: `enumerator` is a live COM object of this thread and every call goes through
-        // interfaces it returned; `process_file_name` only queries the process with the reported
-        // id.
-        unsafe {
-            let device = self
-                .enumerator
-                .GetDefaultAudioEndpoint(eRender, eConsole)
-                .map_err(|e| err("GetDefaultAudioEndpoint", &e))?;
-            let manager = device
-                .Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)
-                .map_err(|e| err("IAudioSessionManager2", &e))?;
-            let sessions = manager
-                .GetSessionEnumerator()
-                .map_err(|e| err("GetSessionEnumerator", &e))?;
-            for i in 0..sessions.GetCount().unwrap_or(0) {
-                let Ok(control) = sessions.GetSession(i) else {
-                    continue;
+    /// The apps with a live session on `outputs`, one per program (`app_sounds`).
+    fn apps(&self, outputs: Outputs) -> AudioResult<Vec<AppSound>> {
+        let devices = match outputs {
+            Outputs::Default => vec![self.default_device()?],
+            Outputs::Connected => self.endpoints()?.active.clone(),
+        };
+        let sessions = self.live_sessions(&devices);
+        Ok(super::app_sounds(sessions.into_iter().map(
+            |(process, volume)| {
+                // SAFETY: `volume` is a live ISimpleAudioVolume taken from `live_sessions`.
+                let (level, muted) = unsafe {
+                    (
+                        volume.GetMasterVolume().ok(),
+                        volume.GetMute().is_ok_and(windows::core::BOOL::as_bool),
+                    )
                 };
-                if control
-                    .GetState()
-                    .is_ok_and(|state| state == AudioSessionStateExpired)
-                {
-                    continue;
-                }
-                let Ok(pid) = control
-                    .cast::<IAudioSessionControl2>()
-                    .and_then(|c| c.GetProcessId())
-                else {
-                    continue;
-                };
-                let Some(process) = (pid != 0).then(|| process_file_name(pid)).flatten() else {
-                    continue;
-                };
-                let Ok(simple) = control.cast::<ISimpleAudioVolume>() else {
-                    continue;
-                };
-                let muted = simple.GetMute().is_ok_and(windows::core::BOOL::as_bool);
-                // A program is muted only while every one of its sessions is.
-                if let Some(app) = apps
-                    .iter_mut()
-                    .find(|a| a.process.eq_ignore_ascii_case(&process))
-                {
-                    app.muted &= muted;
-                    continue;
-                }
-                let Ok(volume) = simple.GetMasterVolume() else {
-                    continue;
-                };
-                let name = Path::new(&process)
-                    .file_stem()
-                    .map_or_else(|| process.clone(), |s| s.to_string_lossy().into_owned());
-                apps.push(AppSound {
-                    process,
-                    name,
-                    volume,
-                    muted,
-                });
-            }
-        }
-        apps.sort_by_key(|a| a.name.to_lowercase());
-        Ok(apps)
+                (process, level, muted)
+            },
+        )))
     }
 
-    /// Live sessions of `process` across all active render endpoints.
-    fn sessions(&self, process: &str) -> AudioResult<Vec<ISimpleAudioVolume>> {
+    /// Every live session on `devices`, with its program's file name.
+    fn live_sessions(&self, devices: &[IMMDevice]) -> Vec<(String, ISimpleAudioVolume)> {
         let mut found = Vec::new();
-        // SAFETY: `enumerator` is a live COM object of this thread and every call goes through
-        // interfaces it returned; `process_file_name` only queries the process with the reported
-        // id.
+        // SAFETY: the devices are live COM objects of this thread and every call goes through
+        // interfaces they returned; `process_file_name` only queries the process with the
+        // reported id.
         unsafe {
-            let collection = self
-                .enumerator
-                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
-                .map_err(|e| err("EnumAudioEndpoints", &e))?;
-            let count = collection.GetCount().map_err(|e| err("GetCount", &e))?;
-            for index in 0..count {
-                let Ok(device) = collection.Item(index) else {
-                    continue;
-                };
+            for device in devices {
                 let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
+                    self.forget_endpoints();
                     continue;
                 };
                 let Ok(sessions) = manager.GetSessionEnumerator() else {
                     continue;
                 };
-                let total = sessions.GetCount().unwrap_or(0);
-                for i in 0..total {
+                for i in 0..sessions.GetCount().unwrap_or(0) {
                     let Ok(control) = sessions.GetSession(i) else {
                         continue;
                     };
@@ -503,24 +530,33 @@ impl ComState {
                     {
                         continue;
                     }
-                    let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
+                    let Ok(pid) = control
+                        .cast::<IAudioSessionControl2>()
+                        .and_then(|c| c.GetProcessId())
+                    else {
                         continue;
                     };
-                    let Ok(pid) = control2.GetProcessId() else {
+                    let Some(process) = (pid != 0).then(|| process_file_name(pid)).flatten() else {
                         continue;
                     };
-                    if pid == 0 {
-                        continue;
-                    }
-                    let matches = process_file_name(pid)
-                        .is_some_and(|name| name.eq_ignore_ascii_case(process));
-                    if matches && let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
-                        found.push(volume);
+                    if let Ok(volume) = control.cast::<ISimpleAudioVolume>() {
+                        found.push((process, volume));
                     }
                 }
             }
         }
-        Ok(found)
+        found
+    }
+
+    /// Live sessions of `process` across all active render endpoints.
+    fn sessions(&self, process: &str) -> AudioResult<Vec<ISimpleAudioVolume>> {
+        let endpoints = self.endpoints()?;
+        Ok(self
+            .live_sessions(&endpoints.active)
+            .into_iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(process))
+            .map(|(_, volume)| volume)
+            .collect())
     }
 
     fn app_volume(&self, process: &str) -> AudioResult<Option<f32>> {

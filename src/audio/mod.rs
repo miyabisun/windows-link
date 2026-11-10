@@ -89,7 +89,7 @@ impl Audio for UnavailableAudio {
         Err(AudioError(self.0.clone()))
     }
 
-    fn apps(&self) -> AudioResult<Vec<AppSound>> {
+    fn apps(&self, _: Outputs) -> AudioResult<Vec<AppSound>> {
         Err(AudioError(self.0.clone()))
     }
 }
@@ -115,6 +115,76 @@ pub trait Audio: Send + Sync + 'static {
     fn master(&self) -> AudioResult<Master>;
     /// Change the default output's volume, its mute, or both.
     fn set_master(&self, volume: Option<f32>, muted: Option<bool>) -> AudioResult<()>;
-    /// The apps with sound on the default output, one per program, by name.
-    fn apps(&self) -> AudioResult<Vec<AppSound>>;
+    /// The apps with sound on `outputs`, one per program, by name.
+    fn apps(&self, outputs: Outputs) -> AudioResult<Vec<AppSound>>;
+}
+
+/// Which outputs' apps to read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Outputs {
+    /// The default output, as Windows' volume mixer shows.
+    Default,
+    /// Every connected output, as the app buttons follow a program.
+    Connected,
+}
+
+/// One app per program from its live sessions (program file name, volume when it can
+/// be read, muted), by name: the first session's volume, muted while every session is.
+/// A program's name is its file name without `.exe`.
+pub fn app_sounds(
+    sessions: impl IntoIterator<Item = (String, Option<f32>, bool)>,
+) -> Vec<AppSound> {
+    let mut apps: Vec<AppSound> = Vec::new();
+    for (process, volume, muted) in sessions {
+        if let Some(app) = apps
+            .iter_mut()
+            .find(|a| a.process.eq_ignore_ascii_case(&process))
+        {
+            app.muted &= muted;
+        } else if let Some(volume) = volume {
+            let name = std::path::Path::new(&process)
+                .file_stem()
+                .map_or_else(|| process.clone(), |s| s.to_string_lossy().into_owned());
+            apps.push(AppSound {
+                process,
+                name,
+                volume,
+                muted,
+            });
+        }
+    }
+    apps.sort_by_key(|a| a.name.to_lowercase());
+    apps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppSound, app_sounds};
+
+    #[test]
+    fn a_program_is_one_app_with_its_first_volume_muted_while_all_its_sessions_are() {
+        let app = |process: &str, name: &str, volume: f32, muted: bool| AppSound {
+            process: process.into(),
+            name: name.into(),
+            volume,
+            muted,
+        };
+        let apps = app_sounds([
+            ("Steam.exe".to_owned(), Some(0.4), true),
+            ("BlueArchive.exe".to_owned(), Some(0.7), true),
+            // A session whose volume cannot be read does not make the app.
+            ("zen.exe".to_owned(), None, false),
+            ("bluearchive.exe".to_owned(), Some(0.2), false),
+            ("steam.exe".to_owned(), Some(1.0), true),
+            ("zen.exe".to_owned(), Some(0.5), false),
+        ]);
+        assert_eq!(
+            apps,
+            [
+                app("BlueArchive.exe", "BlueArchive", 0.7, false),
+                app("Steam.exe", "Steam", 0.4, true),
+                app("zen.exe", "zen", 0.5, false),
+            ]
+        );
+    }
 }

@@ -20,6 +20,8 @@ pub struct FakeState {
     /// process file names (lowercase) muted by themselves
     pub muted: HashSet<String>,
     pub master: Master,
+    /// How often the apps' sound and the master were read.
+    pub reads: usize,
 }
 
 impl FakeAudio {
@@ -34,6 +36,7 @@ impl FakeAudio {
                     volume: 0.5,
                     muted: false,
                 },
+                reads: 0,
             }),
         }
     }
@@ -75,17 +78,15 @@ impl Audio for FakeAudio {
     }
 
     fn app_volume(&self, process: &str) -> AudioResult<Option<f32>> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .volumes
-            .get(&process.to_lowercase())
-            .copied())
+        let mut state = self.state.lock().unwrap();
+        state.reads += 1;
+        Ok(state.volumes.get(&process.to_lowercase()).copied())
     }
 
     fn master(&self) -> AudioResult<Master> {
-        Ok(self.state.lock().unwrap().master)
+        let mut state = self.state.lock().unwrap();
+        state.reads += 1;
+        Ok(state.master)
     }
 
     fn set_master(&self, volume: Option<f32>, muted: Option<bool>) -> AudioResult<()> {
@@ -100,8 +101,9 @@ impl Audio for FakeAudio {
     }
 
     /// One app per volume, named by its file name without `.exe`.
-    fn apps(&self) -> AudioResult<Vec<AppSound>> {
-        let state = self.state.lock().unwrap();
+    fn apps(&self, _: super::Outputs) -> AudioResult<Vec<AppSound>> {
+        let mut state = self.state.lock().unwrap();
+        state.reads += 1;
         let mut apps: Vec<AppSound> = state
             .volumes
             .iter()
@@ -117,7 +119,8 @@ impl Audio for FakeAudio {
     }
 
     fn app_muted(&self, process: &str) -> AudioResult<Option<bool>> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state.reads += 1;
         let process = process.to_lowercase();
         Ok(state
             .volumes

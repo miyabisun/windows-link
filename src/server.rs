@@ -847,7 +847,10 @@ async fn mixer(State(state): State<AppState>) -> Response {
 async fn mixer_response(state: &AppState) -> Response {
     let audio = state.audio.clone();
     let read = tokio::task::spawn_blocking(move || {
-        Ok::<_, crate::audio::AudioError>((audio.master()?, audio.apps()?))
+        Ok::<_, crate::audio::AudioError>((
+            audio.master()?,
+            audio.apps(crate::audio::Outputs::Default)?,
+        ))
     })
     .await;
     match read {

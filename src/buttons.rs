@@ -1,11 +1,11 @@
 //! Button state and press logic, independent of HTTP and of the audio backend.
 
-use std::path::PathBuf;
+use std::{cell::OnceCell, path::PathBuf};
 
 use serde::Serialize;
 
 use crate::{
-    audio::{Audio, AudioError, Device},
+    audio::{AppSound, Audio, AudioError, AudioResult, Device, Master, Outputs},
     config::{ButtonConfig, ButtonSpec, Config},
     discord::ServerIcons,
     launch::{Launcher, Processes, Program, is_running},
@@ -148,10 +148,15 @@ pub fn round2(value: f32) -> f64 {
     (f64::from(value) * 100.0).round() / 100.0
 }
 
-/// Snapshot of what the output buttons need, read once per refresh.
+/// Snapshot of what the audio buttons need, read once per refresh.
 pub struct AudioSnapshot {
     pub devices: Vec<Device>,
     pub default_output: Option<String>,
+    /// The apps with sound on any connected output and the default output's volume,
+    /// each read when the first button asks and shared by the rest: asking Windows
+    /// costs milliseconds, and the buttons are read every second.
+    apps: OnceCell<AudioResult<Vec<AppSound>>>,
+    master: OnceCell<AudioResult<Master>>,
 }
 
 impl AudioSnapshot {
@@ -159,7 +164,25 @@ impl AudioSnapshot {
         Ok(Self {
             devices: audio.devices()?,
             default_output: audio.default_output()?,
+            apps: OnceCell::new(),
+            master: OnceCell::new(),
         })
+    }
+
+    /// The sound of `process` (file name), if it has any.
+    fn app(&self, audio: &dyn Audio, process: &str) -> AudioResult<Option<&AppSound>> {
+        let apps = self
+            .apps
+            .get_or_init(|| audio.apps(Outputs::Connected))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(apps
+            .iter()
+            .find(|app| app.process.eq_ignore_ascii_case(process)))
+    }
+
+    fn master(&self, audio: &dyn Audio) -> AudioResult<Master> {
+        self.master.get_or_init(|| audio.master()).clone()
     }
 }
 
@@ -307,26 +330,26 @@ fn state(
                 options,
             }
         }
-        ButtonSpec::AppVolumeToggle { process, levels } => match audio.app_volume(process) {
-            Ok(volume) => ButtonState::Volume {
-                running: volume.is_some(),
-                volume: volume.map(round2),
+        ButtonSpec::AppVolumeToggle { process, levels } => match snapshot.app(audio, process) {
+            Ok(app) => ButtonState::Volume {
+                running: app.is_some(),
+                volume: app.map(|app| round2(app.volume)),
                 levels: [round2(levels[0]), round2(levels[1])],
             },
             Err(error) => ButtonState::Error {
                 message: error.to_string(),
             },
         },
-        ButtonSpec::AppMuteToggle { process } => match audio.app_muted(process) {
-            Ok(muted) => ButtonState::AppMute {
-                running: muted.is_some(),
-                muted: muted.unwrap_or(false),
+        ButtonSpec::AppMuteToggle { process } => match snapshot.app(audio, process) {
+            Ok(app) => ButtonState::AppMute {
+                running: app.is_some(),
+                muted: app.is_some_and(|app| app.muted),
             },
             Err(error) => ButtonState::Error {
                 message: error.to_string(),
             },
         },
-        ButtonSpec::MuteToggle {} | ButtonSpec::Mixer {} => match audio.master() {
+        ButtonSpec::MuteToggle {} | ButtonSpec::Mixer {} => match snapshot.master(audio) {
             Ok(master) => {
                 let (muted, volume) = (master.muted, round2(master.volume));
                 if matches!(spec, ButtonSpec::Mixer {}) {
@@ -740,6 +763,63 @@ mod tests {
         assert_eq!(audio.app_volume("BlueArchive.exe").unwrap(), Some(0.7));
         press(&config, "ba", &audio, &launcher).unwrap();
         assert_eq!(audio.app_muted("BlueArchive.exe").unwrap(), Some(false));
+    }
+
+    #[test]
+    fn the_buttons_of_one_refresh_share_one_reading_of_the_apps_and_one_of_the_master() {
+        let config = config::parse(
+            "buttons:
+  - id: sf6
+    label: SF6
+    type: audio.app_volume_toggle
+    process: StreetFighter6.exe
+    levels: [0.2, 1.0]
+  - id: ba
+    label: BA
+    type: audio.app_mute_toggle
+    process: BlueArchive.exe
+  - id: mute
+    label: Mute
+    type: audio.mute_toggle
+  - id: mixer
+    label: Mixer
+    type: audio.mixer
+",
+        )
+        .unwrap();
+        let audio = FakeAudio::new(devices(), Some("id-motu"));
+        audio.set_volume("StreetFighter6.exe", 0.2);
+        audio.set_volume("BlueArchive.exe", 0.7);
+        let snapshot = AudioSnapshot::read(&audio).unwrap();
+        let states: Vec<ButtonState> = config
+            .buttons
+            .iter()
+            .map(|button| view(&config, button, &readings(&snapshot), &audio).state)
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ButtonState::Volume {
+                    running: true,
+                    volume: Some(0.2),
+                    levels: [0.2, 1.0]
+                },
+                ButtonState::AppMute {
+                    running: true,
+                    muted: false
+                },
+                ButtonState::Mute {
+                    muted: false,
+                    volume: 0.5
+                },
+                ButtonState::Mixer {
+                    muted: false,
+                    volume: 0.5
+                },
+            ]
+        );
+        // Each reading asks Windows across processes, every second.
+        assert_eq!(audio.state.lock().unwrap().reads, 2, "readings");
     }
 
     #[test]
