@@ -538,3 +538,76 @@ fn list_devices() -> ExitCode {
     }
     ExitCode::SUCCESS
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use tokio::sync::Notify;
+    use windows_link::{audio::UnavailableAudio, config, server::AppState};
+
+    #[derive(Default)]
+    struct Shop {
+        read: AtomicUsize,
+        downloaded: AtomicUsize,
+        ended: AtomicUsize,
+    }
+
+    fn count(counter: &AtomicUsize) {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Wait until `count` reaches `wanted`, as the rounds run on their own task.
+    async fn reaches(count: &AtomicUsize, wanted: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while count.load(Ordering::SeqCst) < wanted {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the round got there");
+    }
+
+    #[tokio::test]
+    async fn a_shop_downloads_only_when_asked() {
+        let shop = Arc::new(Shop::default());
+        let wake = Arc::new(Notify::new());
+        let state = AppState::new(
+            config::parse("buttons: []\n").unwrap(),
+            Arc::new(UnavailableAudio("no audio".into())),
+        );
+        tokio::spawn(super::shop_rounds(
+            vec![shop.clone()],
+            state,
+            wake.clone(),
+            (
+                |shop: &Shop| count(&shop.read),
+                |shop: &Shop| count(&shop.downloaded),
+                |shop: &Shop| count(&shop.ended),
+            ),
+        ));
+        // At start the purchases are read and the round ends: nothing is downloaded.
+        reaches(&shop.ended, 1).await;
+        assert_eq!(shop.read.load(Ordering::SeqCst), 1, "read at start");
+        assert_eq!(
+            shop.downloaded.load(Ordering::SeqCst),
+            0,
+            "downloaded unasked"
+        );
+        // A library update or a sign-in: read again, then downloaded.
+        wake.notify_one();
+        reaches(&shop.downloaded, 1).await;
+        assert_eq!(shop.read.load(Ordering::SeqCst), 2, "read again");
+        assert_eq!(
+            shop.ended.load(Ordering::SeqCst),
+            1,
+            "ended by the download"
+        );
+    }
+}
