@@ -207,9 +207,11 @@ buttons:
   purple to light blue, go once round it in a second and a half. The cross (precision
   select) becomes a sight to aim with, a quarter wider than the arrow and pointing with
   its middle, after another student's halo for each colour: Shiroko's for blue, Midori's
-  for green, Momoi's for red. Turning the highlight off brings the user's own cursors
-  back. Only these cursors are replaced (the hand over a link is not), and a program
-  that draws a cursor of its own keeps it. Whether it is on and its colour are
+  for green, Momoi's for red. The hand over a link becomes Junko's halo in the
+  highlight's colour (a long point over a dot between two arcs), as big as the arrow and
+  pointing with the tip of its point, where the hand's fingertip is. Turning the
+  highlight off brings the user's own cursors back. Only these cursors are replaced, and
+  a program that draws a cursor of its own keeps it. Whether it is on and its colour are
   kept in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
 
   ```yaml

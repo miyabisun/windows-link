@@ -1,7 +1,8 @@
 //! Halos drawn into cursors (the user's of 2026-11-10): Blue Archive students' halos,
 //! drawn here from their shapes as measured off pictures of them (350 pixels square),
-//! not copied from the pictures. Anna's is in the busy cursors, and the three to aim
-//! with stand in for Windows' cross (over a link they hid the link's words).
+//! not copied from the pictures. Anna's is in the busy cursors, three to aim with stand
+//! in for Windows' cross (over a link they hid the link's words), and Junko's, narrow
+//! and pointing with its top, for the hand over a link.
 
 use std::sync::LazyLock;
 
@@ -20,6 +21,9 @@ pub enum Halo {
     Midori,
     /// Midori's shape in pink.
     Momoi,
+    /// Taller than wide: a long four-sided point up, a dot under it, and an arc at each
+    /// side of the dot with a barb at each end. Her own is red; here in the colour given.
+    Junko(Palette),
 }
 
 impl Halo {
@@ -104,6 +108,7 @@ impl Halo {
             Self::Anna => (141.25, 6.6),
             Self::Shiroko => (153.5, 15.0),
             Self::Midori | Self::Momoi => (151.5, 7.35),
+            Self::Junko(_) => (159.5, 9.5),
         }
     }
 
@@ -134,6 +139,24 @@ impl Halo {
                 let stars = -super::distance(&STAR, aside, along);
                 ring(95.4, 102.75).max(ring(122.3, 131.2)).max(stars)
             }
+            Self::Junko(_) => {
+                // The same at both sides of the middle; the arcs' and the dot's middle is
+                // below the halo's own.
+                let aside = x.abs();
+                let round = aside.hypot(y - 49.5);
+                let arc = (round - 68.3)
+                    .min(77.8 - round)
+                    .min(y + 19.5)
+                    .min(aside - 10.5);
+                let dot = 18.0 - aside.hypot(y - 51.0);
+                let barbs =
+                    [&UPPER_BARB[..], &LOWER_BARB[..]].map(|barb| -super::distance(barb, aside, y));
+                (-super::distance(&POINT, x, y))
+                    .max(dot)
+                    .max(arc)
+                    .max(barbs[0])
+                    .max(barbs[1])
+            }
         }
     }
 
@@ -162,6 +185,15 @@ impl Halo {
                 [251.0, 191.0, 199.0],
                 f32::midpoint(y, 1.0),
             ),
+            Self::Junko(palette) => {
+                let hue = match palette {
+                    Palette::Red => 342.0,
+                    other => other.hues().0,
+                };
+                // Deep down to the middle, paler below it; a little short of full light.
+                let paler = ((y - 0.02) / 0.7).clamp(0.0, 1.0);
+                super::hsv(hue, 0.24f32.mul_add(-paler, 0.77)).map(|channel| channel * 0.95)
+            }
         }
     }
 }
@@ -186,6 +218,43 @@ fn bar((along, aside): (f32, f32), (from, to): (f32, f32), half: (f32, f32)) -> 
     let wide = (half.1 - half.0).mul_add(((along - from) / (to - from)).clamp(0.0, 1.0), half.0);
     (along - from).min(to - along).min(wide - aside.abs())
 }
+
+/// The outline of Junko's point, as (aside, down) in the picture's pixels from the
+/// halo's middle: its tip at the top, widest a little below it, a long tail down.
+static POINT: LazyLock<Vec<(f32, f32)>> = LazyLock::new(|| {
+    let side = [
+        (3.5, -150.5),
+        (7.5, -138.5),
+        (11.5, -126.5),
+        (17.0, -114.5),
+        (24.5, -102.5),
+        (33.0, -91.5),
+        (26.5, -78.5),
+        (21.0, -66.5),
+        (16.5, -54.5),
+        (12.5, -42.5),
+        (9.0, -30.5),
+        (6.5, -18.5),
+        (4.0, -6.5),
+        (2.5, 5.5),
+    ];
+    std::iter::once((0.0, -159.5))
+        .chain(side.iter().copied())
+        .chain(std::iter::once((0.0, 16.5)))
+        .chain(side.iter().rev().map(|&(aside, down)| (-aside, down)))
+        .collect()
+});
+/// The barbs at the ends of Junko's right arc, as `POINT`: one standing up from its
+/// upper end, and an arrowhead down from its lower end.
+const UPPER_BARB: [(f32, f32); 3] = [(35.0, -53.5), (35.0, -16.5), (20.5, -16.5)];
+const LOWER_BARB: [(f32, f32); 6] = [
+    (11.0, 105.5),
+    (19.5, 114.5),
+    (26.5, 127.5),
+    (29.0, 159.5),
+    (13.5, 133.5),
+    (10.5, 128.5),
+];
 
 /// The outline of Midori's star on its spoke, as (aside, along) in the picture's
 /// pixels from the halo's middle: a long point inward, a short one outward, their
@@ -353,6 +422,41 @@ mod tests {
             |[_, g, _, a]: [u8; 4]| (f32::from(g) - 62.0).max(0.0) / 190.0 * f32::from(a) / 255.0;
         let green: f32 = (0..40usize).map(|row| own(small[row * 40 + 25])).sum();
         assert!(green > 5.8, "{green} dots of green down the column");
+    }
+
+    /// Junko's is taller than wide: a long point up, a dot under it, and an arc at each
+    /// side of the dot.
+    #[test]
+    fn junkos_halo_is_a_point_over_a_dot_between_two_arcs() {
+        let halo = big(Halo::Junko(Palette::Red), 0.0);
+        let lit = |far: f32, degrees: f32| at(&halo, far, degrees)[3] == 255;
+        assert!(lit(0.5, 0.0) && lit(0.95, 0.0), "the point reaches the top");
+        assert!(lit(0.32, 180.0), "the dot");
+        assert_eq!(at(&halo, 0.155, 180.0)[3], 0, "clear between point and dot");
+        assert!(
+            lit(0.553, 124.1) && lit(0.553, 235.9),
+            "an arc at each side"
+        );
+        assert_eq!(at(&halo, 0.4, 141.0)[3], 0, "clear between dot and arc");
+        assert_eq!(at(&halo, 0.6, 90.0)[3], 0, "narrower than tall");
+        assert_eq!(at(&halo, 0.9, 180.0)[3], 0, "open at the bottom");
+    }
+
+    /// Junko's halo is drawn in each colour of the highlight (the user's of
+    /// 2026-11-10): the same shape, red as her own, green or blue.
+    #[test]
+    fn junkos_halo_comes_in_the_highlights_three_colours() {
+        let of = |palette| big(Halo::Junko(palette), 0.0);
+        let (red, green, blue) = (of(Palette::Red), of(Palette::Green), of(Palette::Blue));
+        let shape = |picture: &[[u8; 4]]| picture.iter().map(|dot| dot[3]).collect::<Vec<_>>();
+        assert_eq!(shape(&red), shape(&green));
+        assert_eq!(shape(&red), shape(&blue));
+        let [r, g, b, _] = at(&red, 0.5, 0.0);
+        assert!(r > g + 100 && r > b + 80, "red {:?}", [r, g, b]);
+        let [r, g, b, _] = at(&green, 0.5, 0.0);
+        assert!(g > r + 100 && g > b + 80, "green {:?}", [r, g, b]);
+        let [r, g, b, _] = at(&blue, 0.5, 0.0);
+        assert!(b > r + 100 && g > r + 80, "blue {:?}", [r, g, b]);
     }
 
     /// Each colour of the highlight aims with its own halo.

@@ -1,5 +1,5 @@
-//! Putting the highlight's cursors in for Windows' (the arrow, the busy ones and the
-//! cross), and Windows' own back.
+//! Putting the highlight's cursors in for Windows' (the arrow, the busy ones, the cross
+//! and the hand over a link), and Windows' own back.
 
 use std::{
     ffi::c_void,
@@ -17,7 +17,7 @@ use windows::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             WindowsAndMessaging::{
                 GetCursorPos, HCURSOR, IMAGE_CURSOR, LR_LOADFROMFILE, LoadImageW, OCR_APPSTARTING,
-                OCR_CROSS, OCR_NORMAL, OCR_WAIT, SPI_SETCURSORS, SYSTEM_CURSOR_ID,
+                OCR_CROSS, OCR_HAND, OCR_NORMAL, OCR_WAIT, SPI_SETCURSORS, SYSTEM_CURSOR_ID,
                 SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetSystemCursor, SystemParametersInfoW,
             },
         },
@@ -84,8 +84,10 @@ pub fn restore() {
 ///   highlight, so the cursor shrank for a moment (the user's of 2026-11-10);
 /// - Anna's halo alone, its colours going round, for Windows' wait cursor;
 /// - the halo to aim with in `palette`, pointing with its middle, for Windows' cross
-///   (the user's of 2026-11-10; over a link it hid the link's words, so the hand is
-///   left alone).
+///   (the user's of 2026-11-10; over a link it hid the link's words);
+/// - Junko's halo in `palette`, as big as the arrow and pointing with the tip of its
+///   point, where the hand's fingertip is, for the hand over a link (the user's of
+///   2026-11-10): it is narrow and hangs under the place pointed at.
 fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
     let write = |what: &str, file: Vec<u8>| {
         let path = dir.join(format!("cursor-highlight-{what}"));
@@ -115,27 +117,35 @@ fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
         OCR_APPSTARTING,
     )?;
 
-    // A halo alone, `across` pixels square and pointing with its middle, once for each turn.
-    let alone = |halo: Halo, across: u32, turns: &[f32]| -> Vec<Vec<u8>> {
+    // A halo alone, `across` pixels square, once for each turn: pointing with its middle,
+    // or with its top, which its edge keeps a dot and a half from the picture's.
+    let alone = |halo: Halo, across: u32, turns: &[f32], top: bool| -> Vec<Vec<u8>> {
         let (middle, half) = (across as f32 / 2.0, u16::try_from(across / 2).unwrap_or(0));
         halo.drawn(across, (middle, middle), across as f32, turns)
             .iter()
-            .map(|frame| super::cur(frame, across, (half, half)))
+            .map(|frame| super::cur(frame, across, (half, if top { 2 } else { half })))
             .collect()
     };
     let wait = super::ani(
-        &alone(Halo::Anna, size, &super::turns()),
+        &alone(Halo::Anna, size, &super::turns(), false),
         super::TURN_JIFFIES,
     );
     put(&write(&format!("wait-{size}.ani"), wait)?, size, OCR_WAIT)?;
 
     // A quarter wider than the arrow: rings to aim with read thin at the arrow's size.
     let across = (size * 5 / 4).min(256);
-    let aim = alone(Halo::aim(palette), across, &[0.0]).concat();
+    let aim = alone(Halo::aim(palette), across, &[0.0], false).concat();
     put(
         &write(&format!("{colour}-aim-{size}.cur"), aim)?,
         across,
         OCR_CROSS,
+    )?;
+
+    let link = alone(Halo::Junko(palette), size, &[0.0], true).concat();
+    put(
+        &write(&format!("{colour}-link-{size}.cur"), link)?,
+        size,
+        OCR_HAND,
     )
 }
 
