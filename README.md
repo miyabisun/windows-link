@@ -200,8 +200,11 @@ buttons:
   green teal. The arrow is changed once, when the button is pressed or its colour chosen:
   it is as big as the arrow Windows draws on the monitor the cursor is on at that moment
   (the pointer size chosen in Windows' settings, at that monitor's DPI) and stays that
-  size on the other monitors. Turning it off brings the user's own cursors back. Only the arrow is replaced, and
-  a program that draws a cursor of its own keeps it. Whether it is on and its colour are
+  size on the other monitors. The arrow Windows shows while a program starts (its arrow
+  with a turning ring) is replaced too, by the same arrow with a ring of its own beside
+  it, so the cursor does not shrink for that moment. Turning it off brings the user's own
+  cursors back. Only these two are replaced, and a program that draws a cursor of its own
+  keeps it. Whether it is on and its colour are
   kept in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
 
   ```yaml

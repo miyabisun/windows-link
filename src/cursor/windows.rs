@@ -1,4 +1,5 @@
-//! Putting the highlighted arrow in for Windows' arrow, and Windows' own back.
+//! Putting the highlighted arrow in for Windows' arrow and for its arrow with the busy ring,
+//! and Windows' own back.
 
 use std::{
     ffi::c_void,
@@ -15,8 +16,8 @@ use windows::{
         UI::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             WindowsAndMessaging::{
-                GetCursorPos, HCURSOR, IMAGE_CURSOR, LR_LOADFROMFILE, LoadImageW, OCR_NORMAL,
-                SPI_SETCURSORS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetSystemCursor,
+                GetCursorPos, HCURSOR, IMAGE_CURSOR, LR_LOADFROMFILE, LoadImageW, OCR_APPSTARTING,
+                OCR_NORMAL, SPI_SETCURSORS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetSystemCursor,
                 SystemParametersInfoW,
             },
         },
@@ -83,7 +84,26 @@ fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
     let cursor = load(&path, size)?;
     // SAFETY: `cursor` is a cursor `load` just created and nothing else owns; SetSystemCursor takes
     // it over.
-    unsafe { SetSystemCursor(cursor, OCR_NORMAL) }.map_err(|e| e.to_string())
+    unsafe { SetSystemCursor(cursor, OCR_NORMAL) }.map_err(|e| e.to_string())?;
+    apply_busy(dir, size, palette)
+}
+
+/// The same arrow with a turning ring, in for the arrow Windows shows while a program
+/// starts: Windows' own is smaller than the highlight, so the cursor shrank for a
+/// moment (the user's of 2026-11-10).
+fn apply_busy(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
+    // A cursor is at most 256 pixels square, and this one a quarter wider than its arrow.
+    let size = size.min(204);
+    let width = super::busy_side(size);
+    let frames: Vec<Vec<u8>> = super::busy_frames(size, palette)
+        .iter()
+        .map(|frame| super::cur(frame, width, super::hotspot(size)))
+        .collect();
+    let path = dir.join(format!("cursor-highlight-{}-{size}.ani", palette.name()));
+    std::fs::write(&path, super::ani(&frames, super::BUSY_JIFFIES)).map_err(|e| e.to_string())?;
+    let cursor = load(&path, width)?;
+    // SAFETY: as in `apply`: `cursor` was just created by `load` and is handed over.
+    unsafe { SetSystemCursor(cursor, OCR_APPSTARTING) }.map_err(|e| e.to_string())
 }
 
 fn load(path: &Path, size: u32) -> Result<HCURSOR, String> {
