@@ -25,7 +25,7 @@ use windows_link::{
     fanza::{self, FanzaLibrary, FanzaShop},
     hold::{Colors, HIGHLIGHTS, HOLDS, Holds},
     home_link,
-    launch::windows::WindowsLauncher,
+    launch::{watch::WindowsWatch, windows::WindowsLauncher},
     library::{GameLibrary, Pins},
     logging,
     mouse::windows::WindowsPointer,
@@ -160,7 +160,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .with_holds(Arc::new(Holds::open(&database, HOLDS)?))
         .with_highlights(highlights)
         .with_highlight_colors(colors)
-        .with_pointer(Arc::new(WindowsPointer::new(Arc::new(WindowsLauncher))));
+        .with_pointer(Arc::new(WindowsPointer::new(Arc::new(WindowsLauncher))))
+        .with_process_watch(Arc::new(WindowsWatch::start(changes.clone())));
     if highlighting {
         state = state.with_arrow(Arc::new(cursor::windows::WindowsArrow(data_dir())));
     }

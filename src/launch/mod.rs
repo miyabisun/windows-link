@@ -46,6 +46,20 @@ pub trait Launcher: Send + Sync + 'static {
     fn close(&self, process: &str) -> Result<usize, String>;
 }
 
+/// Tells when a program may have started or stopped, so nothing has to look for it
+/// again and again.
+pub trait ProcessWatch: Send + Sync + 'static {
+    /// Tell when one of `programs` (lowercase file names, running now) exits.
+    fn watch_exits(&self, programs: Processes);
+}
+
+/// Watches nothing (the tests').
+pub struct NoWatch;
+
+impl ProcessWatch for NoWatch {
+    fn watch_exits(&self, _: Processes) {}
+}
+
 pub fn is_running(processes: &Processes, process: &str) -> bool {
     processes.contains(&process.to_lowercase())
 }
@@ -73,6 +87,8 @@ pub fn working_dir(target: &str) -> Option<std::path::PathBuf> {
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
 }
+
+pub mod watch;
 
 pub mod windows {
     use std::{
@@ -120,7 +136,7 @@ pub mod windows {
     /// The running processes by ID and lowercase file name, read from the system in one
     /// call. It is read every second, and a `ToolHelp` snapshot, which maps its copy of
     /// the list again for every process stepped to, took three times as long.
-    fn snapshot() -> Vec<(u32, String)> {
+    pub(super) fn snapshot() -> Vec<(u32, String)> {
         // Kept between readings (the list is a few hundred kilobytes); `u64`s, so the
         // entries the system writes are aligned.
         static BUFFER: Mutex<Vec<u64>> = Mutex::new(Vec::new());

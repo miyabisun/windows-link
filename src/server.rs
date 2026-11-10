@@ -26,16 +26,13 @@ use crate::{
     discord::{Discord, NoDiscord},
     hold::{Colors, HIGHLIGHTS, HOLDS, Holds},
     icons,
-    launch::{Launcher, windows::WindowsLauncher},
+    launch::{Launcher, NoWatch, ProcessWatch, windows::WindowsLauncher},
     library::{
         self, GameLibrary, KeyError, LabelError, NoLibrary, Picture, Pin, Pins, Update, UpdateError,
     },
     mouse::{self, NoMouse, Pointer, ScrollError, WheelError, WheelRequest},
     power,
 };
-
-/// How often state is re-read to catch changes Windows does not notify (e.g. mixer volume).
-pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Library pictures read from this PC, by `<button>/<item>`, with their media type.
 type Pictures = std::collections::HashMap<String, (Arc<Vec<u8>>, &'static str)>;
@@ -67,6 +64,8 @@ pub struct AppState {
     arrow_shown: Arc<std::sync::Mutex<ArrowShown>>,
     /// Turns the wheel of the mouse board for `POST /buttons/{id}/wheel`.
     pointer: Arc<dyn Pointer>,
+    /// Tells when a program the buttons show as running exits.
+    watch: Arc<dyn ProcessWatch>,
 }
 
 /// What Windows' arrow was last made to show.
@@ -110,6 +109,7 @@ impl AppState {
             arrow: Arc::new(NoArrow),
             arrow_shown: Arc::default(),
             pointer: Arc::new(NoMouse),
+            watch: Arc::new(NoWatch),
         }
     }
 
@@ -202,6 +202,14 @@ impl AppState {
         self
     }
 
+    /// Hear of programs exiting through `watch` (without one their buttons change when
+    /// something else has the buttons read).
+    #[must_use]
+    pub fn with_process_watch(mut self, watch: Arc<dyn ProcessWatch>) -> Self {
+        self.watch = watch;
+        self
+    }
+
     /// Highlight the cursor through `arrow` (without one Windows' cursors are left alone).
     #[must_use]
     pub fn with_arrow(mut self, arrow: Arc<dyn Arrow>) -> Self {
@@ -287,6 +295,7 @@ impl AppState {
         let highlights = self.highlights.clone();
         let colors = self.highlight_colors.clone();
         let pins = self.pins.clone();
+        let watch = self.watch.clone();
         let sign_ins: std::collections::HashMap<String, String> = self
             .libraries
             .iter()
@@ -298,7 +307,7 @@ impl AppState {
                 audio.as_ref(),
                 &server_icons,
                 &sign_ins,
-                launcher.as_ref(),
+                (launcher.as_ref(), watch.as_ref()),
                 &pins,
                 &buttons::Toggles {
                     holds: &holds,
@@ -341,13 +350,13 @@ impl AppState {
         let _ = tokio::task::spawn_blocking(move || arrow.show(wanted)).await;
     }
 
-    /// Refresh on every Windows notification and at least every `POLL_INTERVAL`.
+    /// Read the buttons again each time `changes` is notified: Windows reported a
+    /// change (audio, a window that came or went, a program that exited) or the Discord
+    /// icons were read. Nothing is read on a timer (until 2026-11-10 everything was,
+    /// every second); a press and a panel connecting read them too.
     pub async fn run_refresher(self, changes: Arc<Notify>) {
         loop {
-            tokio::select! {
-                () = changes.notified() => {}
-                () = tokio::time::sleep(POLL_INTERVAL) => {}
-            }
+            changes.notified().await;
             self.refresh().await;
         }
     }
@@ -358,7 +367,7 @@ fn compute(
     audio: &dyn Audio,
     server_icons: &crate::discord::ServerIcons,
     sign_ins: &std::collections::HashMap<String, String>,
-    launcher: &dyn Launcher,
+    (launcher, watch): (&dyn Launcher, &dyn ProcessWatch),
     pins: &Pins,
     toggles: &buttons::Toggles<'_>,
 ) -> Vec<ButtonView> {
@@ -376,6 +385,7 @@ fn compute(
     });
     let snapshot = AudioSnapshot::read(audio);
     let processes = launcher.processes();
+    watch.watch_exits(buttons::running_programs(config, &processes));
     let pins = pins.all().unwrap_or_else(|err| {
         warn!(%err, "cannot read the library pins");
         library::Pinned::new()
@@ -1705,6 +1715,35 @@ buttons:
         assert_eq!(change["type"], "desktops");
         assert_eq!(change["reason"], "changed");
         assert_eq!(change["desktops"][1]["current"], true);
+    }
+
+    /// The buttons are read when Windows reports a change, and at no other time.
+    #[tokio::test]
+    async fn the_buttons_are_read_again_only_when_a_change_is_reported() {
+        let launcher = Arc::new(crate::launch::fake::FakeLauncher::default());
+        let state = AppState::new(
+            config::parse(
+                "buttons:\n  - id: other\n    label: Other\n    type: app.launch\n    target: a.exe\n    process: a.exe\n",
+            )
+            .unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        )
+        .with_launcher(launcher.clone());
+        state.refresh().await;
+        let mut events = state.hub.events.subscribe();
+        let changes = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn(state.clone().run_refresher(changes.clone()));
+        launcher.running.lock().unwrap().insert("a.exe".into());
+        // Longer than the second the buttons were read at before.
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        assert!(events.try_recv().is_err(), "read without a change reported");
+        changes.notify_one();
+        let pushed = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let pushed: Value = serde_json::from_str(&pushed).unwrap();
+        assert_eq!(pushed["button"]["id"], "other");
     }
 
     #[tokio::test]

@@ -29,9 +29,16 @@ use windows::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Foundation::{CloseHandle, PROPERTYKEY},
         Media::Audio::{
+            AUDIO_VOLUME_NOTIFICATION_DATA, AudioSessionDisconnectReason, AudioSessionState,
             AudioSessionStateExpired, DEVICE_STATE, DEVICE_STATE_ACTIVE, DEVICE_STATEMASK_ALL,
-            EDataFlow, ERole, Endpoints::IAudioEndpointVolume, IAudioSessionControl2,
-            IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
+            EDataFlow, ERole,
+            Endpoints::{
+                IAudioEndpointVolume, IAudioEndpointVolumeCallback,
+                IAudioEndpointVolumeCallback_Impl,
+            },
+            IAudioSessionControl, IAudioSessionControl2, IAudioSessionEvents,
+            IAudioSessionEvents_Impl, IAudioSessionManager2, IAudioSessionNotification,
+            IAudioSessionNotification_Impl, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
             IMMNotificationClient_Impl, ISimpleAudioVolume, MMDeviceEnumerator, eCommunications,
             eConsole, eMultimedia, eRender,
         },
@@ -47,7 +54,8 @@ use windows::{
         },
     },
     core::{
-        GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, PWSTR, implement, interface,
+        BOOL, GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, PWSTR, Ref, implement,
+        interface,
     },
 };
 
@@ -179,35 +187,45 @@ impl Audio for WindowsAudio {
     }
 }
 
-#[implement(IMMNotificationClient)]
-struct ChangeNotifier {
+/// What Windows' notices tell: whoever reads the buttons, and the worker.
+struct Signals {
     changes: Option<Arc<Notify>>,
     /// Set so the worker reads the endpoints again (`ComState::endpoints`).
     stale: Arc<AtomicBool>,
 }
 
-impl ChangeNotifier {
+impl Signals {
+    /// A volume or a mute changed: the buttons are read again.
     fn changed(&self) {
-        self.stale.store(true, Ordering::Release);
         if let Some(changes) = &self.changes {
             changes.notify_one();
         }
     }
+
+    /// The endpoints or their sessions changed: they are read again too.
+    fn rearranged(&self) {
+        self.stale.store(true, Ordering::Release);
+        self.changed();
+    }
 }
+
+/// The endpoints coming, going and changing.
+#[implement(IMMNotificationClient)]
+struct ChangeNotifier(Arc<Signals>);
 
 impl IMMNotificationClient_Impl for ChangeNotifier_Impl {
     fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> windows::core::Result<()> {
-        self.changed();
+        self.0.rearranged();
         Ok(())
     }
 
     fn OnDeviceAdded(&self, _: &PCWSTR) -> windows::core::Result<()> {
-        self.changed();
+        self.0.rearranged();
         Ok(())
     }
 
     fn OnDeviceRemoved(&self, _: &PCWSTR) -> windows::core::Result<()> {
-        self.changed();
+        self.0.rearranged();
         Ok(())
     }
 
@@ -218,13 +236,106 @@ impl IMMNotificationClient_Impl for ChangeNotifier_Impl {
         _: &PCWSTR,
     ) -> windows::core::Result<()> {
         if flow == eRender {
-            self.changed();
+            self.0.rearranged();
         }
         Ok(())
     }
 
     fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> windows::core::Result<()> {
         Ok(())
+    }
+}
+
+/// The default output's volume and mute changing (the volume keys, Windows' mixer).
+#[implement(IAudioEndpointVolumeCallback)]
+struct VolumeListener(Arc<Signals>);
+
+impl IAudioEndpointVolumeCallback_Impl for VolumeListener_Impl {
+    fn OnNotify(&self, _: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows::core::Result<()> {
+        self.0.changed();
+        Ok(())
+    }
+}
+
+/// An output's sessions: one starting, and each one's volume, mute and end.
+#[implement(IAudioSessionNotification, IAudioSessionEvents)]
+struct SessionListener(Arc<Signals>);
+
+impl IAudioSessionNotification_Impl for SessionListener_Impl {
+    fn OnSessionCreated(&self, _: Ref<IAudioSessionControl>) -> windows::core::Result<()> {
+        // Read again, which also listens to the new session.
+        self.0.rearranged();
+        Ok(())
+    }
+}
+
+impl IAudioSessionEvents_Impl for SessionListener_Impl {
+    fn OnDisplayNameChanged(&self, _: &PCWSTR, _: *const GUID) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnIconPathChanged(&self, _: &PCWSTR, _: *const GUID) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnSimpleVolumeChanged(&self, _: f32, _: BOOL, _: *const GUID) -> windows::core::Result<()> {
+        self.0.changed();
+        Ok(())
+    }
+
+    fn OnChannelVolumeChanged(
+        &self,
+        _: u32,
+        _: *const f32,
+        _: u32,
+        _: *const GUID,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnGroupingParamChanged(&self, _: *const GUID, _: *const GUID) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnStateChanged(&self, state: AudioSessionState) -> windows::core::Result<()> {
+        // Sound starting and pausing changes no button; a session that ended does.
+        if state == AudioSessionStateExpired {
+            self.0.rearranged();
+        }
+        Ok(())
+    }
+
+    fn OnSessionDisconnected(&self, _: AudioSessionDisconnectReason) -> windows::core::Result<()> {
+        self.0.rearranged();
+        Ok(())
+    }
+}
+
+/// What is listened to while a reading of the endpoints is kept: the default output's
+/// volume, and every connected output's sessions. Dropped with the reading, which stops
+/// the listening.
+#[derive(Default)]
+struct Heard {
+    volume: Option<(IAudioEndpointVolume, IAudioEndpointVolumeCallback)>,
+    managers: Vec<(IAudioSessionManager2, IAudioSessionNotification)>,
+    sessions: Vec<(IAudioSessionControl, IAudioSessionEvents)>,
+}
+
+impl Drop for Heard {
+    fn drop(&mut self) {
+        // SAFETY: each listener is unregistered from the live object it was registered with,
+        // on the worker thread that registered it.
+        unsafe {
+            if let Some((volume, listener)) = &self.volume {
+                let _ = volume.UnregisterControlChangeNotify(listener);
+            }
+            for (session, listener) in &self.sessions {
+                let _ = session.UnregisterAudioSessionNotification(listener);
+            }
+            for (manager, listener) in &self.managers {
+                let _ = manager.UnregisterSessionNotification(listener);
+            }
+        }
     }
 }
 
@@ -237,7 +348,10 @@ fn worker(
     changes: Option<Arc<Notify>>,
     ready: &mpsc::Sender<AudioResult<()>>,
 ) {
-    let stale = Arc::new(AtomicBool::new(true));
+    let signals = Arc::new(Signals {
+        changes,
+        stale: Arc::new(AtomicBool::new(true)),
+    });
     let setup = || -> AudioResult<(IMMDeviceEnumerator, IMMNotificationClient)> {
         // SAFETY: COM is initialised on this worker thread before any other call, every call goes
         // through interfaces COM just returned, and the notification client stays registered only
@@ -249,11 +363,7 @@ fn worker(
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                     .map_err(|e| err("MMDeviceEnumerator", &e))?;
-            let client: IMMNotificationClient = ChangeNotifier {
-                changes,
-                stale: stale.clone(),
-            }
-            .into();
+            let client: IMMNotificationClient = ChangeNotifier(signals.clone()).into();
             enumerator
                 .RegisterEndpointNotificationCallback(&client)
                 .map_err(|e| err("RegisterEndpointNotificationCallback", &e))?;
@@ -272,7 +382,7 @@ fn worker(
     };
     let com = ComState {
         enumerator,
-        stale,
+        signals,
         endpoints: RefCell::new(None),
     };
     while let Ok(command) = commands.recv() {
@@ -310,12 +420,13 @@ struct Endpoints {
     active: Vec<IMMDevice>,
     /// The default output with its ID, else why there is none.
     default: Result<(String, IMMDevice), AudioError>,
+    _heard: Heard,
 }
 
 struct ComState {
     enumerator: IMMDeviceEnumerator,
-    /// Set by `ChangeNotifier` when Windows reports a change of the endpoints.
-    stale: Arc<AtomicBool>,
+    /// Told by Windows' notices; its `stale` has the endpoints read again.
+    signals: Arc<Signals>,
     endpoints: RefCell<Option<Rc<Endpoints>>>,
 }
 
@@ -323,7 +434,7 @@ impl ComState {
     /// The endpoints, read again after a change (or `ENDPOINTS_MAX_AGE`).
     fn endpoints(&self) -> AudioResult<Rc<Endpoints>> {
         // Cleared before reading, so a change reported while reading is read next time.
-        let changed = self.stale.swap(false, Ordering::AcqRel);
+        let changed = self.signals.stale.swap(false, Ordering::AcqRel);
         if !changed
             && let Some(kept) = self.endpoints.borrow().as_ref()
             && kept.read.elapsed() < ENDPOINTS_MAX_AGE
@@ -339,7 +450,58 @@ impl ComState {
     /// Have the endpoints read again: one kept did not answer (its device went away, or
     /// the audio service restarted).
     fn forget_endpoints(&self) {
-        self.stale.store(true, Ordering::Release);
+        self.signals.stale.store(true, Ordering::Release);
+    }
+
+    /// Listen to the default output's volume and to the connected outputs' sessions,
+    /// when someone reads the buttons on their notice. What cannot be listened to is
+    /// left out: its changes then show when something else has the buttons read.
+    fn hear(&self, active: &[IMMDevice], default: Option<&IMMDevice>) -> Heard {
+        let mut heard = Heard::default();
+        if self.signals.changes.is_none() {
+            return heard;
+        }
+        // SAFETY: the devices are live COM objects of this thread, every call goes through
+        // interfaces they returned, and each listener registered is kept in `heard` with the
+        // object it is registered with until `Heard::drop` unregisters it.
+        unsafe {
+            if let Some(volume) = default.and_then(|device| {
+                device
+                    .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+                    .ok()
+            }) {
+                let listener: IAudioEndpointVolumeCallback =
+                    VolumeListener(self.signals.clone()).into();
+                if volume.RegisterControlChangeNotify(&listener).is_ok() {
+                    heard.volume = Some((volume, listener));
+                }
+            }
+            for device in active {
+                let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
+                    continue;
+                };
+                let listener = SessionListener(self.signals.clone());
+                let created: IAudioSessionNotification = listener.into();
+                if manager.RegisterSessionNotification(&created).is_err() {
+                    continue;
+                }
+                // Windows tells of new sessions only once the sessions were listed.
+                let sessions = manager.GetSessionEnumerator();
+                let events: Option<IAudioSessionEvents> = created.cast().ok();
+                heard.managers.push((manager, created));
+                let (Ok(sessions), Some(events)) = (sessions, events) else {
+                    continue;
+                };
+                for i in 0..sessions.GetCount().unwrap_or(0) {
+                    if let Ok(session) = sessions.GetSession(i)
+                        && session.RegisterAudioSessionNotification(&events).is_ok()
+                    {
+                        heard.sessions.push((session, events.clone()));
+                    }
+                }
+            }
+        }
+        heard
     }
 
     fn read_endpoints(&self) -> AudioResult<Endpoints> {
@@ -377,11 +539,13 @@ impl ComState {
                 Ok(device) => Ok((device_id(&device)?, device)),
                 Err(e) => Err(err("GetDefaultAudioEndpoint", &e)),
             };
+            let heard = self.hear(&active, default.as_ref().ok().map(|(_, device)| device));
             Ok(Endpoints {
                 read: Instant::now(),
                 devices,
                 active,
                 default,
+                _heard: heard,
             })
         }
     }

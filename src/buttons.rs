@@ -413,6 +413,23 @@ fn press_output(
     audio.set_default_output(target).map_err(PressError::Audio)
 }
 
+/// The programs (lowercase file names) the buttons show as running: the exit of one
+/// changes a button.
+pub fn running_programs(config: &Config, processes: &Processes) -> Processes {
+    config
+        .buttons
+        .iter()
+        .filter_map(|button| match &button.spec {
+            ButtonSpec::DiscordServer { .. } => Some(DISCORD_EXE),
+            ButtonSpec::AppLaunch { process, .. } => process.as_deref(),
+            ButtonSpec::SteamGame { process, .. } => Some(process.as_str()),
+            _ => None,
+        })
+        .map(str::to_lowercase)
+        .filter(|name| processes.contains(name))
+        .collect()
+}
+
 /// The colour the cursor is highlighted in: that of the first `cursor.highlight` button
 /// that is on, or none while none is.
 pub fn highlight(views: &[ButtonView]) -> Option<crate::cursor::Palette> {
@@ -1096,6 +1113,47 @@ buttons:
             Some(std::path::PathBuf::from("C:/Games/ba.exe"))
         );
         assert_eq!(super::icon_path(&config.buttons[1]), None);
+    }
+
+    #[test]
+    fn the_programs_whose_exit_changes_a_button_are_those_shown_as_running() {
+        let config = config::parse(
+            "buttons:
+  - id: ba
+    label: BA
+    type: app.launch
+    target: C:/Games/launcher.exe
+    process: BlueArchive.exe
+  - id: steam
+    label: Steam
+    type: app.launch
+    target: steam.exe
+    process: steamwebhelper.exe
+  - id: site
+    label: Site
+    type: app.launch
+    target: https://example.com/
+  - id: sf6
+    label: SF6
+    type: steam.game
+    app_id: 1364780
+    process: StreetFighter6.exe
+  - id: vc
+    label: VC
+    type: discord.server
+    guild_id: \"1\"
+",
+        )
+        .unwrap();
+        let running: Processes = ["bluearchive.exe", "discord.exe", "explorer.exe"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let mut watched: Vec<String> = super::running_programs(&config, &running)
+            .into_iter()
+            .collect();
+        watched.sort();
+        assert_eq!(watched, ["bluearchive.exe", "discord.exe"]);
     }
 
     #[test]
