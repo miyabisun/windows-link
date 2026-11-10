@@ -196,15 +196,16 @@ fn created(handle: HANDLE) -> Option<u64> {
 }
 
 /// A handle to wait on for each of `programs` that runs: its oldest process, which lasts
-/// as long as the program (the others are its helpers, which come and go).
-fn oldest(programs: &Processes) -> Vec<Owned> {
-    let mut found: std::collections::HashMap<String, (u64, Owned)> =
+/// as long as the program (the others are its helpers, which come and go). The
+/// processes in `gone` exited already and are left out, should Windows still list one.
+fn oldest(programs: &Processes, gone: &[u32]) -> Vec<(u32, Owned)> {
+    let mut found: std::collections::HashMap<String, (u64, u32, Owned)> =
         std::collections::HashMap::new();
     if programs.is_empty() {
         return Vec::new();
     }
     for (pid, name) in snapshot() {
-        if !programs.contains(&name) {
+        if !programs.contains(&name) || gone.contains(&pid) {
             continue;
         }
         // SAFETY: the handle is used only after OpenProcess succeeded and closed exactly once,
@@ -223,9 +224,11 @@ fn oldest(programs: &Processes) -> Vec<Owned> {
             let _ = unsafe { CloseHandle(handle) };
             continue;
         };
-        let older = found.get(&name).is_none_or(|(known, _)| at < *known);
+        let older = found.get(&name).is_none_or(|(known, _, _)| at < *known);
         let dropped = if older {
-            found.insert(name, (at, Owned(handle))).map(|(_, old)| old)
+            found
+                .insert(name, (at, pid, Owned(handle)))
+                .map(|(_, _, old)| old)
         } else {
             Some(Owned(handle))
         };
@@ -236,7 +239,7 @@ fn oldest(programs: &Processes) -> Vec<Owned> {
     }
     found
         .into_values()
-        .map(|(_, handle)| handle)
+        .map(|(_, pid, handle)| (pid, handle))
         .take(MOST_WATCHED)
         .collect()
 }
@@ -244,28 +247,40 @@ fn oldest(programs: &Processes) -> Vec<Owned> {
 /// Wait for one of the wanted programs to exit and tell `changed`, starting over each
 /// time the wanted programs change.
 fn exits(wanted: &Mutex<Processes>, wake: &Owned, changed: &Notify) {
+    // The processes seen to exit, so one Windows goes on listing is not waited on again
+    // (its handle is signalled at once, which would turn the loop).
+    let mut gone: Vec<u32> = Vec::new();
     loop {
         let programs = wanted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let watched = oldest(&programs);
+        let watched = oldest(&programs, &gone);
         let handles: Vec<HANDLE> = std::iter::once(wake.0)
-            .chain(watched.iter().map(|handle| handle.0))
+            .chain(watched.iter().map(|(_, handle)| handle.0))
             .collect();
         // SAFETY: every handle is live for the wait: `wake` for good, the processes' until
         // closed below.
         let signalled = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
-        for Owned(handle) in watched {
+        let index = signalled.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+        let exited = index
+            .checked_sub(1)
+            .and_then(|at| watched.get(at))
+            .map(|(pid, _)| *pid);
+        for (_, Owned(handle)) in watched {
             // SAFETY: `handle` is one `oldest` opened, closed exactly once here.
             let _ = unsafe { CloseHandle(handle) };
         }
-        let index = signalled.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
         if index == 0 {
             // The wanted programs changed.
             continue;
         }
-        if index < handles.len() {
+        if let Some(pid) = exited {
+            // Process IDs come round again: only the latest exits are remembered.
+            if gone.len() >= MOST_WATCHED {
+                gone.remove(0);
+            }
+            gone.push(pid);
             changed.notify_one();
             continue;
         }
