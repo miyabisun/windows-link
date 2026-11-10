@@ -201,10 +201,18 @@ buttons:
   it is as big as the arrow Windows draws on the monitor the cursor is on at that moment
   (the pointer size chosen in Windows' settings, at that monitor's DPI) and stays that
   size on the other monitors. The arrow Windows shows while a program starts (its arrow
-  with a turning ring) is replaced too, by the same arrow with a ring of its own beside
-  it, so the cursor does not shrink for that moment. Turning it off brings the user's own
-  cursors back. Only these two are replaced, and a program that draws a cursor of its own
-  keeps it. Whether it is on and its colour are
+  with a turning ring) is replaced by the same arrow, so the cursor does not shrink for
+  that moment. Pictures of your own can stand in for more: PNG files (with alpha, square)
+  put beside `config.yaml`, read when the arrow is changed. No picture is shipped.
+
+  | File | Used for |
+  |---|---|
+  | `cursor-busy.png` | turns once round in 1.2 s beside the arrow while a program starts, and alone as the wait cursor |
+  | `cursor-link-red.png`, `cursor-link-green.png`, `cursor-link-blue.png` | the cursor over a link (Windows' hand) while the highlight is that colour, a quarter wider than the arrow and pointing with its middle |
+
+  A navy edge is drawn round a picture so a pale one shows over a pale page. Turning the
+  highlight off brings the user's own cursors back. Only these cursors are replaced, and
+  a program that draws a cursor of its own keeps it. Whether it is on and its colour are
   kept in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
 
   ```yaml

@@ -1,7 +1,8 @@
 //! The `cursor.highlight` buttons: while one is on, an arrow as big as Windows' (on the
 //! monitor the cursor was on when it was pressed) stands in for the arrow cursor, so the cursor is easy to find over a busy screen. The arrow
 //! is drawn after Blue Archive's own cursor, in the colour chosen for the button on the
-//! panel, and handed to Windows as a cursor file (`.cur`).
+//! panel, and handed to Windows as a cursor file (`.cur`). Pictures of the user's own can
+//! stand in for the busy cursors and the hand over a link (`art`).
 //!
 //! The game's cursor (read off Windows on 2026-10-18, 32 by 32, with its alpha) is a
 //! dot-wide navy edge, a white rim inside it and a fill whose hue turns from cyan at the
@@ -18,6 +19,7 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
+pub mod art;
 pub mod windows;
 
 /// The colour a `cursor.highlight` button fills the arrow with, chosen on the panel:
@@ -129,18 +131,15 @@ const WHITE: [f32; 3] = [248.0, 251.0, 255.0];
 /// Samples a pixel is drawn from, across and down: enough to shade an edge as finely
 /// as the game's.
 const SAMPLES: u32 = 8;
-/// The busy cursor, on the arrow's 32 by 32 units: how wide its picture is, where its
-/// ring's centre is (clear of the arrow's right point and foot), the ring's inner and
-/// outer reach, and how many degrees of it the coloured arc covers, at what saturation.
-const BUSY_SIDE: f32 = 40.0;
-const RING_AT: (f32, f32) = (31.5, 30.5);
-const RING: (f32, f32) = (3.0, 7.5);
-const ARC: f32 = 120.0;
-const ARC_SATURATION: f32 = 0.6;
-/// The frames of one turn of the arc, and how long each shows, in sixtieths of a
-/// second: a turn a second, as Windows' own ring.
-const BUSY_FRAMES: u32 = 12;
-pub const BUSY_JIFFIES: u32 = 5;
+/// The busy cursor, on the arrow's 32 by 32 units: how wide its picture is, and where
+/// the middle of the mark beside the arrow is and how wide the mark (clear of the
+/// arrow's right point and foot).
+const BUSY_SIDE: f32 = 52.0;
+const MARK_AT: (f32, f32) = (37.5, 37.5);
+const MARK: f32 = 28.0;
+/// The frames of one turn of a mark, and how long each shows, in sixtieths of a second.
+const TURN_FRAMES: u32 = 36;
+pub const TURN_JIFFIES: u32 = 2;
 
 /// The point of the arrow, where the cursor points, on a cursor `size` pixels wide:
 /// the point of the outline nearest the corner its short top cuts off, a dot inside
@@ -185,11 +184,7 @@ fn to_byte_range(value: f32, most: f32) -> u32 {
 /// straight (not premultiplied) RGBA.
 pub fn picture(size: u32, palette: Palette) -> Vec<[u8; 4]> {
     (0..size * size)
-        .map(|at| {
-            pixel(size, (at % size, at / size), |across, down, edge| {
-                colour(across, down, palette, edge)
-            })
-        })
+        .map(|at| pixel(size, (at % size, at / size), palette))
         .collect()
 }
 
@@ -198,74 +193,40 @@ pub fn busy_side(size: u32) -> u32 {
     to_byte_range(size as f32 * BUSY_SIDE / 32.0, 256.0)
 }
 
+/// The degrees each frame of a turning mark is turned by, once round.
+pub fn turns() -> impl Iterator<Item = f32> {
+    (0..TURN_FRAMES).map(|frame| 360.0 * frame as f32 / TURN_FRAMES as f32)
+}
+
 /// The busy cursor's frames (Windows shows it while a program starts): the arrow of
-/// `picture`, as big and where it is, and a ring low at its right whose coloured arc
-/// turns once round over the frames. Each is `busy_side` pixels square, as `picture`.
-pub fn busy_frames(size: u32, palette: Palette) -> Vec<Vec<[u8; 4]>> {
-    let width = busy_side(size);
-    let places = || (0..width * width).map(|at| (at % width, at / width));
-    let arrow: Vec<[u8; 4]> = places()
-        .map(|at| {
-            pixel(size, at, |across, down, edge| {
-                colour(across, down, palette, edge)
-            })
-        })
+/// `picture`, as big and where it is, and `mark` low at its right, turning once round
+/// over the frames. Each is `busy_side` pixels square, as `picture`.
+pub fn busy_frames(size: u32, palette: Palette, mark: &art::Art) -> Vec<Vec<[u8; 4]>> {
+    let (width, unit) = (busy_side(size), size as f32 / 32.0);
+    let arrow: Vec<[u8; 4]> = (0..width * width)
+        .map(|at| pixel(size, (at % width, at / width), palette))
         .collect();
-    (0..BUSY_FRAMES)
-        .map(|frame| {
-            let turn = 360.0 * frame as f32 / BUSY_FRAMES as f32;
-            places()
+    turns()
+        .map(|turn| {
+            let middle = (MARK_AT.0 * unit, MARK_AT.1 * unit);
+            mark.drawn(width, middle, MARK * unit, turn)
+                .into_iter()
                 .zip(&arrow)
-                .map(|(at, &under)| {
-                    let over = pixel(size, at, |across, down, edge| {
-                        ring(across, down, turn, palette, edge)
-                    });
-                    if over[3] > 0 { over } else { under }
-                })
+                .map(|(over, &under)| if over[3] > 0 { over } else { under })
                 .collect()
         })
         .collect()
 }
 
-/// The ring at (`across`, `down`), as `colour`: a navy edge inside and out, white
-/// between them but for the arc, which trails `ARC` degrees behind `turn` (degrees
-/// clockwise of the top) in the palette's colours, and the shadow under it.
-fn ring(across: f32, down: f32, turn: f32, palette: Palette, edge: f32) -> Option<([f32; 3], f32)> {
-    let depth = |across: f32, down: f32| {
-        let far = (across - RING_AT.0).hypot(down - RING_AT.1);
-        (far - RING.0).min(RING.1 - far)
-    };
-    let inside = depth(across, down);
-    if inside <= 0.0 {
-        return (depth(across - SHADOW.0, down - SHADOW.1) > 0.0).then_some((SHADE, SHADOW_ALPHA));
-    }
-    if inside < edge {
-        return Some((NAVY, 1.0));
-    }
-    let at = (across - RING_AT.0).atan2(RING_AT.1 - down).to_degrees();
-    let behind = (turn - at).rem_euclid(360.0);
-    if behind >= ARC {
-        return Some((WHITE, 1.0));
-    }
-    let (first, second) = palette.hues();
-    let hue = (first - second).mul_add(behind / ARC, second);
-    Some((hsv(hue, ARC_SATURATION), 1.0))
-}
-
-/// One pixel: the colours `paint` gives its samples (at a place on the arrow's 32 by
-/// 32 units, for an edge that wide) mixed by how much of each covers it (the arrow
+/// One pixel: its samples' colours mixed by how much of each covers it (the arrow
 /// whole, its shadow at `SHADOW_ALPHA`).
-fn pixel(
-    size: u32,
-    (column, row): (u32, u32),
-    paint: impl Fn(f32, f32, f32) -> Option<([f32; 3], f32)>,
-) -> [u8; 4] {
+fn pixel(size: u32, (column, row): (u32, u32), palette: Palette) -> [u8; 4] {
     let unit = 32.0 / size as f32;
     let (mut sum, mut weight) = ([0.0f32; 3], 0.0f32);
     for sample in 0..SAMPLES * SAMPLES {
         let across = (column as f32 + ((sample % SAMPLES) as f32 + 0.5) / SAMPLES as f32) * unit;
         let down = (row as f32 + ((sample / SAMPLES) as f32 + 0.5) / SAMPLES as f32) * unit;
-        if let Some((colour, alpha)) = paint(across, down, EDGE_PIXELS * unit) {
+        if let Some((colour, alpha)) = colour(across, down, palette, EDGE_PIXELS * unit) {
             weight += alpha;
             for channel in 0..3 {
                 sum[channel] = colour[channel].mul_add(alpha, sum[channel]);
@@ -647,25 +608,21 @@ mod tests {
         frame[usize::try_from(row * busy_side(size) + column).unwrap()]
     }
 
-    /// The point of the ring's band `degrees` clockwise of its top.
-    fn on_ring(degrees: f32) -> (f32, f32) {
-        let (sin, cos) = degrees.to_radians().sin_cos();
-        let middle = f32::midpoint(RING.0, RING.1);
-        (
-            middle.mul_add(sin, RING_AT.0),
-            middle.mul_add(-cos, RING_AT.1),
-        )
+    /// Four dots square, red at the left and blue at the right: a mark to tell a turn by.
+    fn halves() -> art::Art {
+        let (red, blue) = ([255, 0, 0, 255], [0, 0, 255, 255]);
+        art::Art::new(4, [red, red, blue, blue].repeat(4)).unwrap()
     }
 
     /// While a program starts the arrow stays as big as it is (Windows' own arrow with
     /// its ring is smaller, the user's of 2026-11-10): every frame draws the same arrow,
-    /// dot for dot, and a ring beside it on a wider picture.
+    /// dot for dot, and beside it the user's mark, turned half round by half the frames.
     #[test]
-    fn the_busy_cursor_keeps_the_arrow_and_adds_a_ring_beside_it() {
+    fn the_busy_cursor_keeps_the_arrow_and_turns_a_mark_beside_it() {
         let size = 48;
         let (arrow, width) = (picture(size, Palette::Blue), busy_side(size));
         assert!(width > size);
-        let frames = busy_frames(size, Palette::Blue);
+        let frames = busy_frames(size, Palette::Blue, &halves());
         assert!(frames.len() > 1);
         for frame in &frames {
             assert_eq!(frame.len(), usize::try_from(width * width).unwrap());
@@ -674,24 +631,11 @@ mod tests {
                 let place = usize::try_from(at / size * width + at % size).unwrap();
                 assert!(drawn[3] == 0 || frame[place] == drawn, "dot {at}");
             }
-            assert_eq!(busy_at(size, frame, on_ring(90.0))[3], 255);
-            assert_eq!(busy_at(size, frame, RING_AT)[3], 0, "the ring is open");
         }
-    }
-
-    /// The ring's coloured arc turns clockwise from frame to frame, the rest of the ring
-    /// white: it starts at the top and is at the bottom half the frames later.
-    #[test]
-    fn the_rings_arc_turns_from_frame_to_frame() {
-        let size = 64;
-        let frames = busy_frames(size, Palette::Red);
-        let coloured = |frame: usize, degrees: f32| {
-            let [r, g, b, _] = busy_at(size, &frames[frame], on_ring(degrees));
-            r.max(g).max(b) - r.min(g).min(b) > 60
-        };
-        let half = frames.len() / 2;
-        assert!(coloured(0, 340.0) && !coloured(0, 160.0));
-        assert!(coloured(half, 160.0) && !coloured(half, 340.0));
+        let left = (MARK_AT.0 - MARK / 4.0, MARK_AT.1);
+        assert_eq!(busy_at(size, &frames[0], left), [255, 0, 0, 255]);
+        let half = &frames[frames.len() / 2];
+        assert_eq!(busy_at(size, half, left), [0, 0, 255, 255]);
     }
 
     /// Windows takes the frames for one cursor of the size asked.
@@ -700,11 +644,11 @@ mod tests {
         let (size, width) = (48, busy_side(48));
         let path =
             std::env::temp_dir().join(format!("windows-link-cursor-{}.ani", std::process::id()));
-        let frames: Vec<Vec<u8>> = busy_frames(size, Palette::Green)
+        let frames: Vec<Vec<u8>> = busy_frames(size, Palette::Green, &halves())
             .iter()
             .map(|frame| cur(frame, width, hotspot(size)))
             .collect();
-        std::fs::write(&path, ani(&frames, BUSY_JIFFIES)).unwrap();
+        std::fs::write(&path, ani(&frames, TURN_JIFFIES)).unwrap();
         let loaded = windows::loaded_size(&path, width);
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, Some(width));

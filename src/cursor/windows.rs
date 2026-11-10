@@ -1,5 +1,5 @@
-//! Putting the highlighted arrow in for Windows' arrow and for its arrow with the busy ring,
-//! and Windows' own back.
+//! Putting the highlight's cursors in for Windows' (the arrow, the busy ones and the hand
+//! over a link), and Windows' own back.
 
 use std::{
     ffi::c_void,
@@ -17,15 +17,15 @@ use windows::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             WindowsAndMessaging::{
                 GetCursorPos, HCURSOR, IMAGE_CURSOR, LR_LOADFROMFILE, LoadImageW, OCR_APPSTARTING,
-                OCR_NORMAL, SPI_SETCURSORS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetSystemCursor,
-                SystemParametersInfoW,
+                OCR_HAND, OCR_NORMAL, OCR_WAIT, SPI_SETCURSORS, SYSTEM_CURSOR_ID,
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetSystemCursor, SystemParametersInfoW,
             },
         },
     },
     core::{PCWSTR, w},
 };
 
-use super::{Arrow, Palette};
+use super::{Arrow, Palette, art::Art};
 use crate::{config::ButtonSpec, config::Config};
 
 /// The IDs of the `cursor.highlight` buttons of `config`.
@@ -74,36 +74,87 @@ pub fn restore() {
     }
 }
 
-/// The arrow in `palette`, `size` pixels square, in for Windows' arrow. Its file is
-/// written afresh each time: one an older version wrote under the same name draws
-/// that version's arrow (v0.1.28 left its 1.5x one behind).
+/// The highlight's cursors in `palette`, each put in once, their files written afresh
+/// each time (one an older version wrote under the same name draws that version's
+/// arrow: v0.1.28 left its 1.5x one behind):
+///
+/// - the arrow, `size` pixels square, for Windows' arrow;
+/// - for the arrow Windows shows while a program starts, the same arrow with the
+///   user's `busy` picture turning beside it, or the arrow alone without one: Windows'
+///   own is smaller than the highlight, so the cursor shrank for a moment (the user's
+///   of 2026-11-10);
+/// - the `busy` picture alone, turning, for Windows' wait cursor;
+/// - the user's `link-<colour>` picture for the hand over a link, pointing with its
+///   middle (the user's of 2026-11-10: a halo to aim with). A colour without one
+///   leaves the hand as it is.
 fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
-    let path = dir.join(format!("cursor-highlight-{}-{size}.cur", palette.name()));
-    let file = super::cur(&super::picture(size, palette), size, super::hotspot(size));
-    std::fs::write(&path, file).map_err(|e| e.to_string())?;
-    let cursor = load(&path, size)?;
-    // SAFETY: `cursor` is a cursor `load` just created and nothing else owns; SetSystemCursor takes
-    // it over.
-    unsafe { SetSystemCursor(cursor, OCR_NORMAL) }.map_err(|e| e.to_string())?;
-    apply_busy(dir, size, palette)
+    let write = |what: &str, file: Vec<u8>| {
+        let path = dir.join(format!("cursor-highlight-{what}"));
+        std::fs::write(&path, file)
+            .map(|()| path)
+            .map_err(|e| e.to_string())
+    };
+    let colour = palette.name();
+    let arrow = super::cur(&super::picture(size, palette), size, super::hotspot(size));
+    let arrow = write(&format!("{colour}-{size}.cur"), arrow)?;
+    put(&arrow, size, OCR_NORMAL)?;
+
+    // A picture alone, `across` pixels square, pointing with its middle.
+    let alone = |art: &Art, across: u32, turn: f32| {
+        let (middle, half) = (across as f32 / 2.0, u16::try_from(across / 2).unwrap_or(0));
+        let picture = art.drawn(across, (middle, middle), across as f32, turn);
+        super::cur(&picture, across, (half, half))
+    };
+    if let Some(mark) = art(dir, "busy") {
+        // A cursor is at most 256 pixels square, and this one wider than its arrow by its mark.
+        let small = size.min(157);
+        let width = super::busy_side(small);
+        let frames: Vec<Vec<u8>> = super::busy_frames(small, palette, &mark)
+            .iter()
+            .map(|frame| super::cur(frame, width, super::hotspot(small)))
+            .collect();
+        let busy = super::ani(&frames, super::TURN_JIFFIES);
+        put(
+            &write(&format!("{colour}-busy-{size}.ani"), busy)?,
+            width,
+            OCR_APPSTARTING,
+        )?;
+        let frames: Vec<Vec<u8>> = super::turns()
+            .map(|turn| alone(&mark, size, turn))
+            .collect();
+        let wait = super::ani(&frames, super::TURN_JIFFIES);
+        put(&write(&format!("wait-{size}.ani"), wait)?, size, OCR_WAIT)?;
+    } else {
+        put(&arrow, size, OCR_APPSTARTING)?;
+    }
+    if let Some(aim) = art(dir, &format!("link-{colour}")) {
+        // A quarter wider than the arrow: a ring to aim with reads thin at the arrow's size.
+        let across = (size * 5 / 4).min(256);
+        let link = write(
+            &format!("link-{colour}-{size}.cur"),
+            alone(&aim, across, 0.0),
+        )?;
+        put(&link, across, OCR_HAND)?;
+    }
+    Ok(())
 }
 
-/// The same arrow with a turning ring, in for the arrow Windows shows while a program
-/// starts: Windows' own is smaller than the highlight, so the cursor shrank for a
-/// moment (the user's of 2026-11-10).
-fn apply_busy(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
-    // A cursor is at most 256 pixels square, and this one a quarter wider than its arrow.
-    let size = size.min(204);
-    let width = super::busy_side(size);
-    let frames: Vec<Vec<u8>> = super::busy_frames(size, palette)
-        .iter()
-        .map(|frame| super::cur(frame, width, super::hotspot(size)))
-        .collect();
-    let path = dir.join(format!("cursor-highlight-{}-{size}.ani", palette.name()));
-    std::fs::write(&path, super::ani(&frames, super::BUSY_JIFFIES)).map_err(|e| e.to_string())?;
-    let cursor = load(&path, width)?;
-    // SAFETY: as in `apply`: `cursor` was just created by `load` and is handed over.
-    unsafe { SetSystemCursor(cursor, OCR_APPSTARTING) }.map_err(|e| e.to_string())
+/// The user's picture `cursor-<name>.png` in the data folder `dir`, if there is one that
+/// can be read.
+fn art(dir: &Path, name: &str) -> Option<Art> {
+    let path = dir.join(format!("cursor-{name}.png"));
+    let file = std::fs::read(&path).ok()?;
+    Art::decode(&file)
+        .inspect_err(|err| warn!(%err, path = %path.display(), "cannot read a cursor picture"))
+        .ok()
+}
+
+/// The cursor file at `path`, `size` pixels square, in for Windows' cursor `id`.
+fn put(path: &Path, size: u32, id: SYSTEM_CURSOR_ID) -> Result<(), String> {
+    let cursor = load(path, size)?;
+    // SAFETY: `cursor` is a cursor `load` just created and nothing else owns; SetSystemCursor takes
+    // it over.
+    unsafe { SetSystemCursor(cursor, id) }.map_err(|e| e.to_string())
 }
 
 fn load(path: &Path, size: u32) -> Result<HCURSOR, String> {
