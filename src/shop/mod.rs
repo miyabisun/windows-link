@@ -960,6 +960,12 @@ impl<S: Shop> ShopLibrary<S> {
     /// and tried again next time.
     pub fn download(&self) {
         self.download_all();
+        self.end_round();
+    }
+
+    /// End the round: after its downloads, or after only reading the purchases (at
+    /// start, when nothing is downloaded unasked).
+    pub fn end_round(&self) {
         let mut round = self.round_state();
         round.doing = None;
         round.finished = unix_seconds(SystemTime::now());

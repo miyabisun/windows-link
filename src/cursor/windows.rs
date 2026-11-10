@@ -1,6 +1,10 @@
 //! Putting the highlighted arrow in for Windows' arrow, and Windows' own back.
 
-use std::{ffi::c_void, os::windows::ffi::OsStrExt, path::Path, time::Duration};
+use std::{
+    ffi::c_void,
+    os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
+};
 
 use tracing::warn;
 use windows::{
@@ -20,15 +24,8 @@ use windows::{
     core::{PCWSTR, w},
 };
 
-use super::Palette;
-use crate::{
-    config::ButtonSpec,
-    config::Config,
-    hold::{Colors, Holds},
-};
-
-/// How often the buttons, and the monitor the cursor is on, are looked at.
-const POLL: Duration = Duration::from_millis(150);
+use super::{Arrow, Palette};
+use crate::{config::ButtonSpec, config::Config};
 
 /// The IDs of the `cursor.highlight` buttons of `config`.
 pub fn buttons(config: &Config) -> Vec<String> {
@@ -40,33 +37,22 @@ pub fn buttons(config: &Config) -> Vec<String> {
         .collect()
 }
 
-/// Keep the cursor highlighted while one of `buttons` is on in `highlights`, in the
-/// colour chosen for it in `colors` (the first's, should more be on), at the size for
-/// the monitor the cursor is on, writing the cursor files into `dir`. Runs for good
-/// on its own thread.
-pub fn run(buttons: &[String], highlights: &Holds, colors: &Colors, dir: &Path) {
-    // A run stopped while it showed the highlight leaves it until Windows' arrow is put back.
-    restore();
-    let mut shown: Option<(u32, Palette)> = None;
-    loop {
-        std::thread::sleep(POLL);
-        let on = highlights.held().unwrap_or_default();
-        if let Some(id) = buttons.iter().find(|id| on.contains(*id)) {
-            let palette = colors
-                .all()
-                .unwrap_or_default()
-                .get(id)
-                .copied()
-                .unwrap_or_default();
-            let wanted = (size_here(), palette);
-            if shown != Some(wanted) {
-                if let Err(err) = apply(dir, wanted.0, palette) {
+/// Windows' arrow, changed once each time a button is pressed or its colour chosen;
+/// the cursor files are written into the folder given. Nothing watches the cursor: the
+/// highlight is as big as Windows draws its arrow on the monitor the cursor is on when
+/// it is put in, and stays so (the user's of 2026-11-10; until then a thread looked
+/// every 150 ms for the monitor under the cursor).
+pub struct WindowsArrow(pub PathBuf);
+
+impl Arrow for WindowsArrow {
+    fn show(&self, palette: Option<Palette>) {
+        match palette {
+            Some(palette) => {
+                if let Err(err) = apply(&self.0, size_here(), palette) {
                     warn!(%err, "cannot highlight the cursor");
                 }
-                shown = Some(wanted);
             }
-        } else if shown.take().is_some() {
-            restore();
+            None => restore(),
         }
     }
 }

@@ -152,12 +152,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let pins = Arc::new(Pins::open(&database)?);
     let highlights = Arc::new(Holds::open(&database, HIGHLIGHTS)?);
     let colors = Arc::new(Colors::open(&database)?);
-    let highlighters = cursor::windows::buttons(&config);
-    let highlighting = !highlighters.is_empty();
-    if highlighting {
-        let (kept, chosen, dir) = (highlights.clone(), colors.clone(), data_dir());
-        std::thread::spawn(move || cursor::windows::run(&highlighters, &kept, &chosen, &dir));
-    }
+    let highlighting = !cursor::windows::buttons(&config).is_empty();
     let mut state = AppState::new(config, audio.clone())
         .with_desktops(desktops.clone())
         .with_discord(discord)
@@ -166,30 +161,11 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .with_highlights(highlights)
         .with_highlight_colors(colors)
         .with_pointer(Arc::new(WindowsPointer::new(Arc::new(WindowsLauncher))));
-    for (button, library) in libraries.buttons {
-        state = state.with_library(&button, library);
+    if highlighting {
+        state = state.with_arrow(Arc::new(cursor::windows::WindowsArrow(data_dir())));
     }
-    if let Some(client) = libraries.fanza_client {
-        state = state.with_fanza(client, libraries.fanza_wake.clone());
-    }
-    if let Some(session) = libraries.dlsite_session {
-        state = state.with_dlsite(session, libraries.dlsite_wake.clone());
-    }
+    let state = serve_libraries(state, libraries);
     tokio::spawn(state.clone().run_refresher(changes));
-    if !libraries.dlsite.is_empty() {
-        tokio::spawn(refresh_dlsite(
-            libraries.dlsite,
-            state.clone(),
-            libraries.dlsite_wake,
-        ));
-    }
-    if !libraries.fanza.is_empty() {
-        tokio::spawn(refresh_fanza(
-            libraries.fanza,
-            state.clone(),
-            libraries.fanza_wake,
-        ));
-    }
     let runtime = tokio::runtime::Handle::current();
     let publisher = state.clone();
     desktop_watch(move |reason| {
@@ -301,58 +277,81 @@ struct Libraries {
     fanza: Vec<Arc<FanzaLibrary>>,
     dlsite_session: Option<Arc<DlsiteSession>>,
     fanza_client: Option<Arc<fanza::Client>>,
-    /// Wake each shop's round of downloads before its time (a library update, a sign-in).
+    /// Start each shop's round of downloads (a library update, a sign-in).
     dlsite_wake: Arc<Notify>,
     fanza_wake: Arc<Notify>,
 }
 
-/// How often the shops' purchases are read again (new purchases and installs).
-const SHOP_REFRESH: std::time::Duration = std::time::Duration::from_hours(6);
-
-/// Identify the DLsite games now and every `SHOP_REFRESH`, or at once when `wake` is
-/// notified (the user signed in through the panel, a library update), with the
-/// purchases while the sign-in lasts, let the pictures be read again, then download the
-/// games bought but not there yet and the updates (the next round waits for them).
-async fn refresh_dlsite(libraries: Vec<Arc<DlsiteLibrary>>, state: AppState, wake: Arc<Notify>) {
-    loop {
-        for library in &libraries {
-            let library = Arc::clone(library);
-            let _ = tokio::task::spawn_blocking(move || library.refresh()).await;
-        }
-        state.forget_pictures();
-        // A sign-in that ended shows on the button now.
-        state.refresh().await;
-        for library in &libraries {
-            let library = Arc::clone(library);
-            let _ = tokio::task::spawn_blocking(move || library.download()).await;
-        }
-        tokio::select! {
-            () = tokio::time::sleep(SHOP_REFRESH) => {}
-            () = wake.notified() => {}
-        }
+/// Give `state` the library buttons and the shops' sign-ins, and start the shops' rounds.
+fn serve_libraries(mut state: AppState, libraries: Libraries) -> AppState {
+    for (button, library) in libraries.buttons {
+        state = state.with_library(&button, library);
     }
+    if let Some(client) = libraries.fanza_client {
+        state = state.with_fanza(client, libraries.fanza_wake.clone());
+    }
+    if let Some(session) = libraries.dlsite_session {
+        state = state.with_dlsite(session, libraries.dlsite_wake.clone());
+    }
+    if !libraries.dlsite.is_empty() {
+        tokio::spawn(shop_rounds(
+            libraries.dlsite,
+            state.clone(),
+            libraries.dlsite_wake,
+            (
+                DlsiteLibrary::refresh,
+                DlsiteLibrary::download,
+                DlsiteLibrary::end_round,
+            ),
+        ));
+    }
+    if !libraries.fanza.is_empty() {
+        tokio::spawn(shop_rounds(
+            libraries.fanza,
+            state.clone(),
+            libraries.fanza_wake,
+            (
+                FanzaLibrary::refresh,
+                FanzaLibrary::download,
+                FanzaLibrary::end_round,
+            ),
+        ));
+    }
+    state
 }
 
-/// Read the FANZA purchases now and every `SHOP_REFRESH`, or at once when `wake` is
-/// notified (the user signed in through the panel, a library update), let the pictures be read again, then download the games
-/// bought but not there yet.
-async fn refresh_fanza(libraries: Vec<Arc<FanzaLibrary>>, state: AppState, wake: Arc<Notify>) {
+/// What a shop's rounds do with a library: read its purchases and work out its games,
+/// download and update them, and end a round that only read.
+type Round<L> = (fn(&L), fn(&L), fn(&L));
+
+/// A shop's rounds. At start the purchases are read and the games worked out, so the
+/// list is right, and nothing is downloaded. Each time `wake` is notified (the user
+/// asked for a library update or signed in through the panel) they are read again, the
+/// pictures are let be read again, and the games bought but not there yet and the
+/// updates are downloaded (the next round waits for them). Nothing runs on a timer: the
+/// user chose to update by hand (2026-11-10).
+async fn shop_rounds<L: Send + Sync + 'static>(
+    libraries: Vec<Arc<L>>,
+    state: AppState,
+    wake: Arc<Notify>,
+    (refresh, download, end): Round<L>,
+) {
+    let mut asked = false;
     loop {
         for library in &libraries {
             let library = Arc::clone(library);
-            let _ = tokio::task::spawn_blocking(move || library.refresh()).await;
+            let _ = tokio::task::spawn_blocking(move || refresh(&library)).await;
         }
         state.forget_pictures();
         // A sign-in that ended shows on the button now.
         state.refresh().await;
+        let finish = if asked { download } else { end };
         for library in &libraries {
             let library = Arc::clone(library);
-            let _ = tokio::task::spawn_blocking(move || library.download()).await;
+            let _ = tokio::task::spawn_blocking(move || finish(&library)).await;
         }
-        tokio::select! {
-            () = tokio::time::sleep(SHOP_REFRESH) => {}
-            () = wake.notified() => {}
-        }
+        wake.notified().await;
+        asked = true;
     }
 }
 

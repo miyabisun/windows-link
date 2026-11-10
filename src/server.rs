@@ -21,7 +21,7 @@ use crate::{
     audio::Audio,
     buttons::{self, AudioSnapshot, ButtonState, ButtonView, PressError},
     config::{ButtonSpec, Config},
-    cursor::Palette,
+    cursor::{Arrow, NoArrow, Palette},
     desktops::{self, VirtualDesktops},
     discord::{Discord, NoDiscord},
     hold::{Colors, HIGHLIGHTS, HOLDS, Holds},
@@ -62,8 +62,20 @@ pub struct AppState {
     highlights: Arc<Holds>,
     /// The colour chosen for each `cursor.highlight` button.
     pub(crate) highlight_colors: Arc<Colors>,
+    /// Windows' arrow, and what it was last made to show (nothing yet at start).
+    arrow: Arc<dyn Arrow>,
+    arrow_shown: Arc<std::sync::Mutex<ArrowShown>>,
     /// Turns the wheel of the mouse board for `POST /buttons/{id}/wheel`.
     pointer: Arc<dyn Pointer>,
+}
+
+/// What Windows' arrow was last made to show.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum ArrowShown {
+    /// Nothing yet: a run before this one may have left the highlight.
+    #[default]
+    Unknown,
+    Is(Option<Palette>),
 }
 
 struct Hub {
@@ -95,6 +107,8 @@ impl AppState {
                 Holds::in_memory(HIGHLIGHTS).expect("an in-memory database opens"),
             ),
             highlight_colors: Arc::new(Colors::in_memory().expect("an in-memory database opens")),
+            arrow: Arc::new(NoArrow),
+            arrow_shown: Arc::default(),
             pointer: Arc::new(NoMouse),
         }
     }
@@ -185,6 +199,13 @@ impl AppState {
     #[must_use]
     pub fn with_highlight_colors(mut self, colors: Arc<Colors>) -> Self {
         self.highlight_colors = colors;
+        self
+    }
+
+    /// Highlight the cursor through `arrow` (without one Windows' cursors are left alone).
+    #[must_use]
+    pub fn with_arrow(mut self, arrow: Arc<dyn Arrow>) -> Self {
+        self.arrow = arrow;
         self
     }
 
@@ -288,6 +309,7 @@ impl AppState {
         })
         .await
         .unwrap_or_default();
+        self.show_arrow(buttons::highlight(&views)).await;
         let mut last = self.hub.last.lock().await;
         for view in &views {
             if !last.contains(view) {
@@ -299,6 +321,24 @@ impl AppState {
         }
         last.clone_from(&views);
         views
+    }
+
+    /// Change Windows' arrow when what the buttons say of it changed: after a press or
+    /// a colour chosen, and once at start, when Windows' own is put back should a
+    /// stopped run have left the highlight.
+    async fn show_arrow(&self, wanted: Option<Palette>) {
+        {
+            let mut shown = self
+                .arrow_shown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *shown == ArrowShown::Is(wanted) {
+                return;
+            }
+            *shown = ArrowShown::Is(wanted);
+        }
+        let arrow = self.arrow.clone();
+        let _ = tokio::task::spawn_blocking(move || arrow.show(wanted)).await;
     }
 
     /// Refresh on every Windows notification and at least every `POLL_INTERVAL`.
@@ -2423,6 +2463,55 @@ buttons:
         let (_, body) = call(state.clone(), "POST", "/buttons/cursor/press").await;
         assert_eq!(body["button"]["state"]["on"], false);
         assert!(state.highlights.held().unwrap().is_empty());
+    }
+
+    /// Windows' arrow is changed when a highlight button is pressed or its colour is
+    /// chosen, once each, and at no other time: nothing watches the cursor.
+    #[tokio::test]
+    async fn the_arrow_is_changed_once_by_each_press_and_colour() {
+        use crate::cursor::{Arrow, Palette};
+
+        #[derive(Default)]
+        struct Shown(std::sync::Mutex<Vec<Option<Palette>>>);
+        impl Arrow for Shown {
+            fn show(&self, palette: Option<Palette>) {
+                self.0.lock().unwrap().push(palette);
+            }
+        }
+
+        let text = format!(
+            "{HOLD}  - id: cursor
+    label: Cursor
+    type: cursor.highlight
+"
+        );
+        let arrow = Arc::new(Shown::default());
+        let state = AppState::new(
+            config::parse(&text).unwrap(),
+            Arc::new(FakeAudio::new(Vec::new(), None)),
+        )
+        .with_arrow(arrow.clone());
+        let shown = || std::mem::take(&mut *arrow.0.lock().unwrap());
+        // At start Windows' own arrow is put back, should a stopped run have left ours.
+        state.refresh().await;
+        assert_eq!(shown(), [None]);
+        call(state.clone(), "POST", "/buttons/cursor/press").await;
+        assert_eq!(shown(), [Some(Palette::Blue)]);
+        // Reading the buttons again changes nothing.
+        call(state.clone(), "GET", "/buttons").await;
+        state.refresh().await;
+        assert_eq!(shown(), []);
+        let green = serde_json::json!({ "color": "green" });
+        send(state.clone(), "PUT", "/buttons/cursor/color", green).await;
+        assert_eq!(shown(), [Some(Palette::Green)]);
+        call(state.clone(), "POST", "/buttons/cursor/press").await;
+        assert_eq!(shown(), [None]);
+        // A colour chosen while off waits for the next press.
+        let red = serde_json::json!({ "color": "red" });
+        send(state.clone(), "PUT", "/buttons/cursor/color", red).await;
+        assert_eq!(shown(), []);
+        call(state, "POST", "/buttons/cursor/press").await;
+        assert_eq!(shown(), [Some(Palette::Red)]);
     }
 
     /// A highlight button's colour is chosen on the panel (its menu): blue until

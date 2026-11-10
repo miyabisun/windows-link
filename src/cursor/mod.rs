@@ -32,6 +32,20 @@ pub enum Palette {
     Blue,
 }
 
+/// Windows' arrow cursor, which a `cursor.highlight` button changes.
+pub trait Arrow: Send + Sync + 'static {
+    /// Put the highlight in `palette` in for Windows' arrow, or Windows' own back.
+    fn show(&self, palette: Option<Palette>);
+}
+
+/// No arrow to change: the tests', and a server without `cursor.highlight` buttons,
+/// which leaves Windows' cursors alone.
+pub struct NoArrow;
+
+impl Arrow for NoArrow {
+    fn show(&self, _: Option<Palette>) {}
+}
+
 impl Palette {
     /// The fill's hues, in degrees, at the arrow's left edge and at its right point,
     /// where the next colour mixes in: blue takes red (cyan to violet, as the game's

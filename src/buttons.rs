@@ -413,6 +413,15 @@ fn press_output(
     audio.set_default_output(target).map_err(PressError::Audio)
 }
 
+/// The colour the cursor is highlighted in: that of the first `cursor.highlight` button
+/// that is on, or none while none is.
+pub fn highlight(views: &[ButtonView]) -> Option<crate::cursor::Palette> {
+    views.iter().find_map(|view| match view.state {
+        ButtonState::Highlight { on: true, color } => Some(color),
+        _ => None,
+    })
+}
+
 /// The toggle buttons that are on, by kind, and the highlights' colours (see
 /// `crate::hold`).
 pub struct Toggles<'a> {

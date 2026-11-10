@@ -1166,6 +1166,23 @@ mod tests {
     }
 
     #[test]
+    fn a_round_that_only_reads_ends_without_downloading() {
+        use crate::library::Doing;
+
+        let root = games("reads");
+        let library = library(&root);
+        // As at start: the games are worked out, and nothing is downloaded unasked.
+        library.refresh();
+        assert_eq!(library.round().unwrap().doing, Some(Doing::Purchases));
+        library.end_round();
+        let round = library.round().unwrap();
+        assert_eq!(round.doing, None);
+        assert!(round.finished.is_some());
+        assert_eq!(round.jobs, []);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_round_that_cannot_read_the_games_folder_downloads_nothing_and_says_why() {
         use super::play::Work;
 
