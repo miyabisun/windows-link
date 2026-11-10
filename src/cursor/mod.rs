@@ -1,8 +1,8 @@
 //! The `cursor.highlight` buttons: while one is on, an arrow as big as Windows' (on the
 //! monitor the cursor was on when it was pressed) stands in for the arrow cursor, so the cursor is easy to find over a busy screen. The arrow
 //! is drawn after Blue Archive's own cursor, in the colour chosen for the button on the
-//! panel, and handed to Windows as a cursor file (`.cur`). Pictures of the user's own can
-//! stand in for the busy cursors and the hand over a link (`art`).
+//! panel, and handed to Windows as a cursor file (`.cur`). The busy cursors are
+//! changed with it, to a student's halo (`halo`).
 //!
 //! The game's cursor (read off Windows on 2026-10-18, 32 by 32, with its alpha) is a
 //! dot-wide navy edge, a white rim inside it and a fill whose hue turns from cyan at the
@@ -19,7 +19,7 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
-pub mod art;
+pub mod halo;
 pub mod windows;
 
 /// The colour a `cursor.highlight` button fills the arrow with, chosen on the panel:
@@ -137,9 +137,10 @@ const SAMPLES: u32 = 8;
 const BUSY_SIDE: f32 = 52.0;
 const MARK_AT: (f32, f32) = (37.5, 37.5);
 const MARK: f32 = 28.0;
-/// The frames of one turn of a mark, and how long each shows, in sixtieths of a second.
-const TURN_FRAMES: u32 = 36;
-pub const TURN_JIFFIES: u32 = 2;
+/// The frames in which a halo's colours go once round, and how long each shows, in
+/// sixtieths of a second: a turn in a second and a half.
+const TURN_FRAMES: u32 = 30;
+pub const TURN_JIFFIES: u32 = 3;
 
 /// The point of the arrow, where the cursor points, on a cursor `size` pixels wide:
 /// the point of the outline nearest the corner its short top cuts off, a dot inside
@@ -193,23 +194,28 @@ pub fn busy_side(size: u32) -> u32 {
     to_byte_range(size as f32 * BUSY_SIDE / 32.0, 256.0)
 }
 
-/// The degrees each frame of a turning mark is turned by, once round.
-pub fn turns() -> impl Iterator<Item = f32> {
-    (0..TURN_FRAMES).map(|frame| 360.0 * frame as f32 / TURN_FRAMES as f32)
+/// How far round a halo's colours have gone in each frame of a busy cursor, in
+/// degrees, once round.
+pub fn turns() -> Vec<f32> {
+    (0..TURN_FRAMES)
+        .map(|frame| 360.0 * frame as f32 / TURN_FRAMES as f32)
+        .collect()
 }
 
 /// The busy cursor's frames (Windows shows it while a program starts): the arrow of
-/// `picture`, as big and where it is, and `mark` low at its right, turning once round
-/// over the frames. Each is `busy_side` pixels square, as `picture`.
-pub fn busy_frames(size: u32, palette: Palette, mark: &art::Art) -> Vec<Vec<[u8; 4]>> {
+/// `picture`, as big and where it is, and Anna's halo low at its right, its colours
+/// going once round over the frames. Each is `busy_side` pixels square, as `picture`.
+pub fn busy_frames(size: u32, palette: Palette) -> Vec<Vec<[u8; 4]>> {
     let (width, unit) = (busy_side(size), size as f32 / 32.0);
     let arrow: Vec<[u8; 4]> = (0..width * width)
         .map(|at| pixel(size, (at % width, at / width), palette))
         .collect();
-    turns()
-        .map(|turn| {
-            let middle = (MARK_AT.0 * unit, MARK_AT.1 * unit);
-            mark.drawn(width, middle, MARK * unit, turn)
+    let middle = (MARK_AT.0 * unit, MARK_AT.1 * unit);
+    halo::Halo::Anna
+        .drawn(width, middle, MARK * unit, &turns())
+        .into_iter()
+        .map(|frame| {
+            frame
                 .into_iter()
                 .zip(&arrow)
                 .map(|(over, &under)| if over[3] > 0 { over } else { under })
@@ -608,34 +614,33 @@ mod tests {
         frame[usize::try_from(row * busy_side(size) + column).unwrap()]
     }
 
-    /// Four dots square, red at the left and blue at the right: a mark to tell a turn by.
-    fn halves() -> art::Art {
-        let (red, blue) = ([255, 0, 0, 255], [0, 0, 255, 255]);
-        art::Art::new(4, [red, red, blue, blue].repeat(4)).unwrap()
-    }
-
     /// While a program starts the arrow stays as big as it is (Windows' own arrow with
     /// its ring is smaller, the user's of 2026-11-10): every frame draws the same arrow,
-    /// dot for dot, and beside it the user's mark, turned half round by half the frames.
+    /// dot for dot, and beside it Anna's halo, which stays as it is while its colours go
+    /// round: purple at its top at first, light blue there half the frames later.
     #[test]
-    fn the_busy_cursor_keeps_the_arrow_and_turns_a_mark_beside_it() {
+    fn the_busy_cursor_keeps_the_arrow_and_anna_s_halo_changes_colour_beside_it() {
         let size = 48;
         let (arrow, width) = (picture(size, Palette::Blue), busy_side(size));
         assert!(width > size);
-        let frames = busy_frames(size, Palette::Blue, &halves());
+        let frames = busy_frames(size, Palette::Blue);
         assert!(frames.len() > 1);
+        let shape = |frame: &[[u8; 4]]| frame.iter().map(|dot| dot[3]).collect::<Vec<_>>();
         for frame in &frames {
             assert_eq!(frame.len(), usize::try_from(width * width).unwrap());
+            assert_eq!(shape(frame), shape(&frames[0]), "nothing moves");
             for at in 0..size * size {
                 let drawn = arrow[usize::try_from(at).unwrap()];
                 let place = usize::try_from(at / size * width + at % size).unwrap();
                 assert!(drawn[3] == 0 || frame[place] == drawn, "dot {at}");
             }
         }
-        let left = (MARK_AT.0 - MARK / 4.0, MARK_AT.1);
-        assert_eq!(busy_at(size, &frames[0], left), [255, 0, 0, 255]);
-        let half = &frames[frames.len() / 2];
-        assert_eq!(busy_at(size, half, left), [0, 0, 255, 255]);
+        // On the gear's ring, straight above its middle.
+        let top = (MARK_AT.0, MARK_AT.1 - MARK * 0.33);
+        let [r, g, _, a] = busy_at(size, &frames[0], top);
+        assert!(a == 255 && r > g + 20, "purple at first: {r} {g} {a}");
+        let [r, g, _, _] = busy_at(size, &frames[frames.len() / 2], top);
+        assert!(g > r + 60, "light blue half a turn later: {r} {g}");
     }
 
     /// Windows takes the frames for one cursor of the size asked.
@@ -644,7 +649,7 @@ mod tests {
         let (size, width) = (48, busy_side(48));
         let path =
             std::env::temp_dir().join(format!("windows-link-cursor-{}.ani", std::process::id()));
-        let frames: Vec<Vec<u8>> = busy_frames(size, Palette::Green, &halves())
+        let frames: Vec<Vec<u8>> = busy_frames(size, Palette::Green)
             .iter()
             .map(|frame| cur(frame, width, hotspot(size)))
             .collect();

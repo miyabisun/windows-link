@@ -200,19 +200,13 @@ buttons:
   green teal. The arrow is changed once, when the button is pressed or its colour chosen:
   it is as big as the arrow Windows draws on the monitor the cursor is on at that moment
   (the pointer size chosen in Windows' settings, at that monitor's DPI) and stays that
-  size on the other monitors. The arrow Windows shows while a program starts (its arrow
-  with a turning ring) is replaced by the same arrow, so the cursor does not shrink for
-  that moment. Pictures of your own can stand in for more: PNG files (with alpha, square)
-  put beside `config.yaml`, read when the arrow is changed. No picture is shipped.
-
-  | File | Used for |
-  |---|---|
-  | `cursor-busy.png` | turns once round in 1.2 s beside the arrow while a program starts, and alone as the wait cursor |
-  | `cursor-link-red.png`, `cursor-link-green.png`, `cursor-link-blue.png` | the cursor over a link (Windows' hand) while the highlight is that colour, a quarter wider than the arrow and pointing with its middle |
-
-  A navy edge is drawn round a picture so a pale one shows over a pale page. Turning the
-  highlight off brings the user's own cursors back. Only these cursors are replaced, and
-  a program that draws a cursor of its own keeps it. Whether it is on and its colour are
+  size on the other monitors. The busy cursors are changed with it: the arrow Windows
+  shows while a program starts (its arrow with a turning ring) becomes the same arrow,
+  as big as it is, with a small gear beside it (drawn after the halo of Anna, a student
+  of the game), and the wait cursor the gear alone. The gear stays still; its colours,
+  purple to light blue, go once round it in a second and a half. Turning the highlight
+  off brings the user's own cursors back. Only these cursors are replaced (the hand
+  over a link is not), and a program that draws a cursor of its own keeps it. Whether it is on and its colour are
   kept in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
 
   ```yaml
