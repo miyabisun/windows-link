@@ -204,9 +204,12 @@ buttons:
   shows while a program starts (its arrow with a turning ring) becomes the same arrow,
   as big as it is, with a small gear beside it (drawn after the halo of Anna, a student
   of the game), and the wait cursor the gear alone. The gear stays still; its colours,
-  purple to light blue, go once round it in a second and a half. Turning the highlight
-  off brings the user's own cursors back. Only these cursors are replaced (the hand
-  over a link is not), and a program that draws a cursor of its own keeps it. Whether it is on and its colour are
+  purple to light blue, go once round it in a second and a half. The cross (precision
+  select) becomes a sight to aim with, a quarter wider than the arrow and pointing with
+  its middle, after another student's halo for each colour: Shiroko's for blue, Midori's
+  for green, Momoi's for red. Turning the highlight off brings the user's own cursors
+  back. Only these cursors are replaced (the hand over a link is not), and a program
+  that draws a cursor of its own keeps it. Whether it is on and its colour are
   kept in `windows-link.db`. For example in `desktops/ブルアカ.yaml`:
 
   ```yaml

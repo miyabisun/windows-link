@@ -1,8 +1,8 @@
 //! The `cursor.highlight` buttons: while one is on, an arrow as big as Windows' (on the
 //! monitor the cursor was on when it was pressed) stands in for the arrow cursor, so the cursor is easy to find over a busy screen. The arrow
 //! is drawn after Blue Archive's own cursor, in the colour chosen for the button on the
-//! panel, and handed to Windows as a cursor file (`.cur`). The busy cursors are
-//! changed with it, to a student's halo (`halo`).
+//! panel, and handed to Windows as a cursor file (`.cur`). The busy cursors and the
+//! cross are changed with it, to students' halos (`halo`).
 //!
 //! The game's cursor (read off Windows on 2026-10-18, 32 by 32, with its alpha) is a
 //! dot-wide navy edge, a white rim inside it and a fill whose hue turns from cyan at the

@@ -1,8 +1,7 @@
 //! Halos drawn into cursors (the user's of 2026-11-10): Blue Archive students' halos,
 //! drawn here from their shapes as measured off pictures of them (350 pixels square),
-//! not copied from the pictures. Anna's is in the busy cursors. The three to aim with
-//! are in no cursor yet: over a link they hid the link's words, and which cursor they
-//! go in instead is the user's to choose.
+//! not copied from the pictures. Anna's is in the busy cursors, and the three to aim
+//! with stand in for Windows' cross (over a link they hid the link's words).
 
 use std::sync::LazyLock;
 
@@ -24,7 +23,7 @@ pub enum Halo {
 }
 
 impl Halo {
-    /// The halo to aim with over a link while the highlight is in `palette`.
+    /// The halo to aim with while the highlight is in `palette`.
     pub fn aim(palette: Palette) -> Self {
         match palette {
             Palette::Blue => Self::Shiroko,

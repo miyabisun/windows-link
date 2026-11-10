@@ -1,5 +1,5 @@
-//! Putting the highlight's cursors in for Windows' (the arrow and the busy ones), and
-//! Windows' own back.
+//! Putting the highlight's cursors in for Windows' (the arrow, the busy ones and the
+//! cross), and Windows' own back.
 
 use std::{
     ffi::c_void,
@@ -17,7 +17,7 @@ use windows::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             WindowsAndMessaging::{
                 GetCursorPos, HCURSOR, IMAGE_CURSOR, LR_LOADFROMFILE, LoadImageW, OCR_APPSTARTING,
-                OCR_NORMAL, OCR_WAIT, SPI_SETCURSORS, SYSTEM_CURSOR_ID,
+                OCR_CROSS, OCR_NORMAL, OCR_WAIT, SPI_SETCURSORS, SYSTEM_CURSOR_ID,
                 SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetSystemCursor, SystemParametersInfoW,
             },
         },
@@ -82,10 +82,10 @@ pub fn restore() {
 /// - for the arrow Windows shows while a program starts, the same arrow with Anna's
 ///   halo beside it, its colours going round: Windows' own is smaller than the
 ///   highlight, so the cursor shrank for a moment (the user's of 2026-11-10);
-/// - Anna's halo alone, its colours going round, for Windows' wait cursor.
-///
-/// The hand over a link is left alone: a halo there hid the link's words (the user's of
-/// 2026-11-10).
+/// - Anna's halo alone, its colours going round, for Windows' wait cursor;
+/// - the halo to aim with in `palette`, pointing with its middle, for Windows' cross
+///   (the user's of 2026-11-10; over a link it hid the link's words, so the hand is
+///   left alone).
 fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
     let write = |what: &str, file: Vec<u8>| {
         let path = dir.join(format!("cursor-highlight-{what}"));
@@ -115,14 +115,28 @@ fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
         OCR_APPSTARTING,
     )?;
 
-    let (middle, half) = (size as f32 / 2.0, u16::try_from(size / 2).unwrap_or(0));
-    let frames: Vec<Vec<u8>> = Halo::Anna
-        .drawn(size, (middle, middle), size as f32, &super::turns())
-        .iter()
-        .map(|frame| super::cur(frame, size, (half, half)))
-        .collect();
-    let wait = super::ani(&frames, super::TURN_JIFFIES);
-    put(&write(&format!("wait-{size}.ani"), wait)?, size, OCR_WAIT)
+    // A halo alone, `across` pixels square and pointing with its middle, once for each turn.
+    let alone = |halo: Halo, across: u32, turns: &[f32]| -> Vec<Vec<u8>> {
+        let (middle, half) = (across as f32 / 2.0, u16::try_from(across / 2).unwrap_or(0));
+        halo.drawn(across, (middle, middle), across as f32, turns)
+            .iter()
+            .map(|frame| super::cur(frame, across, (half, half)))
+            .collect()
+    };
+    let wait = super::ani(
+        &alone(Halo::Anna, size, &super::turns()),
+        super::TURN_JIFFIES,
+    );
+    put(&write(&format!("wait-{size}.ani"), wait)?, size, OCR_WAIT)?;
+
+    // A quarter wider than the arrow: rings to aim with read thin at the arrow's size.
+    let across = (size * 5 / 4).min(256);
+    let aim = alone(Halo::aim(palette), across, &[0.0]).concat();
+    put(
+        &write(&format!("{colour}-aim-{size}.cur"), aim)?,
+        across,
+        OCR_CROSS,
+    )
 }
 
 /// The cursor file at `path`, `size` pixels square, in for Windows' cursor `id`.
