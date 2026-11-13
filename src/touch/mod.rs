@@ -80,6 +80,22 @@ pub fn is_stray(o: &Observation) -> bool {
     !o.touch_down && o.since_real_ms >= QUIET_MS && o.previous == Some(o.cursor) && away
 }
 
+/// The cursor's state Windows reports while touch or pen input hides the mouse cursor
+/// (`CURSOR_SUPPRESSED`).
+pub const SUPPRESSED: u32 = 2;
+
+/// Whether the mouse cursor has just come back from touch or pen input: Windows hid it
+/// for that input at the last look (`before`, the cursor's state) and no longer does
+/// (`now`).
+///
+/// At that moment Windows loads its arrow, wait and program-starting cursors again from
+/// the user's scheme, so cursors a program put in for them are gone (measured on
+/// 2026-11-13, with windows-link stopped too): the highlighted cursor is put in again
+/// then.
+pub fn came_back(before: u32, now: u32) -> bool {
+    before & SUPPRESSED != 0 && now & SUPPRESSED == 0
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Monitor {
     pub id: String,
@@ -133,7 +149,10 @@ pub struct MonitorView {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeepCursor, Observation, QUIET_MS, Source, classify, is_stray, monitor_id};
+    use super::{
+        KeepCursor, Observation, QUIET_MS, SUPPRESSED, Source, came_back, classify, is_stray,
+        monitor_id,
+    };
 
     #[test]
     fn classifies_touch_pen_and_mouse_by_signature() {
@@ -158,6 +177,19 @@ mod tests {
         assert_eq!(id.len(), 4 + 16);
         assert_eq!(id, monitor_id(&path.to_uppercase()));
         assert_ne!(id, monitor_id(r"\\?\DISPLAY#IOC90CF#5&384b0f7a&0&UID4357"));
+    }
+
+    /// The mouse cursor comes back once touch stops hiding it: hidden at the last
+    /// look, not now. A cursor an application hides is not that.
+    #[test]
+    fn the_cursor_comes_back_when_touch_stops_hiding_it() {
+        const SHOWING: u32 = 1;
+        assert!(came_back(SUPPRESSED, SHOWING));
+        assert!(came_back(SUPPRESSED, 0), "back, though a program hides it");
+        assert!(!came_back(SUPPRESSED, SUPPRESSED), "still hidden by touch");
+        assert!(!came_back(SHOWING, SHOWING));
+        assert!(!came_back(0, SHOWING), "a program's hiding ended");
+        assert!(!came_back(SHOWING, SUPPRESSED), "touch began");
     }
 
     fn observation() -> Observation {

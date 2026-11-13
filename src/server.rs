@@ -350,6 +350,14 @@ impl AppState {
         let _ = tokio::task::spawn_blocking(move || arrow.show(wanted)).await;
     }
 
+    /// Put the highlighted cursor in again where it is on: Windows put its own back, as
+    /// it does when the mouse cursor returns after a touch (the touch cursor keeper
+    /// tells of it).
+    pub async fn show_arrow_again(&self) {
+        let arrow = self.arrow.clone();
+        let _ = tokio::task::spawn_blocking(move || arrow.again()).await;
+    }
+
     /// Read the buttons again each time `changes` is notified: Windows reported a
     /// change (audio, a window that came or went, a program that exited) or the Discord
     /// icons were read. Nothing is read on a timer (until 2026-11-10 everything was,
@@ -2516,6 +2524,8 @@ buttons:
             fn show(&self, palette: Option<Palette>) {
                 self.0.lock().unwrap().push(palette);
             }
+
+            fn again(&self) {}
         }
 
         let text = format!(

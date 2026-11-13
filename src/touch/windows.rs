@@ -29,16 +29,19 @@ use windows::{
             Controls::{POINTER_DEVICE_INFO, POINTER_DEVICE_TYPE_TOUCH},
             Input::Pointer::GetPointerDevices,
             WindowsAndMessaging::{
-                CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, MONITORINFOF_PRIMARY,
-                MSG, MSLLHOOKSTRUCT, SetCursorPos, SetTimer, SetWindowsHookExW, TranslateMessage,
-                WH_MOUSE_LL, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER,
+                CURSORINFO, CallNextHookEx, DispatchMessageW, GetCursorInfo, GetCursorPos,
+                GetMessageW, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, SetCursorPos, SetTimer,
+                SetWindowsHookExW, TranslateMessage, WH_MOUSE_LL, WM_LBUTTONUP, WM_RBUTTONUP,
+                WM_TIMER,
             },
         },
     },
     core::BOOL,
 };
 
-use super::{Displays, KeepCursor, Monitor, Observation, Source, classify, is_stray, monitor_id};
+use super::{
+    Displays, KeepCursor, Monitor, Observation, Source, came_back, classify, is_stray, monitor_id,
+};
 
 /// Cursor poll period; a tap is restored within a few polls of the finger lifting.
 const POLL_MS: u32 = 40;
@@ -252,18 +255,20 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
 
 /// Install the hook and the cursor poller on a dedicated thread. The process must
 /// already be per-monitor DPI aware so hook, cursor and monitor coordinates agree.
-pub fn start_hook(keep: KeepCursor) -> Result<(), String> {
+/// `returned` is called, on that thread, each time the mouse cursor comes back after a
+/// touch (see `came_back`); it must not take long, the hook waits on the thread.
+pub fn start_hook(keep: KeepCursor, returned: impl Fn() + Send + 'static) -> Result<(), String> {
     let (ready_tx, ready_rx) = mpsc::channel();
     thread::Builder::new()
         .name("touch-hook".into())
-        .spawn(move || hook_thread(&keep, &ready_tx))
+        .spawn(move || hook_thread(&keep, &returned, &ready_tx))
         .map_err(|e| format!("cannot start touch hook thread: {e}"))?;
     ready_rx
         .recv()
         .map_err(|_| "touch hook thread exited during start".to_owned())?
 }
 
-fn hook_thread(keep: &KeepCursor, ready: &mpsc::Sender<Result<(), String>>) {
+fn hook_thread(keep: &KeepCursor, returned: &dyn Fn(), ready: &mpsc::Sender<Result<(), String>>) {
     // SAFETY: `start` and `msg` are live locals the calls write into; `hook` has the signature a
     // WH_MOUSE_LL hook needs; the timer has no callback, so it posts WM_TIMER to this thread.
     unsafe {
@@ -286,6 +291,9 @@ fn hook_thread(keep: &KeepCursor, ready: &mpsc::Sender<Result<(), String>>) {
         let mut msg = MSG::default();
         while GetMessageW(&raw mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_TIMER {
+                if poller.came_back() {
+                    returned();
+                }
                 poller.tick(keep);
             } else {
                 let _ = TranslateMessage(&raw const msg);
@@ -304,9 +312,25 @@ struct Poller {
     /// Monitor lookup for the last stray position (the lookup is the expensive part;
     /// the keep-cursor setting is re-read every tick so switching it on takes effect).
     looked_up: Option<((i32, i32), Option<MonitorAt>)>,
+    /// The cursor's state at the last poll (see `came_back`).
+    state: u32,
 }
 
 impl Poller {
+    /// Whether the mouse cursor came back from a touch since the last poll.
+    fn came_back(&mut self) -> bool {
+        let mut info = CURSORINFO {
+            cbSize: u32::try_from(std::mem::size_of::<CURSORINFO>()).unwrap_or(0),
+            ..Default::default()
+        };
+        // SAFETY: `info` is a live local with its size set, which the call fills in.
+        if unsafe { GetCursorInfo(&raw mut info) }.is_err() {
+            return false;
+        }
+        let before = std::mem::replace(&mut self.state, info.flags.0);
+        came_back(before, info.flags.0)
+    }
+
     fn tick(&mut self, keep: &KeepCursor) {
         let mut point = POINT::default();
         // SAFETY: `point` is a live local the call writes the cursor position into.

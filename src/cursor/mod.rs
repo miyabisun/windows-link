@@ -38,6 +38,11 @@ pub enum Palette {
 pub trait Arrow: Send + Sync + 'static {
     /// Put the highlight in `palette` in for Windows' arrow, or Windows' own back.
     fn show(&self, palette: Option<Palette>);
+
+    /// Put the highlight in again as it was last shown, where it is on: Windows put
+    /// its own cursors back (it does each time the mouse cursor returns after a
+    /// touch).
+    fn again(&self);
 }
 
 /// No arrow to change: the tests', and a server without `cursor.highlight` buttons,
@@ -46,6 +51,8 @@ pub struct NoArrow;
 
 impl Arrow for NoArrow {
     fn show(&self, _: Option<Palette>) {}
+
+    fn again(&self) {}
 }
 
 impl Palette {

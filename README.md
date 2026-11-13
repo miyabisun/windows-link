@@ -200,7 +200,9 @@ buttons:
   green teal. The arrow is changed once, when the button is pressed or its colour chosen:
   it is as big as the arrow Windows draws on the monitor the cursor is on at that moment
   (the pointer size chosen in Windows' settings, at that monitor's DPI) and stays that
-  size on the other monitors. The busy cursors are changed with it: the arrow Windows
+  size on the other monitors. Windows puts its own arrow and busy cursors back each
+  time the mouse cursor returns after a touch of a touch screen; the highlight is put
+  in again right then (the touch cursor keeper below sees the cursor return). The busy cursors are changed with it: the arrow Windows
   shows while a program starts (its arrow with a turning ring) becomes the same arrow,
   as big as it is, with a small gear beside it (drawn after the halo of Anna, a student
   of the game), and the wait cursor the gear alone. The gear stays still; its colours,

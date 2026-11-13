@@ -163,7 +163,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .with_pointer(Arc::new(WindowsPointer::new(Arc::new(WindowsLauncher))))
         .with_process_watch(Arc::new(WindowsWatch::start(changes.clone())));
     if highlighting {
-        state = state.with_arrow(Arc::new(cursor::windows::WindowsArrow(data_dir())));
+        state = state.with_arrow(Arc::new(cursor::windows::WindowsArrow::new(data_dir())));
     }
     let state = serve_libraries(state, libraries);
     tokio::spawn(state.clone().run_refresher(changes.clone()));
@@ -179,7 +179,14 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = Arc::new(Store::open(&data_dir().join("windows-link.db"))?);
     let keep = KeepCursor::new(store.keep_cursor_overrides()?);
-    if let Err(err) = start_hook(keep.clone()) {
+    // Windows puts its own cursors back when the mouse cursor returns after a touch: the
+    // highlight is put in again then, off the hook's thread.
+    let again = (state.clone(), tokio::runtime::Handle::current());
+    let returned = move || {
+        let state = again.0.clone();
+        again.1.spawn(async move { state.show_arrow_again().await });
+    };
+    if let Err(err) = start_hook(keep.clone(), returned) {
         error!(%err, "touch cursor keeper is unavailable");
     }
     let touch = TouchState::new(Arc::new(WindowsDisplays), store, keep);

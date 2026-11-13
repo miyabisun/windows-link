@@ -5,6 +5,7 @@ use std::{
     ffi::c_void,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
 };
 
 use tracing::warn;
@@ -38,22 +39,53 @@ pub fn buttons(config: &Config) -> Vec<String> {
         .collect()
 }
 
+/// A cursor file put in for one of Windows' cursors, as `put` takes them.
+type Put = (PathBuf, u32, SYSTEM_CURSOR_ID);
+
 /// Windows' arrow, changed once each time a button is pressed or its colour chosen;
 /// the cursor files are written into the folder given. Nothing watches the cursor: the
 /// highlight is as big as Windows draws its arrow on the monitor the cursor is on when
 /// it is put in, and stays so (the user's of 2026-11-10; until then a thread looked
 /// every 150 ms for the monitor under the cursor).
-pub struct WindowsArrow(pub PathBuf);
+///
+/// Windows puts its own arrow, wait and program-starting cursors back each time the
+/// mouse cursor returns after a touch; the touch cursor keeper tells of it, and the
+/// files last written are put in again (`again`, the user's of 2026-11-13).
+pub struct WindowsArrow {
+    dir: PathBuf,
+    /// The files put in while the highlight is on (none while it is off).
+    shown: Mutex<Vec<Put>>,
+}
+
+impl WindowsArrow {
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            shown: Mutex::default(),
+        }
+    }
+}
 
 impl Arrow for WindowsArrow {
     fn show(&self, palette: Option<Palette>) {
+        let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        shown.clear();
         match palette {
             Some(palette) => {
-                if let Err(err) = apply(&self.0, size_here(), palette) {
+                if let Err(err) = apply(&self.dir, size_here(), palette, &mut shown) {
                     warn!(%err, "cannot highlight the cursor");
                 }
             }
             None => restore(),
+        }
+    }
+
+    fn again(&self) {
+        let shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        for (path, size, id) in shown.iter() {
+            if let Err(err) = put(path, *size, *id) {
+                warn!(%err, "cannot put the highlight in again");
+            }
         }
     }
 }
@@ -74,9 +106,9 @@ pub fn restore() {
     }
 }
 
-/// The highlight's cursors in `palette`, each put in once, their files written afresh
-/// each time (one an older version wrote under the same name draws that version's
-/// arrow: v0.1.28 left its 1.5x one behind):
+/// The highlight's cursors in `palette`, each put in once and noted in `shown`, their
+/// files written afresh each time (one an older version wrote under the same name
+/// draws that version's arrow: v0.1.28 left its 1.5x one behind):
 ///
 /// - the arrow, `size` pixels square, for Windows' arrow;
 /// - for the arrow Windows shows while a program starts, the same arrow with Anna's
@@ -88,20 +120,18 @@ pub fn restore() {
 /// - Junko's halo in `palette`, as big as the arrow and pointing with the tip of its
 ///   point, where the hand's fingertip is, for the hand over a link (the user's of
 ///   2026-11-10): it is narrow and hangs under the place pointed at.
-fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
-    let write = |what: &str, file: Vec<u8>| {
+fn apply(dir: &Path, size: u32, palette: Palette, shown: &mut Vec<Put>) -> Result<(), String> {
+    // Writes a cursor file and puts it in, `across` pixels square, for Windows' cursor `id`.
+    let mut write = |what: &str, file: Vec<u8>, across: u32, id: SYSTEM_CURSOR_ID| {
         let path = dir.join(format!("cursor-highlight-{what}"));
-        std::fs::write(&path, file)
-            .map(|()| path)
-            .map_err(|e| e.to_string())
+        std::fs::write(&path, file).map_err(|e| e.to_string())?;
+        put(&path, across, id)?;
+        shown.push((path, across, id));
+        Ok::<(), String>(())
     };
     let colour = palette.name();
     let arrow = super::cur(&super::picture(size, palette), size, super::hotspot(size));
-    put(
-        &write(&format!("{colour}-{size}.cur"), arrow)?,
-        size,
-        OCR_NORMAL,
-    )?;
+    write(&format!("{colour}-{size}.cur"), arrow, size, OCR_NORMAL)?;
 
     // A cursor is at most 256 pixels square, and this one wider than its arrow by the halo.
     let small = size.min(157);
@@ -111,8 +141,9 @@ fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
         .map(|frame| super::cur(frame, width, super::hotspot(small)))
         .collect();
     let busy = super::ani(&frames, super::TURN_JIFFIES);
-    put(
-        &write(&format!("{colour}-busy-{size}.ani"), busy)?,
+    write(
+        &format!("{colour}-busy-{size}.ani"),
+        busy,
         width,
         OCR_APPSTARTING,
     )?;
@@ -130,23 +161,15 @@ fn apply(dir: &Path, size: u32, palette: Palette) -> Result<(), String> {
         &alone(Halo::Anna, size, &super::turns(), false),
         super::TURN_JIFFIES,
     );
-    put(&write(&format!("wait-{size}.ani"), wait)?, size, OCR_WAIT)?;
+    write(&format!("wait-{size}.ani"), wait, size, OCR_WAIT)?;
 
     // A quarter wider than the arrow: rings to aim with read thin at the arrow's size.
     let across = (size * 5 / 4).min(256);
     let aim = alone(Halo::aim(palette), across, &[0.0], false).concat();
-    put(
-        &write(&format!("{colour}-aim-{size}.cur"), aim)?,
-        across,
-        OCR_CROSS,
-    )?;
+    write(&format!("{colour}-aim-{size}.cur"), aim, across, OCR_CROSS)?;
 
     let link = alone(Halo::Junko(palette), size, &[0.0], true).concat();
-    put(
-        &write(&format!("{colour}-link-{size}.cur"), link)?,
-        size,
-        OCR_HAND,
-    )
+    write(&format!("{colour}-link-{size}.cur"), link, size, OCR_HAND)
 }
 
 /// The cursor file at `path`, `size` pixels square, in for Windows' cursor `id`.
