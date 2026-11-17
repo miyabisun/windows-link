@@ -19,16 +19,19 @@ Each button does one thing:
 | `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button |
 | `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and `sign_in: "dlsite"` while DLsite needs signing in through the panel |
 | `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
-
-A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`), and `"pages": true` for DLsite, whose games have pages in the shop (`POST …/page`; the listing gives each game's `page`).
 | `automation.hold` | turns "the user is using the PC" on or off; turning it on also presses its `focus` button ([Mouse board](#mouse-board)) | `held` while on; automation then waits |
 | `cursor.highlight` | turns the highlighted cursor on or off: while on, an arrow after Blue Archive's cursor, in the colour chosen on the panel, stands in for the mouse cursor | `on` while on, and `color` (`red`, `green` or `blue`) |
+
+A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`), and `"pages": true` for DLsite, whose games have pages in the shop (`POST …/page`; the listing gives each game's `page`).
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
 Windows virtual desktops, darkens every monitor but the panel's and mutes the PC while it
 rests (see [Resting](#resting)), stays connected to [home-link](#home-link) so it can rest
 and wake the PC too, and updates itself from GitHub Releases (see [Updates](#updates)).
+With a [mouse board](#mouse-board) plugged in, it clicks, drags and scrolls in a
+program's window as a real mouse does, for scripts over the API and for agents over
+[MCP](#mcp).
 
 ## Requirements
 
@@ -236,27 +239,45 @@ Restart the server after editing the file.
 ## Mouse board
 
 Programs that run as administrator (Blue Archive does) ignore mouse and keyboard input
-that a normal program such as windows-link injects; Windows only lets real devices
-through. For automation that has to scroll such a program, windows-link drives a small
-board that is a real USB mouse: a Raspberry Pi RP2350 board such as Waveshare's
-RP2350-One (plugs straight into a USB-A port) or RP2350-Zero, running the CircuitPython
-program in [`firmware/mouse`](firmware/mouse). The board is also a serial port, on
-which windows-link finds it by asking (only ports of Raspberry Pi and Adafruit boards
-are asked) and tells it how many notches to turn.
+that a normal program such as windows-link injects. Windows only lets real devices
+through. While such a program is at the front, a normal program cannot even move the
+cursor.
+
+To click, drag or scroll in such a program, windows-link drives a small board that is a
+real USB mouse: a Raspberry Pi RP2350 board such as Waveshare's RP2350-Zero or
+RP2350-One (which plugs straight into a USB-A port). The board runs the CircuitPython
+program in [`firmware/mouse`](firmware/mouse). It is also a serial port. windows-link
+finds it by asking the ports of Raspberry Pi and Adafruit boards, and tells it what to
+do: move, hold down or let go buttons, turn the wheel.
 
 To set a board up:
 
 1. Hold the board's BOOT button while plugging it in; it shows up as a drive.
 2. Copy the board's CircuitPython `.uf2` from <https://circuitpython.org> (for example
-   `waveshare_rp2350_one`) onto that drive. The board restarts as `CIRCUITPY`.
+   `waveshare_rp2350_zero`) onto that drive. The board restarts as `CIRCUITPY`.
 3. Copy `firmware/mouse/boot.py` and `firmware/mouse/code.py` onto `CIRCUITPY`, then
    unplug the board and plug it in again (USB is set up in `boot.py`).
 
-`POST /buttons/{id}/wheel` then brings the button's program forward, moves the cursor to
-the point, checks that the program's window is under it, turns the wheel and puts the
-cursor back. It only scrolls the windows of configured `app.launch` buttons.
+To update a board, copy `code.py` onto `CIRCUITPY` again; it restarts by itself. A board
+with an older `code.py` answers `500 mouse` to what it does not know yet.
 
-An `automation.hold` button stops it: press it before using the PC yourself and again
+`POST /buttons/{id}/click`, `/drag` and `/wheel` then work in the window of the button's
+program. Each one:
+
+1. brings the program forward and checks that its window shows at the point,
+2. puts the cursor on the point,
+3. presses, drags or turns the wheel,
+4. puts the cursor back where it was.
+
+Where Windows does not move the cursor, the board moves it as a mouse does. The server
+reads where the cursor is after each step, until it is on the point.
+
+The three only work in the windows of `app.launch` buttons that have a `process`. The
+board is a real mouse: without this limit it would reach everything on the screen,
+prompts for administrator rights included. Agents use the same three through
+[MCP](#mcp).
+
+An `automation.hold` button stops them: press it before using the PC yourself and again
 when done. Its state is kept in `windows-link.db`, so a restart keeps the hold. With
 `focus`, turning it on also presses that `app.launch` button, bringing the program forward
 for you. For example in `desktops/ブルアカ.yaml`:
@@ -549,7 +570,10 @@ Discord's CDN.
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
 | `PUT /buttons/{id}/color` | `{"color": "red"}` (`red`, `green` or `blue`): the colour a `cursor.highlight` button highlights the cursor in; returns `{"button": …}`. `409 not_highlight` for other buttons, `422` for another colour |
-| `POST /buttons/{id}/wheel` | `{"x": …, "y": …, "notches": …}`: turn the [mouse board](#mouse-board)'s wheel over an `app.launch` button's running `process` (`x`, `y` are fractions of its window, `notches` 1–20 either way, negative scrolls down); `204`. `409 user_operating` while an `automation.hold` button is on, `409 not_scrollable` for other buttons, `400 invalid_wheel`, `409 no_mouse`, `409 no_window`, `409 covered` (another window is over that point), `500 mouse` |
+| `POST /buttons/{id}/click` | `{"x": …, "y": …, "button": …, "count": …}`: click with the [mouse board](#mouse-board) in the window of an `app.launch` button's running `process` (`x`, `y` are fractions of its window from the left and the top; `button` is `left`, `right` or `middle`, `left` when left out; `count` is 1 or 2, a double click); `204`. `409 user_operating` while an `automation.hold` button is on, `409 not_clickable` for other buttons, `400 invalid_click`, `409 no_mouse`, `409 no_window`, `409 covered` (another window is over that point), `500 mouse` (the cursor did not get there, or the board does not know the command), `403 foreign_origin` for a page of another web site |
+| `POST /buttons/{id}/drag` | `{"x": …, "y": …, "to_x": …, "to_y": …, "button": …}`: press at `x`, `y`, move to `to_x`, `to_y` in the same window and let go there; `204`, and the click's errors with `409 not_draggable` and `400 invalid_drag` |
+| `POST /buttons/{id}/wheel` | `{"x": …, "y": …, "notches": …}`: turn the wheel at `x`, `y` (`notches` 1–20 either way, negative scrolls down); `204`, and the click's errors with `409 not_scrollable` and `400 invalid_wheel` |
+| `POST /mcp` | the [MCP](#mcp) server: one JSON-RPC message, answered as JSON |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, or a redirect to it on the web, when `icon` is true |
 | `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, status, updated, bought, page, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null, "sign_in": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `status` how its download goes; `updated` and `bought` when its latest version came out and when it was bought, in Unix seconds, when the shop says; `page` its page in the shop; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now, `sign_in` the shop to sign in to through the panel) |
 | `POST /buttons/{id}/library/update` | bring a library button's games up to date, leaving out its `hide` labels: Steam updates its games and shows its install screen for those not installed, answering `{"updates": n, "installs": n}` ([Updating the library](#updating-the-library)); DLsite and FANZA start their round of downloads and updates now, or right after the one under way (`202 {"round": true}`; the listing shows how each game goes). `409 sign_in` while DLsite or FANZA needs signing in, `409 update_unavailable` with the reason (Steam not running or not accepting remote control) |
@@ -587,7 +611,7 @@ Errors are JSON `{"error": code, "message": …}`: `404 not_found`, `409 device_
 `400 invalid_label` (an empty or taken name, or Steam's own label), `409 labels_unavailable`
 (Steam cannot be asked now, with the reason), `500 labels`,
 `500 storage`, `400 invalid_hwnd`, `400 invalid_name`, `409 exists`, `503 desktops`,
-`502 update`, or the wheel's errors above.
+`502 update`, or the mouse board's errors above.
 
 `/events` messages:
 
@@ -609,6 +633,28 @@ exiting. It has no notice of a program starting that a program without administr
 rights can take, so one that starts without showing a window (Steam started in the tray)
 shows as running the next time anything has the buttons read: another notice, a press,
 or a panel connecting.
+
+## MCP
+
+`POST /mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server
+(Streamable HTTP; each message is answered as JSON, there is no event stream), so an
+agent can use the [mouse board](#mouse-board). For Claude Code:
+
+```powershell
+claude mcp add --transport http windows-link http://127.0.0.1:4730/mcp
+```
+
+| Tool | Does |
+|------|------|
+| `list_buttons` | `GET /buttons`: the buttons with their states. The mouse works in the windows of the `app.launch` buttons that are `running` |
+| `mouse_click` | `POST /buttons/{id}/click` with `id`, `x`, `y` and, when wanted, `button` and `count` |
+| `mouse_drag` | `POST /buttons/{id}/drag` with `id`, `x`, `y`, `to_x`, `to_y` and, when wanted, `button` |
+| `mouse_wheel` | `POST /buttons/{id}/wheel` with `id`, `x`, `y`, `notches` |
+
+Each tool sends the request beside it, so it checks and fails as that request does. The
+tool's answer is the request's body (`null` after a `204`), with `isError` set for an
+error status. While an `automation.hold` button is on, the mouse tools fail with
+`user_operating`. There is no authentication, as for the rest of the API.
 
 ## Virtual desktops
 
@@ -790,6 +836,10 @@ the PC through it.
 Accepted risk: a web page open in a browser on the same PC can send requests to
 `http://127.0.0.1:4730` and press buttons. This was a deliberate choice for a personal
 machine; there is no token, and requests are not rejected by origin.
+
+The [mouse board](#mouse-board) is the exception, as it is a real mouse. Its three
+requests and `/mcp` answer `403` to a request that names another web site as its origin.
+They take JSON only, which a browser does not send to another site without asking first.
 
 Cross-origin reads (CORS) are allowed only for the windows-deck window
 (`http://tauri.localhost`, `https://tauri.localhost`, `tauri://localhost`) and for pages

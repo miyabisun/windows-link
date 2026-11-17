@@ -4,11 +4,13 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
-        Path, State,
+        Path, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::ORIGIN},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -21,6 +23,7 @@ use crate::{
     audio::Audio,
     buttons::{self, AudioSnapshot, ButtonState, ButtonView, PressError},
     config::{ButtonSpec, Config},
+    cors,
     cursor::{Arrow, NoArrow, Palette},
     desktops::{self, VirtualDesktops},
     discord::{Discord, NoDiscord},
@@ -30,7 +33,11 @@ use crate::{
     library::{
         self, GameLibrary, KeyError, LabelError, NoLibrary, Picture, Pin, Pins, Update, UpdateError,
     },
-    mouse::{self, NoMouse, Pointer, ScrollError, WheelError, WheelRequest},
+    mcp,
+    mouse::{
+        self, Ask, ClickRequest, DragRequest, Motion, MouseError, NoMouse, PlanError, Pointer,
+        WheelRequest,
+    },
     power,
 };
 
@@ -62,7 +69,8 @@ pub struct AppState {
     /// Windows' arrow, and what it was last made to show (nothing yet at start).
     arrow: Arc<dyn Arrow>,
     arrow_shown: Arc<std::sync::Mutex<ArrowShown>>,
-    /// Turns the wheel of the mouse board for `POST /buttons/{id}/wheel`.
+    /// Clicks, drags and turns the wheel with the mouse board (`POST /buttons/{id}/click`,
+    /// `/drag` and `/wheel`).
     pointer: Arc<dyn Pointer>,
     /// Tells when a program the buttons show as running exits.
     watch: Arc<dyn ProcessWatch>,
@@ -217,7 +225,7 @@ impl AppState {
         self
     }
 
-    /// Turn the wheel through `pointer` (tests use a fake; without one there is no mouse).
+    /// Use the mouse through `pointer` (tests use a fake; without one there is no mouse).
     #[must_use]
     pub fn with_pointer(mut self, pointer: Arc<dyn Pointer>) -> Self {
         self.pointer = pointer;
@@ -431,11 +439,10 @@ fn compute(
 }
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/healthz", get(healthz))
         .route("/buttons", get(list_buttons))
         .route("/buttons/{id}/press", post(press_button))
-        .route("/buttons/{id}/wheel", post(turn_wheel))
         .route("/buttons/{id}/color", axum::routing::put(set_color))
         .route("/buttons/{id}/icon", get(button_icon))
         .route("/buttons/{id}/library", get(library_listing))
@@ -473,8 +480,41 @@ pub fn app(state: AppState) -> Router {
         .route("/dlsite/session", axum::routing::put(dlsite_session))
         .route("/power/sleep", post(sleep))
         .route("/events", get(events))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .merge(
+            Router::new()
+                .route("/buttons/{id}/wheel", post(turn_wheel))
+                .route("/buttons/{id}/click", post(click))
+                .route("/buttons/{id}/drag", post(drag))
+                .route_layer(middleware::from_fn(own_pages_only)),
+        )
+        .with_state(state);
+    // The MCP tools are requests to the API above.
+    let tools = api.clone();
+    api.route(
+        "/mcp",
+        post(move |headers: HeaderMap, body: Bytes| mcp::handle(tools.clone(), headers, body))
+            .layer(middleware::from_fn(own_pages_only)),
+    )
+    .layer(TraceLayer::new_for_http())
+}
+
+/// Refuse a request that says it comes from a page of another web site (a browser
+/// tells where the page asking is from). The mouse board is a real mouse: such a page,
+/// one that reaches this server under its own name included, must not have it used.
+/// Programs that are no browser send no origin and are let through.
+async fn own_pages_only(request: Request, next: Next) -> Response {
+    let foreign = request
+        .headers()
+        .get(ORIGIN)
+        .is_some_and(|origin| !origin.to_str().is_ok_and(cors::allowed));
+    if foreign {
+        return error(
+            StatusCode::FORBIDDEN,
+            "foreign_origin",
+            "the mouse is not used for a page of another web site",
+        );
+    }
+    next.run(request).await
 }
 
 async fn healthz() -> &'static str {
@@ -636,12 +676,42 @@ async fn set_color(
     button_response(&state, &id).await
 }
 
-/// Turn the mouse board's wheel over an app's window, unless the user holds the PC.
+/// Turn the mouse board's wheel over an app's window.
 async fn turn_wheel(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<WheelRequest>,
 ) -> Response {
+    use_mouse(&state, &id, request.into()).await
+}
+
+/// Click with the mouse board in an app's window.
+async fn click(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ClickRequest>,
+) -> Response {
+    use_mouse(&state, &id, request.into()).await
+}
+
+/// Drag with the mouse board inside an app's window.
+async fn drag(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<DragRequest>,
+) -> Response {
+    use_mouse(&state, &id, request.into()).await
+}
+
+/// Do what was asked of the mouse board in an app's window, unless the user holds the
+/// PC.
+async fn use_mouse(state: &AppState, id: &str, ask: Ask) -> Response {
+    // The codes of the wheel are older than the click and the drag.
+    let (not_an_app, invalid, done) = match ask.motion {
+        Motion::Wheel { .. } => ("not_scrollable", "invalid_wheel", "scrolled"),
+        Motion::Click { .. } => ("not_clickable", "invalid_click", "clicked"),
+        Motion::Drag { .. } => ("not_draggable", "invalid_drag", "dragged"),
+    };
     let held = match state.holds.held() {
         Ok(holds) => !holds.is_empty(),
         Err(err) => {
@@ -652,49 +722,49 @@ async fn turn_wheel(
             );
         }
     };
-    let wheel = match mouse::plan(&state.config, &id, request, held) {
-        Ok(wheel) => wheel,
-        Err(WheelError::NotFound) => {
+    let gesture = match mouse::plan(&state.config, id, ask, held) {
+        Ok(gesture) => gesture,
+        Err(PlanError::NotFound) => {
             return error(StatusCode::NOT_FOUND, "not_found", "unknown button");
         }
-        Err(WheelError::NotScrollable) => {
+        Err(PlanError::NotAnApp) => {
             return error(
                 StatusCode::CONFLICT,
-                "not_scrollable",
-                "only an app.launch button with a process can be scrolled",
+                not_an_app,
+                &format!("only an app.launch button with a process can be {done}"),
             );
         }
-        Err(WheelError::Held) => {
+        Err(PlanError::Held) => {
             return error(
                 StatusCode::CONFLICT,
                 "user_operating",
                 "the user is using the PC (an automation.hold button is on)",
             );
         }
-        Err(WheelError::Invalid(message)) => {
-            return error(StatusCode::BAD_REQUEST, "invalid_wheel", &message);
+        Err(PlanError::Invalid(message)) => {
+            return error(StatusCode::BAD_REQUEST, invalid, &message);
         }
     };
     let pointer = state.pointer.clone();
-    match tokio::task::spawn_blocking(move || pointer.scroll(&wheel)).await {
+    match tokio::task::spawn_blocking(move || pointer.act(&gesture)).await {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(ScrollError::NoMouse)) => error(
+        Ok(Err(MouseError::NoMouse)) => error(
             StatusCode::CONFLICT,
             "no_mouse",
             "no mouse board answers on a serial port",
         ),
-        Ok(Err(ScrollError::NoWindow)) => error(
+        Ok(Err(MouseError::NoWindow)) => error(
             StatusCode::CONFLICT,
             "no_window",
             "the app has no window to bring forward",
         ),
-        Ok(Err(ScrollError::Covered)) => error(
+        Ok(Err(MouseError::Covered)) => error(
             StatusCode::CONFLICT,
             "covered",
             "another window covers that point of the app",
         ),
-        Ok(Err(ScrollError::Failed(message))) => {
-            warn!(button = %id, %message, "wheel failed");
+        Ok(Err(MouseError::Failed(message))) => {
+            warn!(button = %id, %message, "the mouse failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, "mouse", &message)
         }
         Err(join) => error(
@@ -1549,6 +1619,7 @@ mod tests {
     use crate::{
         audio::{Device, fake::FakeAudio},
         config,
+        mouse::{Motion, MouseButton, MouseError},
     };
 
     const CONFIG: &str = r"
@@ -2611,7 +2682,21 @@ buttons:
         let (status, body) = send(state.clone(), "POST", "/buttons/ba/wheel", wheel(-3)).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "user_operating");
-        assert!(pointer.scrolled.lock().unwrap().is_empty());
+        for (uri, body) in [
+            (
+                "/buttons/ba/click",
+                serde_json::json!({ "x": 0.5, "y": 0.5 }),
+            ),
+            (
+                "/buttons/ba/drag",
+                serde_json::json!({ "x": 0.5, "y": 0.8, "to_x": 0.5, "to_y": 0.2 }),
+            ),
+        ] {
+            let (status, body) = send(state.clone(), "POST", uri, body).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{uri}");
+            assert_eq!(body["error"], "user_operating", "{uri}");
+        }
+        assert!(pointer.done.lock().unwrap().is_empty());
 
         let (_, body) = call(state.clone(), "POST", "/buttons/hands/press").await;
         assert_eq!(body["button"]["state"]["held"], false);
@@ -2623,10 +2708,123 @@ buttons:
 
         let (status, _) = send(state, "POST", "/buttons/ba/wheel", wheel(-3)).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        let scrolled = pointer.scrolled.lock().unwrap();
-        assert_eq!(scrolled.len(), 1);
-        assert_eq!(scrolled[0].process, "BlueArchive.exe");
-        assert_eq!(scrolled[0].notches, -3);
+        let done = pointer.done.lock().unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].process, "BlueArchive.exe");
+        assert_eq!(done[0].motion, Motion::Wheel { notches: -3 });
+    }
+
+    #[tokio::test]
+    async fn a_click_and_a_drag_reach_the_mouse_at_the_point_of_the_app() {
+        let (state, _, pointer) = hold_state();
+        let click = serde_json::json!({ "x": 0.25, "y": 0.5 });
+        let (status, _) = send(state.clone(), "POST", "/buttons/ba/click", click).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let twice = serde_json::json!({ "x": 0.1, "y": 0.9, "button": "right", "count": 2 });
+        let (status, _) = send(state.clone(), "POST", "/buttons/ba/click", twice).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let drag = serde_json::json!({ "x": 0.5, "y": 0.8, "to_x": 0.5, "to_y": 0.2 });
+        let (status, _) = send(state, "POST", "/buttons/ba/drag", drag).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let done = pointer.done.lock().unwrap();
+        assert_eq!(done.len(), 3);
+        assert!(done.iter().all(|g| g.process == "BlueArchive.exe"));
+        assert_eq!((done[0].x, done[0].y), (0.25, 0.5));
+        assert_eq!(
+            done[0].motion,
+            Motion::Click {
+                button: MouseButton::Left,
+                count: 1
+            }
+        );
+        assert_eq!(
+            done[1].motion,
+            Motion::Click {
+                button: MouseButton::Right,
+                count: 2
+            }
+        );
+        assert_eq!((done[2].x, done[2].y), (0.5, 0.8));
+        assert_eq!(
+            done[2].motion,
+            Motion::Drag {
+                to_x: 0.5,
+                to_y: 0.2,
+                button: MouseButton::Left
+            }
+        );
+    }
+
+    /// The board is a real mouse, so a page of another web site must not have it used:
+    /// a browser tells where the page asking is from.
+    #[tokio::test]
+    async fn the_mouse_is_not_used_for_a_page_of_another_web_site() {
+        let (state, _, pointer) = hold_state();
+        let from = |origin: &'static str, uri: &'static str, body: Value| {
+            let state = state.clone();
+            async move {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("origin", origin)
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                app(state).oneshot(request).await.unwrap().status()
+            }
+        };
+        let click = serde_json::json!({ "x": 0.5, "y": 0.5 });
+        let drag = serde_json::json!({ "x": 0.5, "y": 0.8, "to_x": 0.5, "to_y": 0.2 });
+        for (uri, body) in [
+            ("/buttons/ba/click", click.clone()),
+            ("/buttons/ba/drag", drag),
+            ("/buttons/ba/wheel", wheel(1)),
+        ] {
+            let status = from("http://evil.example:4730", uri, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
+        assert!(pointer.done.lock().unwrap().is_empty());
+        // The panel's own page may.
+        let status = from("http://tauri.localhost", "/buttons/ba/click", click).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(pointer.done.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_mouse_clicks_and_drags_only_in_app_windows_within_limits() {
+        let (state, _, pointer) = hold_state();
+        let click = serde_json::json!({ "x": 0.5, "y": 0.5 });
+        let drag = serde_json::json!({ "x": 0.5, "y": 0.8, "to_x": 0.5, "to_y": 0.2 });
+
+        let (status, _) = send(state.clone(), "POST", "/buttons/nope/click", click.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = send(state.clone(), "POST", "/buttons/web/click", click.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_clickable");
+        let (status, body) = send(state.clone(), "POST", "/buttons/web/drag", drag.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_draggable");
+
+        let thrice = serde_json::json!({ "x": 0.5, "y": 0.5, "count": 3 });
+        let (status, body) = send(state.clone(), "POST", "/buttons/ba/click", thrice).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_click");
+        let outside = serde_json::json!({ "x": 0.5, "y": 0.8, "to_x": 0.5, "to_y": 1.2 });
+        let (status, body) = send(state.clone(), "POST", "/buttons/ba/drag", outside).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_drag");
+        assert!(pointer.done.lock().unwrap().is_empty());
+
+        *pointer.error.lock().unwrap() = Some(MouseError::Covered);
+        let (status, body) = send(state.clone(), "POST", "/buttons/ba/click", click).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "covered");
+        *pointer.error.lock().unwrap() = Some(MouseError::Failed("old firmware".into()));
+        let (status, body) = send(state, "POST", "/buttons/ba/drag", drag).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "mouse");
+        assert_eq!(body["message"], "old firmware");
     }
 
     #[tokio::test]
@@ -2643,12 +2841,12 @@ buttons:
         let far = serde_json::json!({ "x": 1.5, "y": 0.5, "notches": 1 });
         let (status, _) = send(state.clone(), "POST", "/buttons/ba/wheel", far).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(pointer.scrolled.lock().unwrap().is_empty());
+        assert!(pointer.done.lock().unwrap().is_empty());
 
         for (failure, code) in [
-            (crate::mouse::ScrollError::NoMouse, "no_mouse"),
-            (crate::mouse::ScrollError::NoWindow, "no_window"),
-            (crate::mouse::ScrollError::Covered, "covered"),
+            (MouseError::NoMouse, "no_mouse"),
+            (MouseError::NoWindow, "no_window"),
+            (MouseError::Covered, "covered"),
         ] {
             *pointer.error.lock().unwrap() = Some(failure);
             let (status, body) = send(state.clone(), "POST", "/buttons/ba/wheel", wheel(1)).await;

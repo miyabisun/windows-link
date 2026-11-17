@@ -117,10 +117,10 @@ pub mod windows {
                 },
                 Shell::ShellExecuteW,
                 WindowsAndMessaging::{
-                    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW,
-                    GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-                    PostMessageW, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow, ShowWindow,
-                    WM_CLOSE, WS_EX_TOOLWINDOW,
+                    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetForegroundWindow, GetWindow,
+                    GetWindowLongW, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic,
+                    IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow,
+                    ShowWindow, WM_CLOSE, WS_EX_TOOLWINDOW,
                 },
             },
         },
@@ -311,6 +311,13 @@ pub mod windows {
             let Some(hwnd) = main_window(&pids(program)) else {
                 return Ok(false);
             };
+            // Already at the front: the Alt pressed below would reach the window itself
+            // and open its menu, which then takes the next key or wheel turn (measured
+            // on 2026-11-18: every other wheel turn of the mouse board was lost).
+            // SAFETY: GetForegroundWindow takes no arguments, and `hwnd` is only read.
+            if unsafe { GetForegroundWindow() == hwnd && !IsIconic(hwnd).as_bool() } {
+                return Ok(true);
+            }
             // Bringing forward a window on another virtual desktop would switch the
             // screen to that desktop; bring the window here instead.
             match crate::desktops::winvd::bring_to_current_desktop(hwnd.0 as isize) {

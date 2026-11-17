@@ -50,6 +50,36 @@ static LAST_X: AtomicI32 = AtomicI32::new(0);
 static LAST_Y: AtomicI32 = AtomicI32::new(0);
 static LAST_REAL_MS: AtomicU64 = AtomicU64::new(0);
 static TOUCH_DOWN: AtomicBool = AtomicBool::new(false);
+/// The mouse board is at work: the cursor is where windows-link put it on purpose.
+static BOARD_AT_WORK: AtomicBool = AtomicBool::new(false);
+
+/// Nothing is moved back while this lives: the mouse board is at work (see `mouse`).
+///
+/// The board is a real mouse, so its presses and wheel turns tell the hook that the
+/// user's mouse is at the point the board visits. The cursor, once put back where the
+/// user left it, was then taken to that point again, and a drag could be pulled off
+/// its way while the button was down (measured on 2026-11-18).
+pub struct BoardAtWork(());
+
+/// Keep the cursor keeper still until the returned value is dropped; drop it after the
+/// cursor is put back.
+pub fn board_at_work() -> BoardAtWork {
+    BOARD_AT_WORK.store(true, Ordering::Relaxed);
+    BoardAtWork(())
+}
+
+impl Drop for BoardAtWork {
+    fn drop(&mut self) {
+        // The cursor is back where the user left it: that is the real mouse's place.
+        let mut point = POINT::default();
+        // SAFETY: `point` is a live local the call writes the cursor position into.
+        if unsafe { GetCursorPos(&raw mut point) }.is_ok() {
+            LAST_X.store(point.x, Ordering::Relaxed);
+            LAST_Y.store(point.y, Ordering::Relaxed);
+        }
+        BOARD_AT_WORK.store(false, Ordering::Relaxed);
+    }
+}
 
 pub(crate) fn wide(buffer: &[u16]) -> String {
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
@@ -332,6 +362,10 @@ impl Poller {
     }
 
     fn tick(&mut self, keep: &KeepCursor) {
+        if BOARD_AT_WORK.load(Ordering::Relaxed) {
+            self.previous = None;
+            return;
+        }
         let mut point = POINT::default();
         // SAFETY: `point` is a live local the call writes the cursor position into.
         if unsafe { GetCursorPos(&raw mut point) }.is_err() {

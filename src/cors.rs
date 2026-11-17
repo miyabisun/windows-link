@@ -22,7 +22,7 @@ pub fn layer() -> CorsLayer {
 }
 
 /// The Tauri `WebView` origins, and `http://localhost` / `http://127.0.0.1` on any port.
-fn allowed(origin: &str) -> bool {
+pub(crate) fn allowed(origin: &str) -> bool {
     if matches!(
         origin,
         "http://tauri.localhost" | "https://tauri.localhost" | "tauri://localhost"

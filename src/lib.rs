@@ -13,6 +13,7 @@ pub mod icons;
 pub mod launch;
 pub mod library;
 pub mod logging;
+pub mod mcp;
 pub mod mouse;
 pub mod port;
 pub mod power;
