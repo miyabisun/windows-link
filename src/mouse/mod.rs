@@ -23,8 +23,6 @@ pub mod windows;
 
 use serde::Deserialize;
 
-use crate::config::{ButtonSpec, Config};
-
 /// What the board answers to `?`, followed by its version.
 pub const GREETING: &str = "windows-link mouse";
 /// Most notches one request may turn.
@@ -209,7 +207,7 @@ impl MouseButton {
     }
 }
 
-/// What the mouse does at a point of an app's window.
+/// What the mouse does at a point of a program's window.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Motion {
     /// Turn the wheel (negative scrolls down).
@@ -224,27 +222,34 @@ pub enum Motion {
     },
 }
 
-/// A request for the mouse: where in the app's window (fractions of its client area)
-/// and what to do there.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A request for the mouse: in which program's window (`process`, the file name of a
+/// running program such as `BlueArchive.exe`), where in it (fractions of its client
+/// area) and what to do there.
+///
+/// The one who asks names the program. The board is a real mouse, with a mouse's reach;
+/// the server does not narrow it to the programs of its configuration.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Ask {
+    pub process: String,
     pub x: f64,
     pub y: f64,
     pub motion: Motion,
 }
 
-/// `POST /buttons/{id}/wheel`: where in the app's window and how many notches.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+/// `POST /mouse/wheel`: in which program's window, where in it and how many notches.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct WheelRequest {
+    pub process: String,
     pub x: f64,
     pub y: f64,
     pub notches: i32,
 }
 
-/// `POST /buttons/{id}/click`: where in the app's window, and which button how often
-/// (the left one once unless told).
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+/// `POST /mouse/click`: in which program's window, where in it, and which button how
+/// often (the left one once unless told).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ClickRequest {
+    pub process: String,
     pub x: f64,
     pub y: f64,
     #[serde(default)]
@@ -257,10 +262,11 @@ fn once() -> u8 {
     1
 }
 
-/// `POST /buttons/{id}/drag`: from where to where in the app's window, with which
+/// `POST /mouse/drag`: in which program's window, from where to where in it, with which
 /// button held (the left one unless told).
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct DragRequest {
+    pub process: String,
     pub x: f64,
     pub y: f64,
     pub to_x: f64,
@@ -270,11 +276,14 @@ pub struct DragRequest {
 }
 
 impl From<WheelRequest> for Ask {
-    fn from(WheelRequest { x, y, notches }: WheelRequest) -> Self {
+    fn from(wheel: WheelRequest) -> Self {
         Self {
-            x,
-            y,
-            motion: Motion::Wheel { notches },
+            process: wheel.process,
+            x: wheel.x,
+            y: wheel.y,
+            motion: Motion::Wheel {
+                notches: wheel.notches,
+            },
         }
     }
 }
@@ -282,6 +291,7 @@ impl From<WheelRequest> for Ask {
 impl From<ClickRequest> for Ask {
     fn from(click: ClickRequest) -> Self {
         Self {
+            process: click.process,
             x: click.x,
             y: click.y,
             motion: Motion::Click {
@@ -295,6 +305,7 @@ impl From<ClickRequest> for Ask {
 impl From<DragRequest> for Ask {
     fn from(drag: DragRequest) -> Self {
         Self {
+            process: drag.process,
             x: drag.x,
             y: drag.y,
             motion: Motion::Drag {
@@ -317,38 +328,29 @@ pub struct Gesture {
 
 #[derive(Debug, PartialEq)]
 pub enum PlanError {
-    NotFound,
-    /// Not an app button with a `process`: the mouse only works in the windows of
-    /// configured apps.
-    NotAnApp,
     /// An `automation.hold` button is on: the user is using the PC.
     Held,
     Invalid(String),
 }
 
-/// Check a request for the mouse against the configuration before anything moves.
-pub fn plan(
-    config: &Config,
-    id: &str,
-    ask: impl Into<Ask>,
-    held: bool,
-) -> Result<Gesture, PlanError> {
-    let button = config
-        .buttons
-        .iter()
-        .find(|b| b.id == id)
-        .ok_or(PlanError::NotFound)?;
-    let ButtonSpec::AppLaunch {
-        process: Some(process),
-        ..
-    } = &button.spec
-    else {
-        return Err(PlanError::NotAnApp);
-    };
+/// Check a request for the mouse before anything moves.
+pub fn plan(ask: impl Into<Ask>, held: bool) -> Result<Gesture, PlanError> {
     if held {
         return Err(PlanError::Held);
     }
-    let Ask { x, y, motion } = ask.into();
+    let Ask {
+        process,
+        x,
+        y,
+        motion,
+    } = ask.into();
+    // Running programs are told apart by file name, so a path would match none.
+    let process = process.trim();
+    if process.is_empty() || process.contains(['/', '\\', ':']) {
+        return Err(PlanError::Invalid(
+            "process must be the file name of a running program, such as BlueArchive.exe".into(),
+        ));
+    }
     let inside = |x: f64, y: f64| (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y);
     if !inside(x, y) {
         return Err(PlanError::Invalid("x and y must be between 0 and 1".into()));
@@ -372,7 +374,7 @@ pub fn plan(
         _ => {}
     }
     Ok(Gesture {
-        process: process.clone(),
+        process: process.to_owned(),
         x,
         y,
         motion,
@@ -436,7 +438,6 @@ mod tests {
         buttons_command, candidate_ports, glide, in_client, is_greeting, move_command, plan, reply,
         step_toward, wheel_command,
     };
-    use crate::config;
 
     #[test]
     fn a_wheel_command_is_one_line() {
@@ -580,19 +581,31 @@ mod tests {
 
     #[test]
     fn a_click_is_a_left_single_click_unless_told() {
-        let click: ClickRequest = serde_json::from_str(r#"{"x": 0.5, "y": 0.5}"#).unwrap();
+        let click: ClickRequest =
+            serde_json::from_str(r#"{"process": "a.exe", "x": 0.5, "y": 0.5}"#).unwrap();
+        assert_eq!(click.process, "a.exe");
         assert_eq!(click.button, MouseButton::Left);
         assert_eq!(click.count, 1);
-        let click: ClickRequest =
-            serde_json::from_str(r#"{"x": 0.5, "y": 0.5, "button": "right", "count": 2}"#).unwrap();
+        let click: ClickRequest = serde_json::from_str(
+            r#"{"process": "a.exe", "x": 0.5, "y": 0.5, "button": "right", "count": 2}"#,
+        )
+        .unwrap();
         assert_eq!(click.button, MouseButton::Right);
         assert_eq!(click.count, 2);
         assert!(
-            serde_json::from_str::<ClickRequest>(r#"{"x": 0.5, "y": 0.5, "button": "side"}"#)
-                .is_err()
+            serde_json::from_str::<ClickRequest>(
+                r#"{"process": "a.exe", "x": 0.5, "y": 0.5, "button": "side"}"#
+            )
+            .is_err()
         );
-        let drag: DragRequest =
-            serde_json::from_str(r#"{"x": 0.1, "y": 0.2, "to_x": 0.3, "to_y": 0.4}"#).unwrap();
+        assert!(
+            serde_json::from_str::<ClickRequest>(r#"{"x": 0.5, "y": 0.5}"#).is_err(),
+            "the request says in which program's window"
+        );
+        let drag: DragRequest = serde_json::from_str(
+            r#"{"process": "a.exe", "x": 0.1, "y": 0.2, "to_x": 0.3, "to_y": 0.4}"#,
+        )
+        .unwrap();
         assert_eq!(drag.button, MouseButton::Left);
     }
 
@@ -616,56 +629,56 @@ mod tests {
         assert_eq!(candidate_ports(&ports), ["COM3", "COM7"]);
     }
 
-    const CONFIG: &str = "buttons:
-  - id: ba
-    label: BA
-    type: app.launch
-    target: launcher.exe
-    process: BlueArchive.exe
-  - id: web
-    label: Web
-    type: app.launch
-    target: https://example.com
-";
-
-    fn request(x: f64, y: f64, notches: i32) -> WheelRequest {
-        WheelRequest { x, y, notches }
+    fn request(process: &str, x: f64, y: f64, notches: i32) -> WheelRequest {
+        WheelRequest {
+            process: process.into(),
+            x,
+            y,
+            notches,
+        }
     }
 
     #[test]
-    fn a_wheel_needs_a_running_app_button_and_sane_values() {
-        let config = config::parse(CONFIG).unwrap();
-        let wheel = plan(&config, "ba", request(0.75, 0.55, -3), false).unwrap();
-        assert_eq!(wheel.process, "BlueArchive.exe");
-        assert_eq!(wheel.motion, Motion::Wheel { notches: -3 });
+    fn the_mouse_works_in_the_window_of_the_program_the_request_names() {
+        // Any program: the board is a mouse, and the one who asks says where it works.
+        for name in ["BlueArchive.exe", "notepad.exe", " Some Game.exe "] {
+            let wheel = plan(request(name, 0.75, 0.55, -3), false).unwrap();
+            assert_eq!(wheel.process, name.trim());
+            assert_eq!((wheel.x, wheel.y), (0.75, 0.55));
+            assert_eq!(wheel.motion, Motion::Wheel { notches: -3 });
+        }
+        // A file name, as Windows lists running programs: not empty, and no path.
+        for bad in ["", "  ", "C:\\Games\\BlueArchive.exe", "bin/game.exe"] {
+            assert!(
+                matches!(
+                    plan(request(bad, 0.5, 0.5, 1), false),
+                    Err(PlanError::Invalid(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wheel_needs_sane_values_and_the_user_away() {
         assert_eq!(
-            plan(&config, "nope", request(0.5, 0.5, 1), false),
-            Err(PlanError::NotFound)
-        );
-        assert_eq!(
-            plan(&config, "web", request(0.5, 0.5, 1), false),
-            Err(PlanError::NotAnApp)
-        );
-        assert_eq!(
-            plan(&config, "ba", request(0.5, 0.5, 1), true),
+            plan(request("BlueArchive.exe", 0.5, 0.5, 1), true),
             Err(PlanError::Held)
         );
         for bad in [
-            request(1.5, 0.5, 1),
-            request(0.5, -0.1, 1),
-            request(0.5, 0.5, 0),
-            request(0.5, 0.5, 21),
-            request(0.5, 0.5, -21),
+            request("BlueArchive.exe", 1.5, 0.5, 1),
+            request("BlueArchive.exe", 0.5, -0.1, 1),
+            request("BlueArchive.exe", 0.5, 0.5, 0),
+            request("BlueArchive.exe", 0.5, 0.5, 21),
+            request("BlueArchive.exe", 0.5, 0.5, -21),
         ] {
-            assert!(matches!(
-                plan(&config, "ba", bad, false),
-                Err(PlanError::Invalid(_))
-            ));
+            assert!(matches!(plan(bad, false), Err(PlanError::Invalid(_))));
         }
     }
 
     fn click(x: f64, y: f64, count: u8) -> ClickRequest {
         ClickRequest {
+            process: "BlueArchive.exe".into(),
             x,
             y,
             button: MouseButton::Right,
@@ -674,9 +687,8 @@ mod tests {
     }
 
     #[test]
-    fn a_click_needs_an_app_button_a_point_in_its_window_and_one_or_two_presses() {
-        let config = config::parse(CONFIG).unwrap();
-        let planned = plan(&config, "ba", click(0.25, 1.0, 2), false).unwrap();
+    fn a_click_needs_a_point_in_the_window_and_one_or_two_presses() {
+        let planned = plan(click(0.25, 1.0, 2), false).unwrap();
         assert_eq!(planned.process, "BlueArchive.exe");
         assert_eq!((planned.x, planned.y), (0.25, 1.0));
         assert_eq!(
@@ -686,24 +698,15 @@ mod tests {
                 count: 2
             }
         );
-        assert_eq!(
-            plan(&config, "web", click(0.5, 0.5, 1), false),
-            Err(PlanError::NotAnApp)
-        );
-        assert_eq!(
-            plan(&config, "ba", click(0.5, 0.5, 1), true),
-            Err(PlanError::Held)
-        );
+        assert_eq!(plan(click(0.5, 0.5, 1), true), Err(PlanError::Held));
         for bad in [click(0.5, 1.01, 1), click(0.5, 0.5, 0), click(0.5, 0.5, 3)] {
-            assert!(matches!(
-                plan(&config, "ba", bad, false),
-                Err(PlanError::Invalid(_))
-            ));
+            assert!(matches!(plan(bad, false), Err(PlanError::Invalid(_))));
         }
     }
 
     fn drag(to_x: f64, to_y: f64) -> DragRequest {
         DragRequest {
+            process: "BlueArchive.exe".into(),
             x: 0.5,
             y: 0.8,
             to_x,
@@ -714,8 +717,7 @@ mod tests {
 
     #[test]
     fn a_drag_starts_and_ends_inside_the_window() {
-        let config = config::parse(CONFIG).unwrap();
-        let planned = plan(&config, "ba", drag(0.5, 0.2), false).unwrap();
+        let planned = plan(drag(0.5, 0.2), false).unwrap();
         assert_eq!((planned.x, planned.y), (0.5, 0.8));
         assert_eq!(
             planned.motion,
@@ -725,15 +727,9 @@ mod tests {
                 button: MouseButton::Left
             }
         );
-        assert_eq!(
-            plan(&config, "ba", drag(0.5, 0.2), true),
-            Err(PlanError::Held)
-        );
+        assert_eq!(plan(drag(0.5, 0.2), true), Err(PlanError::Held));
         for bad in [drag(1.2, 0.2), drag(0.5, -0.5)] {
-            assert!(matches!(
-                plan(&config, "ba", bad, false),
-                Err(PlanError::Invalid(_))
-            ));
+            assert!(matches!(plan(bad, false), Err(PlanError::Invalid(_))));
         }
     }
 }

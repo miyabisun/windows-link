@@ -3,8 +3,6 @@
 //! Each tool is a request to the HTTP API beside it, so it checks, behaves and fails
 //! as the API does, without authentication like the API.
 
-use std::fmt::Write as _;
-
 use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
@@ -83,25 +81,23 @@ fn reply(status: StatusCode, id: &Value, result: Result<Value, (i64, &str)>) -> 
 /// Calls the API for the tool in `params`; the API's answer is the tool's text, an
 /// error status its error.
 async fn call(api: Router, params: &Value) -> Result<Value, (i64, &'static str)> {
-    let mut arguments = params["arguments"].as_object().cloned().unwrap_or_default();
-    // What the mouse does at the button `id`; the other arguments are the request's body.
-    let motion = match params["name"].as_str().unwrap_or_default() {
+    // The path of the mouse's request; the tool's arguments are its body, the program
+    // (`process`) included, so the caller says in which window the mouse works.
+    let path = match params["name"].as_str().unwrap_or_default() {
         "list_buttons" => None,
-        "mouse_click" => Some("click"),
-        "mouse_drag" => Some("drag"),
-        "mouse_wheel" => Some("wheel"),
+        "mouse_click" => Some("/mouse/click"),
+        "mouse_drag" => Some("/mouse/drag"),
+        "mouse_wheel" => Some("/mouse/wheel"),
         _ => return Err((-32602, "unknown tool")),
     };
     let request = Request::builder().header(header::CONTENT_TYPE, "application/json");
-    let request = match motion {
+    let request = match path {
         None => request.method("GET").uri("/buttons").body(Body::empty()),
-        Some(motion) => {
-            let Some(Value::String(id)) = arguments.remove("id") else {
-                return Err((-32602, "id (a string) is required"));
-            };
+        Some(path) => {
+            let arguments = params["arguments"].as_object().cloned().unwrap_or_default();
             request
                 .method("POST")
-                .uri(format!("/buttons/{}/{motion}", segment(&id)))
+                .uri(path)
                 .body(Body::from(Value::Object(arguments).to_string()))
         }
     }
@@ -120,22 +116,10 @@ async fn call(api: Router, params: &Value) -> Result<Value, (i64, &'static str)>
     }))
 }
 
-/// `id` as one segment of a path: each byte outside the unreserved set is escaped.
-fn segment(id: &str) -> String {
-    id.bytes().fold(String::new(), |mut path, byte| {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            path.push(char::from(byte));
-        } else {
-            let _ = write!(path, "%{byte:02X}");
-        }
-        path
-    })
-}
-
 /// The tools with the schemas of their arguments.
 fn tools() -> Value {
-    let id =
-        json!({ "type": "string", "description": "アプリのボタンのid（list_buttonsで分かる）" });
+    let process = json!({ "type": "string",
+        "description": "操作する窓を持つプログラムの実行ファイル名（例: BlueArchive.exe、notepad.exe）。動いているプログラムなら、設定に無いものも指定できる。パスは付けない" });
     let across = |what: &str| {
         json!({ "type": "number", "minimum": 0, "maximum": 1,
             "description": format!("{what}。窓の表示領域の左端を0、右端を1とした横の位置") })
@@ -148,23 +132,23 @@ fn tools() -> Value {
         "description": "押すボタン（省くと left）" });
     json!([
         { "name": "list_buttons",
-          "description": "ボタンの一覧（id・type・label・state）。マウスで操作できるのは、type が app.launch で state.running が true のアプリの窓。type が automation.hold のボタンの state.held が true の間（ユーザーが操作中）、マウスの道具は user_operating で失敗する",
+          "description": "ボタンの一覧（id・type・label・state）。type が automation.hold のボタンの state.held が true の間（ユーザーが操作中）、マウスの道具は user_operating で失敗する",
           "inputSchema": { "type": "object", "properties": {} } },
         { "name": "mouse_click",
-          "description": "アプリの窓の中の点を、本物のUSBマウス（マウスボード）でクリックする。アプリを前に出し、カーソルをその点へ移して押し、カーソルを元の位置へ戻す。管理者権限で動くアプリにも届く。ほかの窓がその点を覆っていると covered で失敗する",
-          "inputSchema": { "type": "object", "required": ["id", "x", "y"], "properties": {
-              "id": id, "x": across("クリックする点"), "y": down("クリックする点"), "button": button,
+          "description": "process で指定したプログラムの窓の中の点を、本物のUSBマウス（マウスボード）でクリックする。その窓を前に出し、カーソルをその点へ移して押し、カーソルを元の位置へ戻す。管理者権限で動くプログラムにも届く。そのプログラムに窓が無いと no_window、ほかの窓がその点を覆っていると covered で失敗する",
+          "inputSchema": { "type": "object", "required": ["process", "x", "y"], "properties": {
+              "process": process, "x": across("クリックする点"), "y": down("クリックする点"), "button": button,
               "count": { "type": "integer", "minimum": 1, "maximum": 2,
                   "description": "押す回数（省くと1、2でダブルクリック）" } } } },
         { "name": "mouse_drag",
-          "description": "アプリの窓の中で、点から点へボタンを押したままカーソルを動かして離す（一覧のスワイプ、つまみの移動など）",
-          "inputSchema": { "type": "object", "required": ["id", "x", "y", "to_x", "to_y"], "properties": {
-              "id": id, "x": across("押す点"), "y": down("押す点"),
+          "description": "process で指定したプログラムの窓の中で、点から点へボタンを押したままカーソルを動かして離す（一覧のスワイプ、つまみの移動など）",
+          "inputSchema": { "type": "object", "required": ["process", "x", "y", "to_x", "to_y"], "properties": {
+              "process": process, "x": across("押す点"), "y": down("押す点"),
               "to_x": across("離す点"), "to_y": down("離す点"), "button": button } } },
         { "name": "mouse_wheel",
-          "description": "アプリの窓の中の点で、マウスのホイールを回す",
-          "inputSchema": { "type": "object", "required": ["id", "x", "y", "notches"], "properties": {
-              "id": id, "x": across("ホイールを回す点"), "y": down("ホイールを回す点"),
+          "description": "process で指定したプログラムの窓の中の点で、マウスのホイールを回す",
+          "inputSchema": { "type": "object", "required": ["process", "x", "y", "notches"], "properties": {
+              "process": process, "x": across("ホイールを回す点"), "y": down("ホイールを回す点"),
               "notches": { "type": "integer", "minimum": -20, "maximum": 20,
                   "description": "回す段数（1〜20。負の数で下へスクロール）" } } } },
     ])
@@ -195,11 +179,6 @@ mod tests {
     type: app.launch
     target: launcher.exe
     process: BlueArchive.exe
-  - id: settings
-    label: Settings
-    type: app.launch
-    target: settings.exe
-    process: Settings.exe
   - id: hands
     label: Hands
     type: automation.hold
@@ -290,9 +269,15 @@ mod tests {
             tool["inputSchema"]["required"].clone()
         };
         assert_eq!(needs("list_buttons"), Value::Null);
-        assert_eq!(needs("mouse_click"), json!(["id", "x", "y"]));
-        assert_eq!(needs("mouse_drag"), json!(["id", "x", "y", "to_x", "to_y"]));
-        assert_eq!(needs("mouse_wheel"), json!(["id", "x", "y", "notches"]));
+        assert_eq!(needs("mouse_click"), json!(["process", "x", "y"]));
+        assert_eq!(
+            needs("mouse_drag"),
+            json!(["process", "x", "y", "to_x", "to_y"])
+        );
+        assert_eq!(
+            needs("mouse_wheel"),
+            json!(["process", "x", "y", "notches"])
+        );
         assert_eq!(tools.len(), 4);
     }
 
@@ -303,17 +288,21 @@ mod tests {
         assert!(!failed);
         assert_eq!(buttons[0]["id"], "ba");
 
-        let click = json!({ "id": "ba", "x": 0.25, "y": 0.5, "button": "right" });
+        let click = json!({ "process": "BlueArchive.exe", "x": 0.25, "y": 0.5, "button": "right" });
         let (failed, answer) = tool(state.clone(), "mouse_click", click).await;
         assert!(!failed);
         assert_eq!(answer, Value::Null, "the API answers 204 with nothing");
-        let drag = json!({ "id": "ba", "x": 0.5, "y": 0.8, "to_x": 0.5, "to_y": 0.2 });
+        let drag =
+            json!({ "process": "BlueArchive.exe", "x": 0.5, "y": 0.8, "to_x": 0.5, "to_y": 0.2 });
         assert!(!tool(state.clone(), "mouse_drag", drag).await.0);
-        let wheel = json!({ "id": "settings", "x": 0.5, "y": 0.5, "notches": -3 });
+        // The caller names the program: one that no button of the configuration starts
+        // is reached as well.
+        let wheel = json!({ "process": "notepad.exe", "x": 0.5, "y": 0.5, "notches": -3 });
         assert!(!tool(state, "mouse_wheel", wheel).await.0);
 
         let done = pointer.done.lock().unwrap();
         assert_eq!(done.len(), 3);
+        assert_eq!(done[0].process, "BlueArchive.exe");
         assert_eq!(
             done[0].motion,
             Motion::Click {
@@ -330,14 +319,14 @@ mod tests {
                 button: MouseButton::Left
             }
         );
-        assert_eq!(done[2].process, "Settings.exe");
+        assert_eq!(done[2].process, "notepad.exe");
         assert_eq!(done[2].motion, Motion::Wheel { notches: -3 });
     }
 
     #[tokio::test]
     async fn a_tool_fails_as_its_api_request_does() {
         let (state, pointer) = state();
-        let click = json!({ "id": "ba", "x": 0.5, "y": 0.5 });
+        let click = json!({ "process": "BlueArchive.exe", "x": 0.5, "y": 0.5 });
         // While the user holds the PC, the mouse stays still.
         let pressed = app(state.clone())
             .oneshot(
@@ -355,22 +344,40 @@ mod tests {
         assert_eq!(answer["error"], "user_operating");
         assert!(pointer.done.lock().unwrap().is_empty());
 
+        // Let go again: what follows fails for its own reason.
+        let pressed = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/buttons/hands/press")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pressed.status(), StatusCode::OK);
+
         let (failed, answer) = tool(
             state.clone(),
             "mouse_click",
-            json!({ "id": "../healthz", "x": 0.5, "y": 0.5 }),
+            json!({ "process": "C:\\Games\\BlueArchive.exe", "x": 0.5, "y": 0.5 }),
         )
         .await;
-        assert!(failed, "an id cannot reach another path");
-        assert_eq!(answer["error"], "not_found");
+        assert!(failed, "a program is named by its file name");
+        assert_eq!(answer["error"], "invalid_click");
 
+        // Without a program the API refuses the request, and says what is missing.
         let body = rpc(
             state.clone(),
             "tools/call",
             json!({ "name": "mouse_click", "arguments": { "x": 0.5, "y": 0.5 } }),
         )
         .await;
-        assert_eq!(body["error"]["code"], -32602, "no id");
+        assert_eq!(body["result"]["isError"], true);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("process"), "{text}");
+        assert!(pointer.done.lock().unwrap().is_empty());
+
         let body = rpc(state.clone(), "tools/call", json!({ "name": "sleep" })).await;
         assert_eq!(body["error"]["code"], -32602, "no such tool");
         let body = rpc(state, "resources/list", json!({})).await;
@@ -395,7 +402,8 @@ mod tests {
     async fn a_web_page_of_another_site_cannot_use_the_tools() {
         let (state, pointer) = state();
         let click = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
-            "name": "mouse_click", "arguments": { "id": "ba", "x": 0.5, "y": 0.5 } } })
+            "name": "mouse_click",
+            "arguments": { "process": "BlueArchive.exe", "x": 0.5, "y": 0.5 } } })
         .to_string();
         let (status, _) = post(state.clone(), Some("https://example.com"), click.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN);

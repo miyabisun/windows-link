@@ -261,8 +261,9 @@ To set a board up:
 To update a board, copy `code.py` onto `CIRCUITPY` again; it restarts by itself. A board
 with an older `code.py` answers `500 mouse` to what it does not know yet.
 
-`POST /buttons/{id}/click`, `/drag` and `/wheel` then work in the window of the button's
-program. Each one:
+`POST /mouse/click`, `/mouse/drag` and `/mouse/wheel` then work in a program's window.
+The request names the program in `process`, by the file name it runs under, such as
+`BlueArchive.exe`. Each one:
 
 1. brings the program forward and checks that its window shows at the point,
 2. puts the cursor on the point,
@@ -272,10 +273,9 @@ program. Each one:
 Where Windows does not move the cursor, the board moves it as a mouse does. The server
 reads where the cursor is after each step, until it is on the point.
 
-The three only work in the windows of `app.launch` buttons that have a `process`. The
-board is a real mouse: without this limit it would reach everything on the screen,
-prompts for administrator rights included. Agents use the same three through
-[MCP](#mcp).
+Any running program that has a window can be named; it needs no button in the
+configuration. The board is a real mouse: a request does in that window what a hand on
+the mouse does. Agents use the same three through [MCP](#mcp).
 
 An `automation.hold` button stops them: press it before using the PC yourself and again
 when done. Its state is kept in `windows-link.db`, so a restart keeps the hold. With
@@ -570,9 +570,9 @@ Discord's CDN.
 | `GET /buttons` | all buttons, shared ones first: `{id, type, label, desktop, except, icon, state}` (`desktop` is the desktop name for a desktop file's button, `null` for shared ones) |
 | `POST /buttons/{id}/press` | press a button; returns `{"button": …}` with the new state |
 | `PUT /buttons/{id}/color` | `{"color": "red"}` (`red`, `green` or `blue`): the colour a `cursor.highlight` button highlights the cursor in; returns `{"button": …}`. `409 not_highlight` for other buttons, `422` for another colour |
-| `POST /buttons/{id}/click` | `{"x": …, "y": …, "button": …, "count": …}`: click with the [mouse board](#mouse-board) in the window of an `app.launch` button's running `process` (`x`, `y` are fractions of its window from the left and the top; `button` is `left`, `right` or `middle`, `left` when left out; `count` is 1 or 2, a double click); `204`. `409 user_operating` while an `automation.hold` button is on, `409 not_clickable` for other buttons, `400 invalid_click`, `409 no_mouse`, `409 no_window`, `409 covered` (another window is over that point), `500 mouse` (the cursor did not get there, or the board does not know the command), `403 foreign_origin` for a page of another web site |
-| `POST /buttons/{id}/drag` | `{"x": …, "y": …, "to_x": …, "to_y": …, "button": …}`: press at `x`, `y`, move to `to_x`, `to_y` in the same window and let go there; `204`, and the click's errors with `409 not_draggable` and `400 invalid_drag` |
-| `POST /buttons/{id}/wheel` | `{"x": …, "y": …, "notches": …}`: turn the wheel at `x`, `y` (`notches` 1–20 either way, negative scrolls down); `204`, and the click's errors with `409 not_scrollable` and `400 invalid_wheel` |
+| `POST /mouse/click` | `{"process": …, "x": …, "y": …, "button": …, "count": …}`: click with the [mouse board](#mouse-board) in the window of the running program `process` (its file name, such as `BlueArchive.exe`; `x`, `y` are fractions of its window from the left and the top; `button` is `left`, `right` or `middle`, `left` when left out; `count` is 1 or 2, a double click); `204`. `409 user_operating` while an `automation.hold` button is on, `400 invalid_click` (an empty `process` or a path as well), `422` without `process`, `409 no_mouse`, `409 no_window` (no running program of that name has a window), `409 covered` (another window is over that point), `500 mouse` (the cursor did not get there, or the board does not know the command), `403 foreign_origin` for a page of another web site |
+| `POST /mouse/drag` | `{"process": …, "x": …, "y": …, "to_x": …, "to_y": …, "button": …}`: press at `x`, `y`, move to `to_x`, `to_y` in the same window and let go there; `204`, and the click's errors with `400 invalid_drag` |
+| `POST /mouse/wheel` | `{"process": …, "x": …, "y": …, "notches": …}`: turn the wheel at `x`, `y` (`notches` 1–20 either way, negative scrolls down); `204`, and the click's errors with `400 invalid_wheel` |
 | `POST /mcp` | the [MCP](#mcp) server: one JSON-RPC message, answered as JSON |
 | `GET /buttons/{id}/icon` | the button's icon as a 256 px PNG, or a redirect to it on the web, when `icon` is true |
 | `GET /buttons/{id}/library` | a library button's games: `{"items":[{id, name, detail, choosable, image, installed, labels, status, updated, bought, page, pinned}], "labels":[{id, name, editable}], "hide":[label id], "partial": null, "labels_locked": null, "sign_in": null}` (`labels` of an item are label IDs; `detail` is a second line such as the maker; `choosable` says the game has programs to choose from; `image` is its picture on the web when known, else ask `…/image`; `status` how its download goes; `updated` and `bought` when its latest version came out and when it was bought, in Unix seconds, when the shop says; `page` its page in the shop; `partial` says why only the installed games are listed, `labels_locked` why labels cannot be changed now, `sign_in` the shop to sign in to through the panel) |
@@ -646,10 +646,13 @@ claude mcp add --transport http windows-link http://127.0.0.1:4730/mcp
 
 | Tool | Does |
 |------|------|
-| `list_buttons` | `GET /buttons`: the buttons with their states. The mouse works in the windows of the `app.launch` buttons that are `running` |
-| `mouse_click` | `POST /buttons/{id}/click` with `id`, `x`, `y` and, when wanted, `button` and `count` |
-| `mouse_drag` | `POST /buttons/{id}/drag` with `id`, `x`, `y`, `to_x`, `to_y` and, when wanted, `button` |
-| `mouse_wheel` | `POST /buttons/{id}/wheel` with `id`, `x`, `y`, `notches` |
+| `list_buttons` | `GET /buttons`: the buttons with their states, an `automation.hold` button's `held` among them |
+| `mouse_click` | `POST /mouse/click` with `process`, `x`, `y` and, when wanted, `button` and `count` |
+| `mouse_drag` | `POST /mouse/drag` with `process`, `x`, `y`, `to_x`, `to_y` and, when wanted, `button` |
+| `mouse_wheel` | `POST /mouse/wheel` with `process`, `x`, `y`, `notches` |
+
+Each call names the program in `process`, for example `BlueArchive.exe`. The agent
+chooses the window the mouse works in; nothing is fixed in the configuration.
 
 Each tool sends the request beside it, so it checks and fails as that request does. The
 tool's answer is the request's body (`null` after a `204`), with `isError` set for an
