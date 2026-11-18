@@ -18,8 +18,8 @@ use windows::Win32::{
 };
 
 use super::{
-    Gesture, Motion, MouseError, Pace, Pointer, Reply, buttons_command, candidate_ports, glide,
-    in_client, is_greeting, move_command, reply, step_toward, wheel_command,
+    Approach, Gesture, Motion, MouseError, Pointer, Reply, buttons_command, candidate_ports, glide,
+    in_client, is_greeting, move_command, reply, wheel_command,
 };
 use crate::{
     launch::{Launcher, Program, windows::main_window_of},
@@ -125,10 +125,10 @@ impl WindowsPointer {
         // SAFETY: SetCursorPos only takes coordinates.
         let _ = unsafe { SetCursorPos(target.x, target.y) };
         let target = (target.x, target.y);
-        let (mut pace, mut still) = (Pace::default(), 0);
+        let (mut approach, mut still) = (Approach::default(), 0);
         for _ in 0..MOVES {
             let cursor = cursor_now();
-            let step = step_toward(cursor, target, pace);
+            let step = approach.step(cursor, target);
             if step == (0, 0) {
                 return Ok(());
             }
@@ -140,7 +140,8 @@ impl WindowsPointer {
             if still > STILL_MOVES {
                 break;
             }
-            pace = pace.after(step, went);
+            let left = (target.0 - cursor.0, target.1 - cursor.1);
+            approach = approach.after(step, left, went);
         }
         Err(MouseError::Failed(
             "the cursor did not reach the point".into(),

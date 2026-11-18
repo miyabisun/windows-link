@@ -112,6 +112,58 @@ pub fn step_toward(cursor: (i32, i32), target: (i32, i32), pace: Pace) -> (i32, 
     )
 }
 
+/// How the board closes in on a point: the pace learnt so far and, along each axis,
+/// the most counts a move may still take.
+///
+/// Where short moves speed up steeply, steps sized by the last pace alone never
+/// arrive: on the game PC a move of two counts took the cursor a pixel and one of four
+/// counts took it five, so it went past the point and fell short of it in turn
+/// (measured on 2026-11-18). A move that goes past the point halves what later moves
+/// may take, down to the one count that goes no farther than a pixel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Approach {
+    pace: Pace,
+    most: (i32, i32),
+}
+
+impl Default for Approach {
+    fn default() -> Self {
+        Self {
+            pace: Pace::default(),
+            most: (MAX_MOVE, MAX_MOVE),
+        }
+    }
+}
+
+impl Approach {
+    /// The counts of the board's next move from `cursor` toward `target`, none once
+    /// there.
+    pub fn step(self, cursor: (i32, i32), target: (i32, i32)) -> (i32, i32) {
+        let (x, y) = step_toward(cursor, target, self.pace);
+        (
+            x.clamp(-self.most.0, self.most.0),
+            y.clamp(-self.most.1, self.most.1),
+        )
+    }
+
+    /// The approach after the board moved `sent` counts with `left` pixels to go, and
+    /// the cursor went `went` pixels.
+    #[must_use]
+    pub fn after(self, sent: (i32, i32), left: (i32, i32), went: (i32, i32)) -> Self {
+        let most = |most: i32, sent: i32, left: i32, went: i32| {
+            let past = sent != 0 && (sent > 0) == (went > 0) && went.abs() > left.abs();
+            if past { (sent.abs() / 2).max(1) } else { most }
+        };
+        Self {
+            pace: self.pace.after(sent, went),
+            most: (
+                most(self.most.0, sent.0, left.0, went.0),
+                most(self.most.1, sent.1, left.1, went.1),
+            ),
+        }
+    }
+}
+
 /// What the board answered to a command.
 #[derive(Debug, PartialEq)]
 pub enum Reply {
@@ -434,9 +486,9 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClickRequest, DragRequest, Motion, MouseButton, Pace, PlanError, Reply, WheelRequest,
-        buttons_command, candidate_ports, glide, in_client, is_greeting, move_command, plan, reply,
-        step_toward, wheel_command,
+        Approach, ClickRequest, DragRequest, Motion, MouseButton, Pace, PlanError, Reply,
+        WheelRequest, buttons_command, candidate_ports, glide, in_client, is_greeting,
+        move_command, plan, reply, step_toward, wheel_command,
     };
 
     #[test]
@@ -516,8 +568,30 @@ mod tests {
         )
     }
 
+    /// Where the cursor ends once an approach from `start` says it is on `target`;
+    /// `moved` takes the cursor and the counts of a move, and gives where it went.
+    fn approached(
+        start: (i32, i32),
+        target: (i32, i32),
+        mut moved: impl FnMut((i32, i32), (i32, i32)) -> (i32, i32),
+    ) -> (i32, i32) {
+        let (mut cursor, mut approach, mut count) = (start, Approach::default(), 0);
+        loop {
+            let step = approach.step(cursor, target);
+            if step == (0, 0) {
+                return cursor;
+            }
+            let now = moved(cursor, step);
+            let left = (target.0 - cursor.0, target.1 - cursor.1);
+            approach = approach.after(step, left, (now.0 - cursor.0, now.1 - cursor.1));
+            cursor = now;
+            count += 1;
+            assert!(count < 60, "{start:?} to {target:?} does not settle");
+        }
+    }
+
     #[test]
-    fn steps_and_pace_bring_a_speeding_cursor_onto_the_target() {
+    fn an_approach_brings_a_speeding_cursor_onto_the_target() {
         for (start, target) in [
             ((-1262, 1410), (720, 78)),
             ((720, 78), (-1262, 1410)),
@@ -525,20 +599,71 @@ mod tests {
             ((0, 0), (2559, 1439)),
             ((2000, 700), (2000, 20)),
         ] {
-            let (mut cursor, mut pace, mut steps) = (start, Pace::default(), 0);
-            loop {
-                let step = step_toward(cursor, target, pace);
-                if step == (0, 0) {
-                    break;
-                }
-                let now = glide_by(cursor, step);
-                pace = pace.after(step, (now.0 - cursor.0, now.1 - cursor.1));
-                cursor = now;
-                steps += 1;
-                assert!(steps < 60, "{start:?} to {target:?} does not settle");
-            }
-            assert_eq!(cursor, target);
+            assert_eq!(approached(start, target, glide_by), target);
         }
+    }
+
+    /// A cursor under a steep pointer curve, as on the game PC (2026-11-18): a move of
+    /// two counts took it about a pixel and one of four counts took it five. The part
+    /// of a pixel a move leaves over counts toward the next move.
+    struct SteepCursor {
+        at: (f64, f64),
+    }
+
+    impl SteepCursor {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "pixels on a screen fit in i32"
+        )]
+        fn moved(&mut self, counts: (i32, i32)) -> (i32, i32) {
+            let along = |count: i32| {
+                let gain = match count.abs() {
+                    0..=2 => 0.6,
+                    3 => 0.9,
+                    _ => 1.25,
+                };
+                f64::from(count) * gain
+            };
+            self.at.0 += along(counts.0);
+            self.at.1 += along(counts.1);
+            (self.at.0.floor() as i32, self.at.1.floor() as i32)
+        }
+    }
+
+    #[test]
+    fn an_approach_settles_where_short_moves_speed_up_steeply() {
+        // The drag that never arrived on 2026-11-18: thirty even steps down a list, the
+        // cursor going past each point and falling short of it in turn.
+        let (from, to) = ((957, 571), (957, 998));
+        let mut cursor = SteepCursor {
+            at: (f64::from(from.0), f64::from(from.1)),
+        };
+        let mut at = from;
+        for point in glide(from, to, 30) {
+            at = approached(at, point, |_, step| cursor.moved(step));
+            assert_eq!(at, point);
+        }
+    }
+
+    #[test]
+    fn a_move_past_the_point_halves_what_later_moves_may_take() {
+        let approach = Approach::default();
+        assert_eq!(approach.step((0, 0), (40, -25)), (40, -25));
+        assert_eq!(
+            approach.step((-1262, 1410), (720, 78)),
+            (127, -127),
+            "no farther than the board moves at once"
+        );
+        // Eight counts took the cursor past a point two pixels away, along x only.
+        let past = approach.after((8, 8), (2, 20), (5, 8));
+        assert_eq!(past.step((0, 0), (100, 100)), (4, 100));
+        // Short of the point, or pushed along an axis the board did not move: no limit.
+        let short = approach.after((8, 0), (20, 0), (5, 3));
+        assert_eq!(short.step((0, 0), (0, 100)), (0, 100));
+        // The limit only goes down, to the one count that goes no farther than a pixel.
+        let slowest = past.after((1, 0), (1, 0), (2, 0));
+        assert_eq!(slowest.step((0, 0), (100, 0)).0, 1);
+        assert_eq!(slowest.step((0, 0), (-100, 0)).0, -1);
     }
 
     #[test]
