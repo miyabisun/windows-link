@@ -68,14 +68,16 @@ pub enum ButtonState {
     /// `license_keys` whether a game's license keys can be read (`GET …/keys`),
     /// `sign_in` the shop the user has to sign in to through the panel, when so,
     /// `rounds` whether the library downloads in rounds that say how they go
-    /// (`GET …/library/update`), and `pages` whether its games have pages in the shop
-    /// (`POST …/page`).
+    /// (`GET …/library/update`), `pages` whether its games have pages in the shop
+    /// (`POST …/page`), and `web` whether its items open on the web, with nothing of
+    /// theirs on this PC (a DLsite shelf).
     Library {
         pins: Vec<Pin>,
         license_keys: bool,
         sign_in: Option<String>,
         rounds: bool,
         pages: bool,
+        web: bool,
     },
     /// `automation.hold`: `held` while the user is using the PC and automation waits.
     Hold {
@@ -274,12 +276,14 @@ pub fn view(
 
 fn library_state(button: &ButtonConfig, readings: &Readings<'_>) -> ButtonState {
     let spec = &button.spec;
+    let web = matches!(spec, ButtonSpec::DlsiteLibrary { works, .. } if works.shelf().is_some());
     ButtonState::Library {
         pins: readings.pins.get(&button.id).cloned().unwrap_or_default(),
-        license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
+        license_keys: matches!(spec, ButtonSpec::DlsiteLibrary { .. }) && !web,
         sign_in: readings.sign_ins.get(&button.id).cloned(),
         rounds: !matches!(spec, ButtonSpec::SteamLibrary { .. }),
         pages: matches!(spec, ButtonSpec::DlsiteLibrary { .. }),
+        web,
     }
 }
 
@@ -657,6 +661,7 @@ mod tests {
                 sign_in: Some("fanza".into()),
                 rounds: true,
                 pages: false,
+                web: false,
             }
         );
         assert!(matches!(
@@ -1248,7 +1253,7 @@ buttons:
     #[test]
     fn library_buttons_show_their_pins_and_open_on_the_panel_instead_of_pressing() {
         let config = config::parse(
-            "buttons:\n  - id: library\n    label: Library\n    type: steam.library\n  - id: other\n    label: Other\n    type: dlsite.library\n",
+            "buttons:\n  - id: library\n    label: Library\n    type: steam.library\n  - id: other\n    label: Other\n    type: dlsite.library\n  - id: shelf\n    label: Shelf\n    type: dlsite.library\n    works: r18\n",
         )
         .unwrap();
         let audio = FakeAudio::new(devices(), None);
@@ -1276,6 +1281,7 @@ buttons:
                 sign_in: None,
                 rounds: false,
                 pages: false,
+                web: false,
             }
         );
         assert_eq!(
@@ -1286,6 +1292,20 @@ buttons:
                 sign_in: None,
                 rounds: true,
                 pages: true,
+                web: false,
+            }
+        );
+        // A shelf's works open on the web: nothing of theirs is on this PC, and they
+        // have no license keys.
+        assert_eq!(
+            view(&config, &config.buttons[2], &readings, &audio).state,
+            ButtonState::Library {
+                pins: vec![],
+                license_keys: false,
+                sign_in: None,
+                rounds: true,
+                pages: true,
+                web: true,
             }
         );
         assert!(matches!(

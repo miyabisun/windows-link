@@ -219,7 +219,7 @@ mod tests {
             kind: "single".into(),
             windows: true,
             version: "2014-04-25 10:00".into(),
-            bought: None,
+            ..Work::default()
         }
     }
 

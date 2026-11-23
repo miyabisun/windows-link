@@ -3,7 +3,8 @@
 //! games bought but not there yet are downloaded into the same layout, and updated
 //! games are brought up to date (the library itself is `crate::shop`'s). Which DLsite
 //! work each folder is comes from what was recorded, DLsiteNest's records and the
-//! purchases.
+//! purchases. The works bought that are not games are on shelves (`shelf`), which read
+//! the purchases in the same round (`Dlsite`).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,6 +20,7 @@ use crate::{
 pub mod nest;
 pub mod play;
 pub mod session;
+pub mod shelf;
 pub mod works;
 
 use session::DlsiteSession;
@@ -144,34 +146,25 @@ impl ShopLibrary<DlsiteShop> {
     }
 
     /// Find out again which DLsite work each game is: from what was recorded, from
-    /// DLsiteNest's records, and from the purchases while the panel's sign-in lasts.
-    /// Pictures of works known only through DLsiteNest come from DLsite's public
-    /// information. Failures are logged and leave what was known; a needed sign-in
-    /// shows on the panel.
-    pub fn refresh(&self) {
-        self.begin_round();
+    /// DLsiteNest's records, and from `read`, the purchases as the round just read
+    /// them (while the panel's sign-in lasts). Pictures of works known only through
+    /// DLsiteNest come from DLsite's public information. Failures leave what was
+    /// known; a needed sign-in shows on the panel.
+    pub(crate) fn refresh(&self, read: &Result<Vec<play::Work>, String>) {
         self.adopt_legacy_works();
         let Ok(games) = self.rescan() else {
             return;
         };
         let titles: Vec<Title> = games.into_iter().map(|(title, _)| title).collect();
         let nest = nest::read();
-        let read = self
-            .shop()
-            .session
-            .resume()
-            .map_err(|err| err.to_string())
-            .and_then(|session| session.purchases());
-        let purchases = match read {
+        let purchases: &[play::Work] = match read {
             Ok(works) => {
-                tracing::info!(works = works.len(), "DLsite purchases read");
-                self.set_purchases(&works);
+                self.set_purchases(works);
                 works
             }
             Err(reason) => {
-                tracing::warn!(%reason, "cannot read the DLsite purchases");
-                self.purchases_failed(&reason);
-                Vec::new()
+                self.purchases_failed(reason);
+                &[]
             }
         };
         let pictured: HashSet<&str> = purchases
@@ -191,7 +184,7 @@ impl ShopLibrary<DlsiteShop> {
             HashMap::new()
         });
         let remembered = self.store.games().unwrap_or_default();
-        let known = identify(&titles, &remembered, &nest, &purchases, &images);
+        let known = identify(&titles, &remembered, &nest, purchases, &images);
         let unknown: Vec<&str> = titles
             .iter()
             .filter(|t| !known.contains_key(&t.id))
@@ -205,6 +198,80 @@ impl ShopLibrary<DlsiteShop> {
         );
         if let Err(err) = self.store.remember(&titles, &known) {
             tracing::warn!(%err, "cannot keep which DLsite work each game is");
+        }
+    }
+}
+
+/// Every DLsite library: the games' and the shelves' (`shelf`), which go through a
+/// round together on one reading of the purchases.
+pub struct Dlsite {
+    session: std::sync::Arc<DlsiteSession>,
+    games: Vec<std::sync::Arc<DlsiteLibrary>>,
+    shelves: Vec<std::sync::Arc<shelf::Shelf>>,
+}
+
+impl Dlsite {
+    pub fn new(
+        session: std::sync::Arc<DlsiteSession>,
+        games: Vec<std::sync::Arc<DlsiteLibrary>>,
+        shelves: Vec<std::sync::Arc<shelf::Shelf>>,
+    ) -> Self {
+        Self {
+            session,
+            games,
+            shelves,
+        }
+    }
+
+    /// Begin a round: read the purchases while the panel's sign-in lasts, and give
+    /// them to every library. A failure is logged and said by each library's round.
+    pub fn refresh(&self) {
+        for library in &self.games {
+            library.begin_round();
+        }
+        for shelf in &self.shelves {
+            shelf.begin_round();
+        }
+        let read = self
+            .session
+            .resume()
+            .map_err(|err| err.to_string())
+            .and_then(|session| session.purchases());
+        match &read {
+            Ok(works) => tracing::info!(works = works.len(), "DLsite purchases read"),
+            Err(reason) => tracing::warn!(%reason, "cannot read the DLsite purchases"),
+        }
+        self.share(&read);
+    }
+
+    /// Give a reading of the purchases to every library.
+    pub(crate) fn share(&self, read: &Result<Vec<play::Work>, String>) {
+        for library in &self.games {
+            library.refresh(read);
+        }
+        for shelf in &self.shelves {
+            shelf.refresh(read);
+        }
+    }
+
+    /// Download and update the games, ending the round. The shelves have nothing to
+    /// download.
+    pub fn download(&self) {
+        for library in &self.games {
+            library.download();
+        }
+        for shelf in &self.shelves {
+            shelf.end_round();
+        }
+    }
+
+    /// End the round after only reading the purchases.
+    pub fn end_round(&self) {
+        for library in &self.games {
+            library.end_round();
+        }
+        for shelf in &self.shelves {
+            shelf.end_round();
         }
     }
 }
@@ -345,7 +412,7 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
-    use super::{DlsiteLibrary, DlsiteSession, DlsiteShop};
+    use super::{Dlsite, DlsiteLibrary, DlsiteSession, DlsiteShop};
     use crate::library::{GameLibrary, Label, LabelError, StartError};
     use crate::shop::{ShopStore, Title, candidates, default_program, listing, title_id};
 
@@ -626,6 +693,11 @@ mod tests {
             std::sync::Arc::new(ShopStore::in_memory("dlsite").unwrap()),
             shop(root),
         )
+    }
+
+    /// The session a library's shop signs in with.
+    fn session(library: &DlsiteLibrary) -> std::sync::Arc<DlsiteSession> {
+        library.shop().session.clone()
     }
 
     #[test]
@@ -979,7 +1051,7 @@ mod tests {
             kind: kind.into(),
             windows,
             version: "2024-01-01T00:00:00.000000Z".into(),
-            bought: None,
+            ..Work::default()
         };
         library.set_purchases(&[
             bought("RJ7", "Coming", "RPG", true),
@@ -1115,7 +1187,7 @@ mod tests {
         use crate::library::{Doing, Job};
 
         let root = games("round");
-        let library = library(&root);
+        let library = std::sync::Arc::new(library(&root));
         assert_eq!(library.round(), Some(crate::library::Round::default()));
 
         library.begin_round();
@@ -1152,8 +1224,9 @@ mod tests {
         );
 
         // Before the user signs in nothing is read or downloaded, and the round says why.
-        library.refresh();
-        library.download();
+        let dlsite = Dlsite::new(session(&library), vec![library.clone()], Vec::new());
+        dlsite.refresh();
+        dlsite.download();
         let round = library.round().unwrap();
         assert_eq!(round.doing, None);
         assert!(round.finished.is_some());
@@ -1170,16 +1243,75 @@ mod tests {
         use crate::library::Doing;
 
         let root = games("reads");
-        let library = library(&root);
+        let library = std::sync::Arc::new(library(&root));
+        let dlsite = Dlsite::new(session(&library), vec![library.clone()], Vec::new());
         // As at start: the games are worked out, and nothing is downloaded unasked.
-        library.refresh();
+        dlsite.refresh();
         assert_eq!(library.round().unwrap().doing, Some(Doing::Purchases));
-        library.end_round();
+        dlsite.end_round();
         let round = library.round().unwrap();
         assert_eq!(round.doing, None);
         assert!(round.finished.is_some());
         assert_eq!(round.jobs, []);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn one_reading_of_the_purchases_goes_to_each_shelf_and_a_failed_one_to_none() {
+        use super::{play::Work, shelf::Shelf, works::Works};
+
+        let file = std::env::temp_dir().join(format!(
+            "windows-link-dlsite-shelves-{}",
+            std::process::id()
+        ));
+        let session = shop(&file).session;
+        let shelf = |which: Works| {
+            let store = ShopStore::in_memory(which.shelf().unwrap()).unwrap();
+            let shelf = Shelf::new(
+                which,
+                std::sync::Arc::new(store),
+                session.clone(),
+                std::sync::Arc::default(),
+            );
+            std::sync::Arc::new(shelf.unwrap())
+        };
+        let (all, r18) = (shelf(Works::AllAges), shelf(Works::R18));
+        // Shelves alone: there are no games to read or download.
+        let dlsite = Dlsite::new(session, Vec::new(), vec![all.clone(), r18.clone()]);
+        let bought = |id: &str, kind: &str, age: &str| Work {
+            id: id.into(),
+            name: id.into(),
+            kind: kind.into(),
+            windows: true,
+            age: age.into(),
+            ..Work::default()
+        };
+        dlsite.share(&Ok(vec![
+            bought("RJ7", "RPG", "r18"),
+            bought("RJ8", "SOU", "all"),
+            bought("RJ9", "MOV", "r18"),
+        ]));
+        let ids = |shelf: &Shelf| -> Vec<String> {
+            shelf.listing().items.into_iter().map(|i| i.id).collect()
+        };
+        assert_eq!(ids(&all), ["RJ8"]);
+        assert_eq!(ids(&r18), ["RJ9"]);
+
+        // Before the user signs in a round reads nothing: each shelf says why and keeps
+        // its works.
+        dlsite.refresh();
+        dlsite.download();
+        for shelf in [&all, &r18] {
+            let round = shelf.round().unwrap();
+            assert_eq!(round.doing, None);
+            assert!(round.finished.is_some());
+            assert_eq!(
+                round.purchases.as_deref(),
+                Some("DLsite needs signing in again through the panel")
+            );
+        }
+        assert_eq!(ids(&all), ["RJ8"]);
+        assert_eq!(ids(&r18), ["RJ9"]);
     }
 
     #[test]

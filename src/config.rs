@@ -123,10 +123,16 @@ pub enum ButtonSpec {
         hide: Vec<String>,
     },
     /// Search the DLsite games in a folder on the panel, start them, and pin them to the
-    /// tab.
+    /// tab; or, by `works`, the works bought that are not games, which open in DLsite
+    /// Play.
     #[serde(rename = "dlsite.library")]
     DlsiteLibrary {
-        /// `<maker>\<title>` folders; DLsiteNest's `D:\DLsiteNest\Game` by default.
+        /// Which of the works bought it holds: `games` (the default), `all-ages` or
+        /// `r18`.
+        #[serde(default)]
+        works: crate::dlsite::works::Works,
+        /// The games' `<maker>\<title>` folders; DLsiteNest's `D:\DLsiteNest\Game` by
+        /// default.
         #[serde(default)]
         root: Option<PathBuf>,
         /// Labels whose games are listed only while the label is selected.
@@ -637,13 +643,51 @@ buttons:
         let config = super::parse_all("", &files).unwrap();
         assert!(matches!(
             &config.buttons[0].spec,
-            ButtonSpec::DlsiteLibrary { root: None, hide } if hide == &["非表示"]
+            ButtonSpec::DlsiteLibrary { root: None, hide, .. } if hide == &["非表示"]
         ));
         assert!(matches!(
             &config.buttons[1].spec,
             ButtonSpec::DlsiteLibrary { root: Some(root), .. } if root == std::path::Path::new("E:/Games")
         ));
         assert_eq!(config.buttons[0].spec.type_name(), "dlsite.library");
+    }
+
+    #[test]
+    fn dlsite_library_buttons_name_the_works_they_hold() {
+        use crate::dlsite::works::Works;
+
+        let button = |id: &str, works: &str| {
+            format!("  - id: {id}\n    label: {id}\n    type: dlsite.library\n{works}")
+        };
+        let files = vec![(
+            "コミック".to_owned(),
+            format!(
+                "buttons:\n{}{}{}",
+                button("games", ""),
+                button("all", "    works: all-ages\n"),
+                button("r18", "    works: r18\n    hide: [非表示]\n"),
+            ),
+        )];
+        let config = super::parse_all("", &files).unwrap();
+        let held: Vec<Works> = config
+            .buttons
+            .iter()
+            .filter_map(|b| match &b.spec {
+                ButtonSpec::DlsiteLibrary { works, .. } => Some(*works),
+                _ => None,
+            })
+            .collect();
+        // Without `works` a button holds the games, as before.
+        assert_eq!(held, [Works::Games, Works::AllAges, Works::R18]);
+        assert!(matches!(
+            &config.buttons[2].spec,
+            ButtonSpec::DlsiteLibrary { hide, .. } if hide == &["非表示"]
+        ));
+        let unknown = vec![(
+            "コミック".to_owned(),
+            format!("buttons:\n{}", button("x", "    works: comics\n")),
+        )];
+        assert!(super::parse_all("", &unknown).is_err());
     }
 
     #[test]

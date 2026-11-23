@@ -160,7 +160,7 @@ impl ShopStore {
     }
 
     /// SQL for this shop's tables, written with `shop_` for the prefix.
-    fn sql(&self, text: &str) -> String {
+    pub(crate) fn sql(&self, text: &str) -> String {
         text.replace("shop_", &format!("{}_", self.prefix))
     }
 
@@ -768,6 +768,39 @@ fn fixed(label: &str) -> Result<(), LabelError> {
     Ok(())
 }
 
+/// Labels as a library changes them: the fixed ones stay, and a label that is not
+/// there says so.
+impl ShopStore {
+    pub(crate) fn library_create_label(&self, name: &str) -> Result<Label, LabelError> {
+        stored(self.create_label(name))
+    }
+
+    pub(crate) fn library_rename_label(&self, label: &str, name: &str) -> Result<(), LabelError> {
+        fixed(label)?;
+        stored(self.rename_label(label, name))?
+            .then_some(())
+            .ok_or(LabelError::NotFound)
+    }
+
+    pub(crate) fn library_delete_label(&self, label: &str) -> Result<(), LabelError> {
+        fixed(label)?;
+        stored(self.delete_label(label))?
+            .then_some(())
+            .ok_or(LabelError::NotFound)
+    }
+
+    pub(crate) fn library_set_label(
+        &self,
+        label: &str,
+        item: &str,
+        on: bool,
+    ) -> Result<(), LabelError> {
+        stored(self.set_label(label, item, on))?
+            .then_some(())
+            .ok_or(LabelError::NotFound)
+    }
+}
+
 /// A purchased work.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Work {
@@ -786,6 +819,12 @@ pub struct Work {
     pub version: String,
     /// When it was bought, in Unix seconds, when the shop says.
     pub bought: Option<i64>,
+    /// The shop's age rating, such as DLsite's `all`, `r15` or `r18`.
+    pub age: String,
+    /// The part of the shop that sells it, such as DLsite's `maniax` or `home`.
+    pub site: String,
+    /// Whether the shop plays it on the web (DLsite Play).
+    pub playable: bool,
 }
 
 /// What a library needs from the shop its games come from.
@@ -1266,27 +1305,19 @@ impl<S: Shop> GameLibrary for ShopLibrary<S> {
     }
 
     fn create_label(&self, name: &str) -> Result<Label, LabelError> {
-        stored(self.store.create_label(name))
+        self.store.library_create_label(name)
     }
 
     fn rename_label(&self, label: &str, name: &str) -> Result<(), LabelError> {
-        fixed(label)?;
-        stored(self.store.rename_label(label, name))?
-            .then_some(())
-            .ok_or(LabelError::NotFound)
+        self.store.library_rename_label(label, name)
     }
 
     fn delete_label(&self, label: &str) -> Result<(), LabelError> {
-        fixed(label)?;
-        stored(self.store.delete_label(label))?
-            .then_some(())
-            .ok_or(LabelError::NotFound)
+        self.store.library_delete_label(label)
     }
 
     fn set_label(&self, label: &str, item: &str, on: bool) -> Result<(), LabelError> {
-        stored(self.store.set_label(label, item, on))?
-            .then_some(())
-            .ok_or(LabelError::NotFound)
+        self.store.library_set_label(label, item, on)
     }
 
     fn programs(&self, id: &str) -> Option<Programs> {

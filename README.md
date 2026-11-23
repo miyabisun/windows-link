@@ -17,12 +17,12 @@ Each button does one thing:
 | `app.launch` | opens a program, shortcut, URL or Store app, or brings it to the front while it runs | whether it runs |
 | `steam.game` | starts a Steam game, or closes it while it runs | whether it runs |
 | `steam.library` | nothing: a panel opens the Steam library to search, start and pin games ([Steam library](#steam-library)) | the games pinned to the button |
-| `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way ([DLsite library](#dlsite-library)) | the games pinned to the button, and `sign_in: "dlsite"` while DLsite needs signing in through the panel |
+| `dlsite.library` | nothing: a panel opens the DLsite games in a folder the same way, or with `works` a shelf of the works bought that are not games ([DLsite library](#dlsite-library)) | the games pinned to the button, and `sign_in: "dlsite"` while DLsite needs signing in through the panel |
 | `fanza.library` | nothing: a panel opens the FANZA games bought the same way ([FANZA library](#fanza-library)) | the same, and `sign_in: "fanza"` while FANZA needs signing in through the panel |
 | `automation.hold` | turns "the user is using the PC" on or off; turning it on also presses its `focus` button ([Mouse board](#mouse-board)) | `held` while on; automation then waits |
 | `cursor.highlight` | turns the highlighted cursor on or off: while on, an arrow after Blue Archive's cursor, in the colour chosen on the panel, stands in for the mouse cursor | `on` while on, and `color` (`red`, `green` or `blue`) |
 
-A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`), and `"pages": true` for DLsite, whose games have pages in the shop (`POST …/page`; the listing gives each game's `page`).
+A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`), and `"pages": true` for DLsite, whose games have pages in the shop (`POST …/page`; the listing gives each game's `page`). `"web": true` is for a DLsite shelf ([Shelves](#shelves)): its items open on the web and nothing of theirs is on this PC, so they have no folder to open (`license_keys` is false there too).
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -403,6 +403,8 @@ panel to sort by. A game known by its `RJ…` work ID has its DLsite page as `pa
 `POST …/page` opens it in the default browser. Its picture is the work's art on DLsite
 (`image` in the listing), or its program's icon until the work is known.
 
+A button holds the games unless it names other `works` ([Shelves](#shelves)).
+
 Some games ask for a license key (serial number) when they first start. `GET …/keys` reads it
 from DLsite each time it is asked (while the panel's sign-in lasts), so the keys are kept
 nowhere on this PC and never logged; the panel shows them with a copy button.
@@ -444,6 +446,50 @@ nowhere on this PC and never logged; the panel shows them with a copy button.
   stops at the login page, the panel asks you to sign in again. The window is a private one
   of its own, so a browser's sign-in is neither touched nor read.
 
+### Shelves
+
+The works bought that are not games (voice, video, CG, manga and so on) are on two
+shelves, each a `dlsite.library` button of its own that names its `works`:
+
+```yaml
+buttons:
+  - id: dlsite          # works: games, the default
+    label: DLsite ゲーム
+    type: dlsite.library
+  - id: dlsite-all
+    label: DLsite 全年齢
+    type: dlsite.library
+    works: all-ages
+  - id: dlsite-r18
+    label: DLsite R18
+    type: dlsite.library
+    works: r18
+    hide: [非表示]
+```
+
+- **Which works**: `all-ages` holds the works DLsite rates for all ages (`age_category`
+  `all`), `r18` every other one: R-18, and R-15 and any rating windows-link does not know
+  with them, so nothing rated shows among the all-ages works. Games are on neither,
+  whatever their age (`root` is for `games` only).
+- **Opening**: nothing is downloaded. Starting a work opens it in DLsite Play
+  (`https://play.dlsite.com/work/<ID>`) in the default browser, where you are signed in
+  yourself. A work DLsite Play cannot show (a program, say) has the `status`
+  `ブラウザ再生に非対応` and opens its page in the shop instead. A work has no folder
+  (`POST …/folder` answers `404`), no programs and no license keys.
+- **In the list**: each work has its work ID as `id`, its maker as `detail`, its art as
+  `image`, `installed: true`, `updated` and `bought` as a game has, and its page on the
+  floor that sells it as `page`. They come opened last first, then bought last.
+- **Kept**: a shelf's works are kept in `windows-link.db` as last read (`dlsite_all_shelf`,
+  `dlsite_r18_shelf`), so the list answers at start and while signed out; each reading of
+  the purchases that works replaces them. Labels (お気に入り and 非表示, and your own) and
+  when each work was opened are each shelf's own (`dlsite_all_…`, `dlsite_r18_…`), apart
+  from the games' and the other shelf's. Buttons that name the same `works` share a shelf.
+- **Rounds**: the purchases are read once a round for the games and both shelves, also
+  with shelf buttons alone, which download nothing. A [library update](#api) on a shelf
+  button starts DLsite's round like one on the games' button, so the games' downloads go
+  on too; a shelf's `GET …/library/update` says `doing: "purchases"` while they are
+  read and why they could not be, with no `jobs`.
+
 ### Downloads and updates
 
 A round starts when the panel asks for a [library update](#api) and right after signing
@@ -454,7 +500,8 @@ and the log show how it goes.
 
 - **Which games**: games (DLsite's game work types) that run on Windows. The AI-translated
   game data in other languages that comes with some purchases (`…ゲームデータ（AI翻訳）`),
-  phone-only games and other works (voice, manga, video) are left out.
+  phone-only games and other works (voice, manga, video) are left out; the other works
+  are on the [shelves](#shelves).
 - **In the list**: a game not here yet is listed first by its work ID, with its maker and
   picture, `installed: false` and a `status` such as `ダウンロード待ち`, `ダウンロード中 40%`,
   `展開中` or why it failed; an updating game has a `status` too. Starting one not here yet

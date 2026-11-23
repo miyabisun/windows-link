@@ -21,7 +21,7 @@ use windows_link::{
         service::DiscordIcons,
         token,
     },
-    dlsite::{self, DlsiteLibrary, DlsiteShop, session::DlsiteSession},
+    dlsite::{self, Dlsite, DlsiteLibrary, DlsiteShop, session::DlsiteSession, shelf::Shelf},
     fanza::{self, FanzaLibrary, FanzaShop},
     hold::{Colors, HIGHLIGHTS, HOLDS, Holds},
     home_link,
@@ -284,7 +284,8 @@ fn discord(config: &config::Config, changes: Arc<Notify>) -> Arc<dyn Discord> {
 /// the shops' sign-ins when a button needs them.
 struct Libraries {
     buttons: Vec<(String, Arc<dyn GameLibrary>)>,
-    dlsite: Vec<Arc<DlsiteLibrary>>,
+    /// DLsite's libraries, the games' and the shelves', when a button needs one.
+    dlsite: Option<Arc<Dlsite>>,
     fanza: Vec<Arc<FanzaLibrary>>,
     dlsite_session: Option<Arc<DlsiteSession>>,
     fanza_client: Option<Arc<fanza::Client>>,
@@ -304,16 +305,12 @@ fn serve_libraries(mut state: AppState, libraries: Libraries) -> AppState {
     if let Some(session) = libraries.dlsite_session {
         state = state.with_dlsite(session, libraries.dlsite_wake.clone());
     }
-    if !libraries.dlsite.is_empty() {
+    if let Some(dlsite) = libraries.dlsite {
         tokio::spawn(shop_rounds(
-            libraries.dlsite,
+            vec![dlsite],
             state.clone(),
             libraries.dlsite_wake,
-            (
-                DlsiteLibrary::refresh,
-                DlsiteLibrary::download,
-                DlsiteLibrary::end_round,
-            ),
+            (Dlsite::refresh, Dlsite::download, Dlsite::end_round),
         ));
     }
     if !libraries.fanza.is_empty() {
@@ -376,6 +373,7 @@ fn libraries(
     let mut dlsite_store = None;
     let mut dlsite_session: Option<Arc<DlsiteSession>> = None;
     let mut dlsite = Vec::new();
+    let mut dlsite_shelves: Vec<(dlsite::works::Works, Arc<Shelf>)> = Vec::new();
     let mut fanza_store = None;
     let mut fanza_client: Option<Arc<fanza::Client>> = None;
     let mut fanza = Vec::new();
@@ -385,7 +383,27 @@ fn libraries(
     for button in &config.buttons {
         let library: Arc<dyn GameLibrary> = match &button.spec {
             ButtonSpec::SteamLibrary { .. } => steam.get_or_insert_with(steam_library).clone(),
-            ButtonSpec::DlsiteLibrary { root, .. } => {
+            ButtonSpec::DlsiteLibrary { works, root, .. } => {
+                let session = Arc::clone(dlsite_session.get_or_insert_with(|| {
+                    Arc::new(DlsiteSession::open(dlsite::session::default_path()))
+                }));
+                // A shelf is shared by the buttons that hold the same works.
+                if let Some(prefix) = works.shelf() {
+                    let shelf = if let Some((_, shelf)) =
+                        dlsite_shelves.iter().find(|(held, _)| held == works)
+                    {
+                        Arc::clone(shelf)
+                    } else {
+                        let store = Arc::new(ShopStore::open(database, prefix)?);
+                        let wake = Arc::clone(&dlsite_wake);
+                        let shelf = Arc::new(Shelf::new(*works, store, session, wake)?);
+                        dlsite_shelves.push((*works, Arc::clone(&shelf)));
+                        shelf
+                    };
+                    let shelf: Arc<dyn GameLibrary> = shelf;
+                    out.push((button.id.clone(), shelf));
+                    continue;
+                }
                 let store = if let Some(store) = &dlsite_store {
                     Arc::clone(store)
                 } else {
@@ -396,9 +414,6 @@ fn libraries(
                 let root = root
                     .clone()
                     .unwrap_or_else(|| std::path::PathBuf::from(dlsite::DEFAULT_ROOT));
-                let session = Arc::clone(dlsite_session.get_or_insert_with(|| {
-                    Arc::new(DlsiteSession::open(dlsite::session::default_path()))
-                }));
                 let library = Arc::new(
                     DlsiteLibrary::new(root, store, DlsiteShop::new(session))
                         .with_wake(Arc::clone(&dlsite_wake)),
@@ -431,6 +446,10 @@ fn libraries(
         };
         out.push((button.id.clone(), library));
     }
+    let dlsite = dlsite_session.clone().map(|session| {
+        let shelves = dlsite_shelves.into_iter().map(|(_, shelf)| shelf).collect();
+        Arc::new(Dlsite::new(session, dlsite, shelves))
+    });
     Ok(Libraries {
         buttons: out,
         dlsite,

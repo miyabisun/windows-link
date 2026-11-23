@@ -1,6 +1,7 @@
 //! The user's DLsite purchases, through DLsite Play with the session the panel signed in
 //! (`super::session`): list the works bought with each work's name, maker, main picture,
-//! type, latest version and purchase date, and download a work's files.
+//! type, age rating, floor, latest version and purchase date, and download a work's
+//! files.
 //!
 //! DLsite Play's authorization follows dlsite-async (MIT,
 //! <https://github.com/bhrevol/dlsite-async>). Downloads follow what dlsite-manager (MIT,
@@ -97,12 +98,14 @@ pub struct RemoteFile {
 impl Session {
     /// Every purchased work, with when it was bought.
     pub fn purchases(&self) -> Result<Vec<Work>, String> {
-        let bought = sales(&json(
+        let answer = json(
             self.agent
                 .get("https://play.dlsite.com/api/v3/content/sales?last=0")
                 .call(),
             "the DLsite purchases",
-        )?);
+        )?;
+        listed(&answer, "the DLsite purchases")?;
+        let bought = sales(&answer);
         let ids: Vec<&str> = bought.iter().map(|(id, _)| id.as_str()).collect();
         let when: HashMap<&str, i64> = bought
             .iter()
@@ -111,13 +114,15 @@ impl Session {
         let mut found = Vec::new();
         for batch in ids.chunks(WORKS_PER_REQUEST) {
             let body = serde_json::to_string(batch).unwrap_or_default();
-            found.extend(works(&json(
+            let answer = json(
                 self.agent
                     .post("https://play.dlsite.com/api/v3/content/works")
                     .header("Content-Type", "application/json")
                     .send(body),
                 "the DLsite works",
-            )?));
+            )?;
+            listed(&answer["works"], "the DLsite works")?;
+            found.extend(works(&answer));
         }
         for work in &mut found {
             work.bought = when.get(work.id.as_str()).copied();
@@ -303,6 +308,15 @@ pub fn file_name(url: &str) -> Option<String> {
     plain.then(|| name.to_owned())
 }
 
+/// Whether DLsite answered with a list. An answer of another shape (an error, say) is not
+/// "nothing bought": what was read before must stay.
+fn listed(answer: &Value, what: &str) -> Result<(), String> {
+    answer
+        .is_array()
+        .then_some(())
+        .ok_or_else(|| format!("{what}: DLsite did not answer with a list"))
+}
+
 /// The work IDs in `/api/v3/content/sales`, each with when it was bought (Unix
 /// seconds) when DLsite says.
 pub fn sales(answer: &Value) -> Vec<(String, Option<i64>)> {
@@ -351,6 +365,9 @@ pub fn works(answer: &Value) -> Vec<Work> {
                     .unwrap_or_default()
                     .to_owned(),
                 bought: None,
+                age: work["age_category"].as_str().unwrap_or_default().to_owned(),
+                site: work["site_id"].as_str().unwrap_or_default().to_owned(),
+                playable: work["is_playwork"].as_bool().unwrap_or(false),
             })
         })
         .collect()
@@ -379,7 +396,18 @@ pub fn public_images(answer: &Value) -> Vec<(String, String)> {
 mod tests {
     use serde_json::json;
 
-    use super::{Work, file_name, license_keys, public_images, sales, split_parts, works};
+    use super::{Work, file_name, license_keys, listed, public_images, sales, split_parts, works};
+
+    #[test]
+    fn an_answer_that_is_not_a_list_is_a_failure_not_an_empty_list() {
+        assert_eq!(listed(&json!([]), "the purchases"), Ok(()));
+        assert_eq!(listed(&json!([{"workno": "RJ1"}]), "the purchases"), Ok(()));
+        assert_eq!(
+            listed(&json!({"error": "maintenance"}), "the purchases"),
+            Err("the purchases: DLsite did not answer with a list".to_owned())
+        );
+        assert!(listed(&json!(null), "the works").is_err());
+    }
 
     #[test]
     fn reads_sales_and_works() {
@@ -403,6 +431,9 @@ mod tests {
                 "maker": {"id": "RG01", "name": {"ja_JP": "サークル"}},
                 "work_files": {"main": "https://img.dlsite.jp/a_img_main.jpg", "sam": "https://img.dlsite.jp/a_img_sam.jpg"},
                 "work_type": "RPG",
+                "age_category": "r18",
+                "site_id": "maniax",
+                "is_playwork": true,
                 "os": ["android", "windows"],
                 "regist_date": "2023-05-17T15:00:00.000000Z",
                 "upgrade_date": "2025-11-09T15:00:00.000000Z"
@@ -431,6 +462,9 @@ mod tests {
                     windows: true,
                     version: "2025-11-09T15:00:00.000000Z".into(),
                     bought: None,
+                    age: "r18".into(),
+                    site: "maniax".into(),
+                    playable: true,
                 },
                 Work {
                     id: "VJ0001".into(),
@@ -441,6 +475,9 @@ mod tests {
                     windows: false,
                     version: "2005-10-02T15:00:00.000000Z".into(),
                     bought: None,
+                    age: String::new(),
+                    site: String::new(),
+                    playable: false,
                 },
             ]
         );

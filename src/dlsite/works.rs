@@ -1,4 +1,5 @@
-//! Which DLsite purchases are games for this PC, and the dates DLsite writes.
+//! Which DLsite purchases are games for this PC and which go to which shelf, and the
+//! dates DLsite writes.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,9 +14,49 @@ const GAME_KINDS: [&str; 11] = [
 /// Whether a purchase is a game for this PC: a game that runs on Windows, and not the
 /// AI-translated data of a game in another language that comes with some purchases.
 pub fn is_game(work: &Work) -> bool {
+    is_game_kind(work) && work.windows && !work.name.contains("ゲームデータ（AI翻訳）")
+}
+
+/// Whether a purchase is a game, for this PC or not.
+fn is_game_kind(work: &Work) -> bool {
     GAME_KINDS.contains(&work.kind.as_str())
-        && work.windows
-        && !work.name.contains("ゲームデータ（AI翻訳）")
+}
+
+/// Which of the works bought a `dlsite.library` button holds: the games, which are
+/// downloaded to this PC, or a shelf of the works that are not games, which open in
+/// DLsite Play.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Works {
+    #[default]
+    Games,
+    /// The works for all ages.
+    AllAges,
+    /// The works with an age limit: R-18, and R-15 with them.
+    R18,
+}
+
+impl Works {
+    /// Whether a purchase belongs here. Only a work DLsite rates `all` is for all ages:
+    /// one it rates otherwise, or not at all, never shows among those by mistake.
+    pub fn holds(self, work: &Work) -> bool {
+        let all_ages = work.age == "all";
+        match self {
+            Self::Games => is_game(work),
+            Self::AllAges => !is_game_kind(work) && all_ages,
+            Self::R18 => !is_game_kind(work) && !all_ages,
+        }
+    }
+
+    /// The prefix of a shelf's tables in windows-link's database (`<prefix>_…`); none
+    /// for the games, whose library is `super::DlsiteLibrary`.
+    pub fn shelf(self) -> Option<&'static str> {
+        match self {
+            Self::Games => None,
+            Self::AllAges => Some("dlsite_all"),
+            Self::R18 => Some("dlsite_r18"),
+        }
+    }
 }
 
 /// A time DLsite gives, such as `2017-12-09T15:00:00.000000Z` (UTC) or
@@ -59,7 +100,7 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
-    use super::{is_game, parse_date};
+    use super::{Works, is_game, parse_date};
     use crate::shop::{
         Work,
         download::{OnDisk, Plan, plan},
@@ -89,6 +130,36 @@ mod tests {
             ..work("RJ5", "RPG", true, "")
         };
         assert!(!is_game(&translated));
+    }
+
+    #[test]
+    fn works_that_are_not_games_go_to_a_shelf_by_their_age() {
+        let voice = |age: &str| Work {
+            age: age.into(),
+            ..work("RJ1", "SOU", false, "")
+        };
+        assert!(Works::Games.holds(&work("RJ2", "RPG", true, "")));
+        assert!(!Works::Games.holds(&voice("all")));
+        assert!(Works::AllAges.holds(&voice("all")));
+        assert!(!Works::R18.holds(&voice("all")));
+        // R-15, and a rating DLsite does not give or names newly, go with R18: a work
+        // never shows among the all-ages ones by mistake.
+        for age in ["r18", "r15", "", "r20"] {
+            assert!(Works::R18.holds(&voice(age)), "{age:?}");
+            assert!(!Works::AllAges.holds(&voice(age)), "{age:?}");
+        }
+        // A game is on no shelf, also one that is not for this PC.
+        let phone_game = Work {
+            age: "all".into(),
+            ..work("RJ3", "RPG", false, "")
+        };
+        assert!(!Works::Games.holds(&phone_game));
+        assert!(!Works::AllAges.holds(&phone_game));
+        assert!(!Works::R18.holds(&phone_game));
+        // Each shelf has tables of its own, apart from the games' (`dlsite_…`).
+        assert_eq!(Works::Games.shelf(), None);
+        let (all, r18) = (Works::AllAges.shelf().unwrap(), Works::R18.shelf().unwrap());
+        assert!(all != r18 && all != "dlsite" && r18 != "dlsite");
     }
 
     #[test]
