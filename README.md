@@ -22,7 +22,7 @@ Each button does one thing:
 | `automation.hold` | turns "the user is using the PC" on or off; turning it on also presses its `focus` button ([Mouse board](#mouse-board)) | `held` while on; automation then waits |
 | `cursor.highlight` | turns the highlighted cursor on or off: while on, an arrow after Blue Archive's cursor, in the colour chosen on the panel, stands in for the mouse cursor | `on` while on, and `color` (`red`, `green` or `blue`) |
 
-A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`), and `"pages": true` for DLsite, whose games have pages in the shop (`POST …/page`; the listing gives each game's `page`). `"web": true` is for a DLsite shelf ([Shelves](#shelves)): its items open on the web and nothing of theirs is on this PC, so they have no folder to open (`license_keys` is false there too).
+A library button's state also says `"rounds": true` for DLsite and FANZA, whose games download in rounds that tell how they go (`GET …/library/update`), and `"pages": true` for DLsite, whose games have pages in the shop (`POST …/page`; the listing gives each game's `page`). `"web": true` is for a DLsite shelf ([Shelves](#shelves)): its items open on the web, or as a folder for its videos, and none starts as a program (`license_keys` is false there too).
 
 It also keeps the mouse cursor where it was when you touch a touch screen (see
 [Touch and the mouse cursor](#touch-and-the-mouse-cursor)), lets a panel follow and switch
@@ -465,30 +465,51 @@ buttons:
     type: dlsite.library
     works: r18
     hide: [非表示]
+    root: D:\DLsiteNest\Movie   # its videos' folder; optional, this is the default
 ```
 
 - **Which works**: `all-ages` holds the works DLsite rates for all ages (`age_category`
   `all`), `r18` every other one: R-18, and R-15 and any rating windows-link does not know
   with them, so nothing rated shows among the all-ages works. Games are on neither,
-  whatever their age (`root` is for `games` only).
-- **Opening**: nothing is downloaded. Starting a work opens it in DLsite Play
+  whatever their age.
+- **Opening**: starting a work opens it in DLsite Play
   (`https://play.dlsite.com/work/<ID>`) in the default browser, where you are signed in
-  yourself. A work DLsite Play cannot show (a program, say) has the `status`
-  `ブラウザ再生に非対応` and opens its page in the shop instead. A work has no folder
-  (`POST …/folder` answers `404`), no programs and no license keys.
+  yourself; nothing of it is downloaded. A work DLsite Play cannot show has the `status`
+  `ブラウザ再生に非対応` and opens its page in the shop instead. Such a work has no folder
+  (`POST …/folder` answers `404`), no programs and no license keys. Videos go another
+  way:
+- **Videos**: a video (work type `MOV`) whose files DLsite gives to download
+  (`downloadable`) is kept on this PC. windows-link downloads it into
+  `<root>\<maker>\<title>` and brings it up to date the way it does the games
+  ([Downloads and updates](#downloads-and-updates): in a round, when you ask for a
+  library update, never at start), and starting it opens that folder in Explorer;
+  `POST …/folder` opens it too. `root` is a shelf's videos' folder, `D:\DLsiteNest\Movie`
+  (DLsiteNest's) by default; it has to exist. The videos DLsiteNest put there are taken
+  as they are: which folder is which video comes from DLsiteNest's records and from the
+  titles of the videos bought, as for the games (kept in `dlsite_movie_games`; the other
+  `dlsite_movie_…` tables hold the folders as last read and the versions). Shelves that
+  name the same folder share it (a shelf goes by its first button's `root`), and only the
+  videos of the shelves set up are downloaded. A video with no file to download opens in
+  DLsite Play like the other works.
 - **In the list**: each work has its work ID as `id`, its maker as `detail`, its art as
-  `image`, `installed: true`, `updated` and `bought` as a game has, and its page on the
-  floor that sells it as `page`. They come opened last first, then bought last.
+  `image`, `updated` and `bought` as a game has, and its page on the floor that sells it
+  as `page`. A work that opens on the web is `installed: true`; a video is so once its
+  folder is here, and until then says how getting it goes in `status` (`ダウンロード待ち`,
+  the progress, why it failed), as a game not here yet; starting it then answers
+  `409 not_downloaded`. They come opened last first, then bought last.
 - **Kept**: a shelf's works are kept in `windows-link.db` as last read (`dlsite_all_shelf`,
   `dlsite_r18_shelf`), so the list answers at start and while signed out; each reading of
   the purchases that works replaces them. Labels (お気に入り and 非表示, and your own) and
   when each work was opened are each shelf's own (`dlsite_all_…`, `dlsite_r18_…`), apart
   from the games' and the other shelf's. Buttons that name the same `works` share a shelf.
 - **Rounds**: the purchases are read once a round for the games and both shelves, also
-  with shelf buttons alone, which download nothing. A [library update](#api) on a shelf
-  button starts DLsite's round like one on the games' button, so the games' downloads go
-  on too; a shelf's `GET …/library/update` says `doing: "purchases"` while they are
-  read and why they could not be, with no `jobs`.
+  with shelf buttons alone, which download their videos and no games. A
+  [library update](#api) on a shelf button starts DLsite's round like one on the games'
+  button: the games are downloaded first, then the videos. A shelf's
+  `GET …/library/update` says `doing: "purchases"` while the purchases are read (and
+  while the games before its videos are downloaded) and why they could not be, then
+  `doing: "downloads"` with its own videos as `jobs` (never the other shelf's), and
+  `folder` when the videos' folder cannot be read.
 
 ### Downloads and updates
 
@@ -501,7 +522,7 @@ and the log show how it goes.
 - **Which games**: games (DLsite's game work types) that run on Windows. The AI-translated
   game data in other languages that comes with some purchases (`…ゲームデータ（AI翻訳）`),
   phone-only games and other works (voice, manga, video) are left out; the other works
-  are on the [shelves](#shelves).
+  are on the [shelves](#shelves), whose videos are downloaded the same way.
 - **In the list**: a game not here yet is listed first by its work ID, with its maker and
   picture, `installed: false` and a `status` such as `ダウンロード待ち`, `ダウンロード中 40%`,
   `展開中` or why it failed; an updating game has a `status` too. Starting one not here yet

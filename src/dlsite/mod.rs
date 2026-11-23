@@ -4,7 +4,8 @@
 //! games are brought up to date (the library itself is `crate::shop`'s). Which DLsite
 //! work each folder is comes from what was recorded, DLsiteNest's records and the
 //! purchases. The works bought that are not games are on shelves (`shelf`), which read
-//! the purchases in the same round (`Dlsite`).
+//! the purchases in the same round (`Dlsite`). The videos among them are kept on this PC
+//! the way the games are, in a library of their own under another folder.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -27,15 +28,39 @@ use session::DlsiteSession;
 
 /// Where DLsiteNest puts games.
 pub const DEFAULT_ROOT: &str = r"D:\DLsiteNest\Game";
+/// Where DLsiteNest puts videos.
+pub const DEFAULT_VIDEO_ROOT: &str = r"D:\DLsiteNest\Movie";
+/// The prefix of the videos' tables in windows-link's database (`<prefix>_…`), apart
+/// from the games' (`dlsite_…`) and the shelves' own.
+pub const VIDEO_TABLES: &str = "dlsite_movie";
 
 /// DLsite, signed in through the panel.
 pub struct DlsiteShop {
     session: std::sync::Arc<DlsiteSession>,
+    /// The shelves whose videos the library keeps; none for the games' library.
+    videos: Vec<works::Works>,
 }
 
 impl DlsiteShop {
+    /// The shop of the games' library.
     pub fn new(session: std::sync::Arc<DlsiteSession>) -> Self {
-        Self { session }
+        Self {
+            session,
+            videos: Vec::new(),
+        }
+    }
+
+    /// The shop of a library of the videos on `shelves`.
+    pub fn videos(session: std::sync::Arc<DlsiteSession>, shelves: Vec<works::Works>) -> Self {
+        Self {
+            session,
+            videos: shelves,
+        }
+    }
+
+    /// Whether its library is the games'.
+    fn games(&self) -> bool {
+        self.videos.is_empty()
     }
 
     pub fn session(&self) -> &DlsiteSession {
@@ -49,7 +74,11 @@ impl Shop for DlsiteShop {
     }
 
     fn wants(&self, work: &Work) -> bool {
-        works::is_game(work)
+        if self.games() {
+            works::is_game(work)
+        } else {
+            works::is_video(work) && self.videos.iter().any(|shelf| shelf.holds(work))
+        }
     }
 
     fn ready(&self) -> bool {
@@ -148,10 +177,14 @@ impl ShopLibrary<DlsiteShop> {
     /// Find out again which DLsite work each game is: from what was recorded, from
     /// DLsiteNest's records, and from `read`, the purchases as the round just read
     /// them (while the panel's sign-in lasts). Pictures of works known only through
-    /// DLsiteNest come from DLsite's public information. Failures leave what was
+    /// DLsiteNest come from DLsite's public information (the games' only: a shelf
+    /// shows a video's picture as the purchases give it). Failures leave what was
     /// known; a needed sign-in shows on the panel.
     pub(crate) fn refresh(&self, read: &Result<Vec<play::Work>, String>) {
-        self.adopt_legacy_works();
+        let of_games = self.shop().games();
+        if of_games {
+            self.adopt_legacy_works();
+        }
         let Ok(games) = self.rescan() else {
             return;
         };
@@ -179,11 +212,27 @@ impl ShopLibrary<DlsiteShop> {
             .collect();
         missing.sort();
         missing.dedup();
+        if !of_games {
+            missing.clear();
+        }
         let images = play::fetch_public_images(&missing).unwrap_or_else(|reason| {
             tracing::warn!(%reason, "cannot read DLsite's public product information");
             HashMap::new()
         });
         let remembered = self.store.games().unwrap_or_default();
+        // A videos' folder is a video the library keeps, never another work of the same
+        // title (its voice track, say), which would leave the video to download again.
+        let videos: Vec<play::Work>;
+        let purchases = if of_games {
+            purchases
+        } else {
+            videos = purchases
+                .iter()
+                .filter(|work| self.shop().wants(work))
+                .cloned()
+                .collect();
+            &videos
+        };
         let known = identify(&titles, &remembered, &nest, purchases, &images);
         let unknown: Vec<&str> = titles
             .iter()
@@ -191,6 +240,7 @@ impl ShopLibrary<DlsiteShop> {
             .map(|t| t.name.as_str())
             .collect();
         tracing::info!(
+            root = %self.root.display(),
             games = titles.len(),
             identified = known.len(),
             ?unknown,
@@ -202,8 +252,27 @@ impl ShopLibrary<DlsiteShop> {
     }
 }
 
-/// Every DLsite library: the games' and the shelves' (`shelf`), which go through a
-/// round together on one reading of the purchases.
+/// The folder of each shelf's videos, as the shelf buttons name them in order (a
+/// shelf goes by its first button's folder): each folder once, with the shelves whose
+/// videos are kept there.
+pub fn video_roots(buttons: &[(works::Works, PathBuf)]) -> Vec<(PathBuf, Vec<works::Works>)> {
+    let mut roots: Vec<(PathBuf, Vec<works::Works>)> = Vec::new();
+    for (shelf, root) in buttons {
+        if roots.iter().any(|(_, shelves)| shelves.contains(shelf)) {
+            continue;
+        }
+        let key = folder_key(root);
+        match roots.iter_mut().find(|(known, _)| folder_key(known) == key) {
+            Some((_, shelves)) => shelves.push(*shelf),
+            None => roots.push((root.clone(), vec![*shelf])),
+        }
+    }
+    roots
+}
+
+/// Every DLsite library: those of folders on this PC (`games`: the games', and the
+/// shelves' videos') and the shelves' (`shelf`), which go through a round together on
+/// one reading of the purchases.
 pub struct Dlsite {
     session: std::sync::Arc<DlsiteSession>,
     games: Vec<std::sync::Arc<DlsiteLibrary>>,
@@ -254,8 +323,8 @@ impl Dlsite {
         }
     }
 
-    /// Download and update the games, ending the round. The shelves have nothing to
-    /// download.
+    /// Download and update the games and the videos, one library after another, ending
+    /// the round. A shelf's round ends once its videos are through.
     pub fn download(&self) {
         for library in &self.games {
             library.download();
@@ -1265,6 +1334,16 @@ mod tests {
             std::process::id()
         ));
         let session = shop(&file).session;
+        // The videos' folder holds one video, which DLsiteNest put there.
+        let root = file.with_extension("videos");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(r"Maker\Here")).unwrap();
+        std::fs::write(root.join(r"Maker\Here\movie.mp4"), "").unwrap();
+        let videos = std::sync::Arc::new(DlsiteLibrary::new(
+            root.clone(),
+            std::sync::Arc::new(ShopStore::in_memory(super::VIDEO_TABLES).unwrap()),
+            DlsiteShop::videos(session.clone(), vec![Works::AllAges, Works::R18]),
+        ));
         let shelf = |which: Works| {
             let store = ShopStore::in_memory(which.shelf().unwrap()).unwrap();
             let shelf = Shelf::new(
@@ -1272,30 +1351,57 @@ mod tests {
                 std::sync::Arc::new(store),
                 session.clone(),
                 std::sync::Arc::default(),
+                videos.clone(),
             );
             std::sync::Arc::new(shelf.unwrap())
         };
         let (all, r18) = (shelf(Works::AllAges), shelf(Works::R18));
-        // Shelves alone: there are no games to read or download.
-        let dlsite = Dlsite::new(session, Vec::new(), vec![all.clone(), r18.clone()]);
-        let bought = |id: &str, kind: &str, age: &str| Work {
+        // Shelves alone: there are no games to read or download, only their videos.
+        let dlsite = Dlsite::new(
+            session,
+            vec![videos.clone()],
+            vec![all.clone(), r18.clone()],
+        );
+        let bought = |id: &str, name: &str, kind: &str, age: &str| Work {
             id: id.into(),
-            name: id.into(),
+            name: name.into(),
+            maker: "Maker".into(),
             kind: kind.into(),
             windows: true,
             age: age.into(),
+            downloadable: true,
             ..Work::default()
         };
         dlsite.share(&Ok(vec![
-            bought("RJ7", "RPG", "r18"),
-            bought("RJ8", "SOU", "all"),
-            bought("RJ9", "MOV", "r18"),
+            bought("RJ7", "Game", "RPG", "r18"),
+            bought("RJ8", "Voice", "SOU", "all"),
+            bought("RJ9", "Here", "MOV", "r18"),
+            bought("RJ10", "Coming", "MOV", "r18"),
         ]));
         let ids = |shelf: &Shelf| -> Vec<String> {
             shelf.listing().items.into_iter().map(|i| i.id).collect()
         };
         assert_eq!(ids(&all), ["RJ8"]);
-        assert_eq!(ids(&r18), ["RJ9"]);
+        // The same reading tells the videos' library which folder is which video: the
+        // one in the folder is here, the other waits to be downloaded.
+        let videos_of = |shelf: &Shelf| -> Vec<(String, bool, Option<String>)> {
+            let items = shelf.listing().items.into_iter();
+            let mut rows: Vec<_> = items.map(|i| (i.id, i.installed, i.status)).collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            videos_of(&r18),
+            [
+                (
+                    "RJ10".to_owned(),
+                    false,
+                    Some("ダウンロード待ち".to_owned())
+                ),
+                ("RJ9".to_owned(), true, None),
+            ]
+        );
+        assert_eq!(r18.folder("RJ9"), Some(root.join(r"Maker\Here")));
 
         // Before the user signs in a round reads nothing: each shelf says why and keeps
         // its works.
@@ -1311,7 +1417,113 @@ mod tests {
             );
         }
         assert_eq!(ids(&all), ["RJ8"]);
-        assert_eq!(ids(&r18), ["RJ9"]);
+        assert_eq!(videos_of(&r18).len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_videos_library_wants_the_videos_of_its_shelves_and_the_games_library_none() {
+        use super::{play::Work, works::Works};
+        use crate::shop::Shop;
+
+        let file =
+            std::env::temp_dir().join(format!("windows-link-dlsite-wants-{}", std::process::id()));
+        let session = shop(&file).session;
+        let bought = |kind: &str, age: &str, downloadable: bool| Work {
+            id: "RJ1".into(),
+            kind: kind.into(),
+            windows: true,
+            age: age.into(),
+            downloadable,
+            ..Work::default()
+        };
+        let r18 = DlsiteShop::videos(session.clone(), vec![Works::R18]);
+        assert!(r18.wants(&bought("MOV", "r18", true)));
+        assert!(r18.wants(&bought("MOV", "r15", true)));
+        // The all-ages shelf is not set up: its videos are not downloaded.
+        assert!(!r18.wants(&bought("MOV", "all", true)));
+        // A video with no file to download, a voice work and a game are not its.
+        assert!(!r18.wants(&bought("MOV", "r18", false)));
+        assert!(!r18.wants(&bought("SOU", "r18", true)));
+        assert!(!r18.wants(&bought("RPG", "r18", true)));
+        let both = DlsiteShop::videos(session.clone(), vec![Works::AllAges, Works::R18]);
+        assert!(both.wants(&bought("MOV", "all", true)));
+        assert!(both.wants(&bought("MOV", "r18", true)));
+        // The games' library goes on wanting the games only.
+        let games = DlsiteShop::new(session);
+        assert!(games.wants(&bought("RPG", "r18", true)));
+        assert!(!games.wants(&bought("MOV", "r18", true)));
+    }
+
+    #[test]
+    fn a_videos_folder_is_matched_to_a_video_not_to_another_work_of_its_title() {
+        use super::{play::Work, works::Works};
+
+        let file = std::env::temp_dir().join(format!(
+            "windows-link-dlsite-same-title-{}",
+            std::process::id()
+        ));
+        let session = shop(&file).session;
+        let root = file.with_extension("videos");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Maker").join("Same")).unwrap();
+        let videos = DlsiteLibrary::new(
+            root.clone(),
+            std::sync::Arc::new(ShopStore::in_memory(super::VIDEO_TABLES).unwrap()),
+            DlsiteShop::videos(session, vec![Works::R18]),
+        );
+        // The maker sells the voice track and the video under one title.
+        let bought = |id: &str, kind: &str| Work {
+            id: id.into(),
+            name: "Same".into(),
+            maker: "Maker".into(),
+            kind: kind.into(),
+            age: "r18".into(),
+            downloadable: true,
+            ..Work::default()
+        };
+        videos.refresh(&Ok(vec![bought("RJ1", "SOU"), bought("RJ2", "MOV")]));
+        let known: Vec<String> = videos
+            .store
+            .games()
+            .unwrap()
+            .into_values()
+            .map(|known| known.work)
+            .collect();
+        // Taken for the voice work, the video would be downloaded a second time.
+        assert_eq!(known, ["RJ2"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shelves_that_name_the_same_folder_share_its_videos() {
+        use super::{video_roots, works::Works};
+
+        let path = PathBuf::from;
+        // One folder for both shelves, written two ways.
+        assert_eq!(
+            video_roots(&[
+                (Works::AllAges, path(r"D:\DLsiteNest\Movie")),
+                (Works::R18, path(r"d:\dlsitenest\movie")),
+            ]),
+            [(
+                path(r"D:\DLsiteNest\Movie"),
+                vec![Works::AllAges, Works::R18]
+            )]
+        );
+        // A folder each; a second button of a shelf goes by the first one's folder.
+        assert_eq!(
+            video_roots(&[
+                (Works::R18, path(r"E:\Adult")),
+                (Works::AllAges, path(r"D:\Movie")),
+                (Works::R18, path(r"F:\Elsewhere")),
+            ]),
+            [
+                (path(r"E:\Adult"), vec![Works::R18]),
+                (path(r"D:\Movie"), vec![Works::AllAges]),
+            ]
+        );
+        assert!(video_roots(&[]).is_empty());
     }
 
     #[test]

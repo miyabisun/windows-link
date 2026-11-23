@@ -17,6 +17,12 @@ pub fn is_game(work: &Work) -> bool {
     is_game_kind(work) && work.windows && !work.name.contains("ゲームデータ（AI翻訳）")
 }
 
+/// Whether a purchase is a video to keep on this PC: a movie whose files DLsite gives to
+/// download. Other works on the shelves open in DLsite Play.
+pub fn is_video(work: &Work) -> bool {
+    work.kind == "MOV" && work.downloadable
+}
+
 /// Whether a purchase is a game, for this PC or not.
 fn is_game_kind(work: &Work) -> bool {
     GAME_KINDS.contains(&work.kind.as_str())
@@ -100,7 +106,7 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
-    use super::{Works, is_game, parse_date};
+    use super::{Works, is_game, is_video, parse_date};
     use crate::shop::{
         Work,
         download::{OnDisk, Plan, plan},
@@ -160,6 +166,25 @@ mod tests {
         assert_eq!(Works::Games.shelf(), None);
         let (all, r18) = (Works::AllAges.shelf().unwrap(), Works::R18.shelf().unwrap());
         assert!(all != r18 && all != "dlsite" && r18 != "dlsite");
+    }
+
+    #[test]
+    fn a_video_is_a_movie_whose_files_can_be_downloaded() {
+        let movie = |downloadable: bool| Work {
+            downloadable,
+            ..work("RJ1", "MOV", false, "")
+        };
+        assert!(is_video(&movie(true)));
+        // One with no file to download opens in DLsite Play like the other works.
+        assert!(!is_video(&movie(false)));
+        // So does a voice work, though its files can be downloaded.
+        let voice = Work {
+            downloadable: true,
+            ..work("RJ2", "SOU", true, "")
+        };
+        assert!(!is_video(&voice));
+        // A video is on a shelf, never among the games.
+        assert!(!is_game(&movie(true)));
     }
 
     #[test]

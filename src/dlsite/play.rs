@@ -368,6 +368,7 @@ pub fn works(answer: &Value) -> Vec<Work> {
                 age: work["age_category"].as_str().unwrap_or_default().to_owned(),
                 site: work["site_id"].as_str().unwrap_or_default().to_owned(),
                 playable: work["is_playwork"].as_bool().unwrap_or(false),
+                downloadable: work["downloadable"].as_bool().unwrap_or(false),
             })
         })
         .collect()
@@ -434,6 +435,7 @@ mod tests {
                 "age_category": "r18",
                 "site_id": "maniax",
                 "is_playwork": true,
+                "downloadable": true,
                 "os": ["android", "windows"],
                 "regist_date": "2023-05-17T15:00:00.000000Z",
                 "upgrade_date": "2025-11-09T15:00:00.000000Z"
@@ -465,6 +467,7 @@ mod tests {
                     age: "r18".into(),
                     site: "maniax".into(),
                     playable: true,
+                    downloadable: true,
                 },
                 Work {
                     id: "VJ0001".into(),
@@ -478,6 +481,7 @@ mod tests {
                     age: String::new(),
                     site: String::new(),
                     playable: false,
+                    downloadable: false,
                 },
             ]
         );

@@ -131,8 +131,8 @@ pub enum ButtonSpec {
         /// `r18`.
         #[serde(default)]
         works: crate::dlsite::works::Works,
-        /// The games' `<maker>\<title>` folders; DLsiteNest's `D:\DLsiteNest\Game` by
-        /// default.
+        /// The `<maker>\<title>` folders: the games', DLsiteNest's `D:\DLsiteNest\Game`
+        /// by default; for a shelf its videos', `D:\DLsiteNest\Movie` by default.
         #[serde(default)]
         root: Option<PathBuf>,
         /// Labels whose games are listed only while the label is selected.

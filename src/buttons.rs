@@ -69,8 +69,8 @@ pub enum ButtonState {
     /// `sign_in` the shop the user has to sign in to through the panel, when so,
     /// `rounds` whether the library downloads in rounds that say how they go
     /// (`GET …/library/update`), `pages` whether its games have pages in the shop
-    /// (`POST …/page`), and `web` whether its items open on the web, with nothing of
-    /// theirs on this PC (a DLsite shelf).
+    /// (`POST …/page`), and `web` whether its items open on the web, or as a folder for
+    /// its videos, rather than start as programs (a DLsite shelf).
     Library {
         pins: Vec<Pin>,
         license_keys: bool,
@@ -1295,8 +1295,8 @@ buttons:
                 web: false,
             }
         );
-        // A shelf's works open on the web: nothing of theirs is on this PC, and they
-        // have no license keys.
+        // A shelf's works open on the web (its videos as folders): none starts as a
+        // program, and they have no license keys.
         assert_eq!(
             view(&config, &config.buttons[2], &readings, &audio).state,
             ButtonState::Library {

@@ -363,6 +363,81 @@ async fn shop_rounds<L: Send + Sync + 'static>(
     }
 }
 
+/// The library of the videos in each folder the DLsite shelf buttons name
+/// (`DEFAULT_VIDEO_ROOT` unless a shelf's button names another), with the shelves whose
+/// videos it keeps.
+type ShelfVideos = Vec<(Vec<dlsite::works::Works>, Arc<DlsiteLibrary>)>;
+
+fn dlsite_videos(
+    config: &config::Config,
+    database: &std::path::Path,
+    session: &Arc<DlsiteSession>,
+    wake: &Arc<Notify>,
+) -> Result<ShelfVideos, Box<dyn std::error::Error>> {
+    let named: Vec<(dlsite::works::Works, std::path::PathBuf)> = config
+        .buttons
+        .iter()
+        .filter_map(|button| match &button.spec {
+            ButtonSpec::DlsiteLibrary { works, root, .. } if works.shelf().is_some() => {
+                let root = root
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from(dlsite::DEFAULT_VIDEO_ROOT));
+                Some((*works, root))
+            }
+            _ => None,
+        })
+        .collect();
+    let store = Arc::new(ShopStore::open(database, dlsite::VIDEO_TABLES)?);
+    Ok(dlsite::video_roots(&named)
+        .into_iter()
+        .map(|(root, shelves)| {
+            let shop = DlsiteShop::videos(Arc::clone(session), shelves.clone());
+            let library =
+                DlsiteLibrary::new(root, Arc::clone(&store), shop).with_wake(Arc::clone(wake));
+            (shelves, Arc::new(library))
+        })
+        .collect())
+}
+
+/// The DLsite shelves made so far (one for the buttons that hold the same works), and
+/// the libraries of their videos, made with the first shelf.
+#[derive(Default)]
+struct Shelves {
+    made: Vec<(dlsite::works::Works, Arc<Shelf>)>,
+    videos: Option<ShelfVideos>,
+}
+
+impl Shelves {
+    /// The shelf of `works`, whose tables go by `prefix`.
+    fn of(
+        &mut self,
+        (works, prefix): (dlsite::works::Works, &'static str),
+        config: &config::Config,
+        database: &std::path::Path,
+        session: &Arc<DlsiteSession>,
+        wake: &Arc<Notify>,
+    ) -> Result<Arc<Shelf>, Box<dyn std::error::Error>> {
+        if let Some((_, shelf)) = self.made.iter().find(|(held, _)| *held == works) {
+            return Ok(Arc::clone(shelf));
+        }
+        if self.videos.is_none() {
+            self.videos = Some(dlsite_videos(config, database, session, wake)?);
+        }
+        let videos = self
+            .videos
+            .iter()
+            .flatten()
+            .find(|(shelves, _)| shelves.contains(&works))
+            .map(|(_, library)| Arc::clone(library))
+            .ok_or("a DLsite shelf has no folder for its videos")?;
+        let store = Arc::new(ShopStore::open(database, prefix)?);
+        let (session, wake) = (Arc::clone(session), Arc::clone(wake));
+        let new = Arc::new(Shelf::new(works, store, session, wake, videos)?);
+        self.made.push((works, Arc::clone(&new)));
+        Ok(new)
+    }
+}
+
 /// The library behind each library button. The Steam library is read only when a
 /// button needs it, and shared by all such buttons.
 fn libraries(
@@ -373,7 +448,7 @@ fn libraries(
     let mut dlsite_store = None;
     let mut dlsite_session: Option<Arc<DlsiteSession>> = None;
     let mut dlsite = Vec::new();
-    let mut dlsite_shelves: Vec<(dlsite::works::Works, Arc<Shelf>)> = Vec::new();
+    let mut dlsite_shelves = Shelves::default();
     let mut fanza_store = None;
     let mut fanza_client: Option<Arc<fanza::Client>> = None;
     let mut fanza = Vec::new();
@@ -387,20 +462,10 @@ fn libraries(
                 let session = Arc::clone(dlsite_session.get_or_insert_with(|| {
                     Arc::new(DlsiteSession::open(dlsite::session::default_path()))
                 }));
-                // A shelf is shared by the buttons that hold the same works.
                 if let Some(prefix) = works.shelf() {
-                    let shelf = if let Some((_, shelf)) =
-                        dlsite_shelves.iter().find(|(held, _)| held == works)
-                    {
-                        Arc::clone(shelf)
-                    } else {
-                        let store = Arc::new(ShopStore::open(database, prefix)?);
-                        let wake = Arc::clone(&dlsite_wake);
-                        let shelf = Arc::new(Shelf::new(*works, store, session, wake)?);
-                        dlsite_shelves.push((*works, Arc::clone(&shelf)));
-                        shelf
-                    };
-                    let shelf: Arc<dyn GameLibrary> = shelf;
+                    let held = (*works, prefix);
+                    let shelf: Arc<dyn GameLibrary> =
+                        dlsite_shelves.of(held, config, database, &session, &dlsite_wake)?;
                     out.push((button.id.clone(), shelf));
                     continue;
                 }
@@ -446,8 +511,11 @@ fn libraries(
         };
         out.push((button.id.clone(), library));
     }
+    // The games are downloaded before the shelves' videos.
+    let Shelves { made, videos } = dlsite_shelves;
+    dlsite.extend(videos.into_iter().flatten().map(|(_, videos)| videos));
     let dlsite = dlsite_session.clone().map(|session| {
-        let shelves = dlsite_shelves.into_iter().map(|(_, shelf)| shelf).collect();
+        let shelves = made.into_iter().map(|(_, shelf)| shelf).collect();
         Arc::new(Dlsite::new(session, dlsite, shelves))
     });
     Ok(Libraries {

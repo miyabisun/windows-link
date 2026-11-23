@@ -661,7 +661,7 @@ fn program_path(folder: &Path, program: &str) -> PathBuf {
 }
 
 /// The status of a game waiting to be downloaded.
-const WAITING: &str = "ダウンロード待ち";
+pub(crate) const WAITING: &str = "ダウンロード待ち";
 /// A game this round downloaded or updated.
 const DONE: &str = "完了";
 
@@ -825,6 +825,8 @@ pub struct Work {
     pub site: String,
     /// Whether the shop plays it on the web (DLsite Play).
     pub playable: bool,
+    /// Whether the shop gives its files to download.
+    pub downloadable: bool,
 }
 
 /// What a library needs from the shop its games come from.
@@ -1148,12 +1150,15 @@ impl<S: Shop> ShopLibrary<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .any(|work| work.id == id);
-        bought.then(|| {
-            self.progress()
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| WAITING.to_owned())
-        })
+        bought.then(|| self.waits(id))
+    }
+
+    /// How getting a work that is not here goes: as this round says, else waiting.
+    pub(crate) fn waits(&self, id: &str) -> String {
+        self.progress()
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| WAITING.to_owned())
     }
 
     /// The games as last read from the folders (read now when none are kept), each by
