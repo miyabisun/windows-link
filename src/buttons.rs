@@ -5,7 +5,7 @@ use std::{cell::OnceCell, path::PathBuf};
 use serde::Serialize;
 
 use crate::{
-    audio::{AppSound, Audio, AudioError, AudioResult, Device, Master, Outputs},
+    audio::{AppSound, Audio, AudioError, AudioResult, Device, Master, Outputs, resolve},
     config::{ButtonConfig, ButtonSpec, Config},
     discord::ServerIcons,
     launch::{Launcher, Processes, Program, is_running},
@@ -122,14 +122,32 @@ pub enum PressError {
     Storage(String),
 }
 
-/// Default-output target after a press: the second device when the first is the
-/// default, otherwise the first.
-pub fn next_output<'a>(current: Option<&str>, first: &'a str, second: &'a str) -> &'a str {
-    if current == Some(first) {
-        second
-    } else {
-        first
+/// Default-output target after a press, among the button's two devices: the other one
+/// when one of them is the default (`now`), otherwise the first that is connected.
+/// `None` when that leads to no connected device.
+pub fn next_output(now: Option<usize>, connected: [bool; 2]) -> Option<usize> {
+    match now {
+        Some(index) => connected[1 - index].then_some(1 - index),
+        None => connected.iter().position(|&c| c),
     }
+}
+
+/// An output button's two devices as Windows has them now (`resolve`).
+fn outputs<'a>(
+    config: &Config,
+    aliases: &[String; 2],
+    known: &'a [Device],
+) -> [Option<&'a Device>; 2] {
+    aliases
+        .each_ref()
+        .map(|alias| config.devices.get(alias).and_then(|id| resolve(known, id)))
+}
+
+/// Which of an output button's two devices is the default output, if either.
+fn default_among(outputs: &[Option<&Device>; 2], default: Option<&str>) -> Option<usize> {
+    outputs
+        .iter()
+        .position(|device| device.is_some_and(|d| Some(d.id.as_str()) == default))
 }
 
 /// Volume after a press: the lower level when above the midpoint, otherwise the higher.
@@ -300,27 +318,17 @@ fn state(
             devices,
             device_icons,
         } => {
-            let options = devices
-                .iter()
-                .enumerate()
-                .map(|(index, alias)| {
-                    let device = config
-                        .devices
-                        .get(alias)
-                        .and_then(|id| snapshot.devices.iter().find(|d| &d.id == id));
-                    OutputOption {
-                        alias: alias.clone(),
-                        name: device.map(|d| d.name.clone()),
-                        connected: device.is_some_and(|d| d.connected),
-                        icon: device_icons.map(|icons| icons[index]),
-                    }
+            let outputs = outputs(config, devices, &snapshot.devices);
+            let options = (0..2)
+                .map(|index| OutputOption {
+                    alias: devices[index].clone(),
+                    name: outputs[index].map(|d| d.name.clone()),
+                    connected: outputs[index].is_some_and(|d| d.connected),
+                    icon: device_icons.map(|icons| icons[index]),
                 })
                 .collect();
             let default = snapshot.default_output.as_deref();
-            let current = devices
-                .iter()
-                .find(|alias| config.devices.get(*alias).map(String::as_str) == default)
-                .cloned();
+            let current = default_among(&outputs, default).map(|index| devices[index].clone());
             let current_name = default.and_then(|id| {
                 snapshot
                     .devices
@@ -390,31 +398,28 @@ fn state(
     }
 }
 
-/// Make the other of the two devices the default output, when it is connected.
+/// Make the next of the two devices the default output (`next_output`).
 fn press_output(
     config: &Config,
     devices: &[String; 2],
     audio: &dyn Audio,
 ) -> Result<(), PressError> {
-    let first = &config.devices[&devices[0]];
-    let second = &config.devices[&devices[1]];
-    let current = audio.default_output().map_err(PressError::Audio)?;
-    let target = next_output(current.as_deref(), first, second);
     let known = audio.devices().map_err(PressError::Audio)?;
-    let device = known.iter().find(|d| d.id == target);
-    if !device.is_some_and(|d| d.connected) {
-        let alias = if target == first {
-            &devices[0]
-        } else {
-            &devices[1]
-        };
-        let name = device.map_or(alias.as_str(), |d| d.name.as_str());
-        return Err(PressError::Conflict {
-            code: "device_unavailable",
-            message: format!("{name} is not connected"),
-        });
+    let default = audio.default_output().map_err(PressError::Audio)?;
+    let outputs = outputs(config, devices, &known);
+    let now = default_among(&outputs, default.as_deref());
+    let connected = outputs.map(|device| device.is_some_and(|d| d.connected));
+    if let Some(device) = next_output(now, connected).and_then(|index| outputs[index]) {
+        return audio
+            .set_default_output(&device.id)
+            .map_err(PressError::Audio);
     }
-    audio.set_default_output(target).map_err(PressError::Audio)
+    let wanted = now.map_or(0, |index| 1 - index);
+    let name = outputs[wanted].map_or(devices[wanted].as_str(), |d| d.name.as_str());
+    Err(PressError::Conflict {
+        code: "device_unavailable",
+        message: format!("{name} is not connected"),
+    })
 }
 
 /// The programs (lowercase file names) the buttons show as running: the exit of one
@@ -935,11 +940,58 @@ buttons:
     }
 
     #[test]
-    fn output_toggles_between_the_two_and_falls_back_to_the_first() {
-        assert_eq!(next_output(Some("a"), "a", "b"), "b");
-        assert_eq!(next_output(Some("b"), "a", "b"), "a");
-        assert_eq!(next_output(Some("other"), "a", "b"), "a");
-        assert_eq!(next_output(None, "a", "b"), "a");
+    fn output_goes_to_the_other_device_or_the_first_one_connected() {
+        assert_eq!(next_output(Some(0), [true, true]), Some(1));
+        assert_eq!(next_output(Some(1), [true, true]), Some(0));
+        assert_eq!(next_output(Some(0), [true, false]), None, "nowhere to go");
+        assert_eq!(next_output(Some(1), [false, true]), None);
+        // The default is some other device: the first of the two that is connected.
+        assert_eq!(next_output(None, [true, true]), Some(0));
+        assert_eq!(next_output(None, [false, true]), Some(1));
+        assert_eq!(next_output(None, [false, false]), None);
+    }
+
+    #[test]
+    fn output_press_from_another_device_passes_over_the_one_not_connected() {
+        let config = config::parse(CONFIG).unwrap();
+        let audio = FakeAudio::new(devices(), Some("id-hdmi"));
+        audio.set_connected("id-motu", false);
+        press(&config, "output", &audio, &FakeLauncher::default()).unwrap();
+        assert_eq!(audio.default_output().unwrap().as_deref(), Some("id-jbl"));
+    }
+
+    #[test]
+    fn output_press_reaches_a_device_that_came_back_under_another_id() {
+        let config = config::parse(CONFIG).unwrap();
+        let mut known = devices();
+        known[0] = Device {
+            id: "id-motu".into(),
+            name: "Out (MOTU M Series)".into(),
+            connected: false,
+        };
+        known.push(Device {
+            id: "id-motu-2".into(),
+            name: "Out (2- MOTU M Series)".into(),
+            connected: true,
+        });
+        let audio = FakeAudio::new(known, Some("id-jbl"));
+        press(&config, "output", &audio, &FakeLauncher::default()).unwrap();
+        assert_eq!(
+            audio.default_output().unwrap().as_deref(),
+            Some("id-motu-2")
+        );
+
+        let snapshot = AudioSnapshot::read(&audio).unwrap();
+        let view = view(&config, &config.buttons[0], &readings(&snapshot), &audio);
+        let ButtonState::Output {
+            current, options, ..
+        } = view.state
+        else {
+            panic!("an output button");
+        };
+        assert_eq!(current.as_deref(), Some("motu"));
+        assert!(options[0].connected);
+        assert_eq!(options[0].name.as_deref(), Some("Out (2- MOTU M Series)"));
     }
 
     #[test]

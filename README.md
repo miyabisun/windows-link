@@ -158,9 +158,11 @@ buttons:
     process: BlueArchive.exe       # the game the launcher starts
 ```
 
-- `audio.output_toggle` switches to the second device when the first is the default, and
-  to the first device otherwise. Windows cannot make a disconnected device the default,
-  so pressing toward one fails with `409 device_unavailable`.
+- `audio.output_toggle` switches to the other device when one of the two is the default,
+  and otherwise to the first of them that is connected. Windows cannot make a
+  disconnected device the default, so a press with nowhere to go fails with
+  `409 device_unavailable`. A USB device back on another port gets a new ID from Windows
+  (its name gains a count, `2- `); the button follows it without a change to `devices`.
 - `audio.app_volume_toggle` sets the lower level when the current volume is above the
   midpoint of the two levels, and the higher level otherwise. It applies to every audio
   session of the process. Windows remembers per-application volume, so the state shows

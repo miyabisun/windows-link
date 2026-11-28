@@ -18,6 +18,35 @@ pub struct Device {
     pub connected: bool,
 }
 
+/// The endpoint to use for the configured `id`: itself while it is connected, otherwise
+/// a connected endpoint that is the same device. A USB device back on another port gets
+/// a new endpoint from Windows, named with a count (`Speakers (2- D3V)`), while the old
+/// one stays, not connected. `None` when Windows does not know `id`.
+pub fn resolve<'a>(devices: &'a [Device], id: &str) -> Option<&'a Device> {
+    let own = devices.iter().find(|d| d.id == id)?;
+    if own.connected {
+        return Some(own);
+    }
+    let name = without_count(&own.name);
+    let twin = devices
+        .iter()
+        .find(|d| d.connected && without_count(&d.name) == name);
+    Some(twin.unwrap_or(own))
+}
+
+/// An endpoint's name, `what it is called (device)`, in those two parts, without the
+/// count Windows puts before a device it has met again.
+// ponytail: by name, so an output the user renamed is not found under its new ID;
+// compare the devices' hardware IDs if that comes up.
+fn without_count(name: &str) -> (&str, &str) {
+    let (called, device) = name.split_once('(').unwrap_or((name, ""));
+    let rest = device.trim_start_matches(|c: char| c.is_ascii_digit());
+    match rest.strip_prefix("- ") {
+        Some(counted) if rest.len() < device.len() => (called, counted),
+        _ => (called, device),
+    }
+}
+
 /// The default output's volume (0.0-1.0) and whether it is muted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct Master {
@@ -159,7 +188,54 @@ pub fn app_sounds(
 
 #[cfg(test)]
 mod tests {
-    use super::{AppSound, app_sounds};
+    use super::{AppSound, Device, app_sounds, resolve};
+
+    fn device(id: &str, name: &str, connected: bool) -> Device {
+        Device {
+            id: id.into(),
+            name: name.into(),
+            connected,
+        }
+    }
+
+    #[test]
+    fn a_device_back_under_another_id_stands_for_the_one_configured() {
+        let known = [
+            device("old", "スピーカー (ADAM Audio D3V  )", false),
+            device("new", "スピーカー (2- ADAM Audio D3V  )", true),
+            device("third", "スピーカー (3- ADAM Audio D3V  )", false),
+            device("jbl", "BTイヤホン (JBL Tour Pro 3)", true),
+        ];
+        let id = |id: &str| resolve(&known, id).map(|d| d.id.as_str());
+        assert_eq!(id("old"), Some("new"), "the count Windows adds");
+        assert_eq!(id("third"), Some("new"), "between two counts");
+        assert_eq!(id("new"), Some("new"), "connected: itself");
+        assert_eq!(id("jbl"), Some("jbl"));
+        assert_eq!(id("gone"), None, "Windows does not know it");
+    }
+
+    #[test]
+    fn a_disconnected_device_stays_itself_without_a_connected_twin() {
+        let known = [
+            device("main", "MOTU (MOTU M Series)", false),
+            // Another output of the same device is not the one configured.
+            device("out34", "Out 3-4 (MOTU M Series)", true),
+            device("back", "MOTU (2- MOTU M Series)", false),
+            // The count is before the device, not before what the output is called.
+            device(
+                "hdmi",
+                "2 - T10FA (AMD High Definition Audio Device)",
+                false,
+            ),
+            device("hdmi-1", "T10FA (AMD High Definition Audio Device)", true),
+            device("r", "Speakers (2- Realtek(R) Audio)", false),
+            device("r-2", "Speakers (Realtek(R) Audio)", true),
+        ];
+        let id = |id: &str| resolve(&known, id).map(|d| d.id.as_str());
+        assert_eq!(id("main"), Some("main"));
+        assert_eq!(id("hdmi"), Some("hdmi"));
+        assert_eq!(id("r"), Some("r-2"), "a device name with brackets");
+    }
 
     #[test]
     fn a_program_is_one_app_with_its_first_volume_muted_while_all_its_sessions_are() {
